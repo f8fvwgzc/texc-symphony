@@ -5,8 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "SQLite persistence for Symphony runs, events, token usage and retention."
 
 [dependencies]
+chrono = { workspace = true }
+# Bundled SQLite: identical builds on linux/amd64, linux/arm64 and macOS, no system libsqlite3.
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
 
 [lints]
 workspace = true
