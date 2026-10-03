@@ -21,14 +21,14 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # Declared locally (not `workspace = true`) so this crate only opts into the timer/sync parts of tokio and
 # never into networking; the workspace entry enables `net`, `process`, ... for the runtime crates.
-tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "time", "sync", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "test-util"] }
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "test-util"] }
 
 [lints]
 workspace = true

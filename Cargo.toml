@@ -21,25 +21,25 @@ symphony-store = { path = "crates/symphony-store" }
 symphony-server = { path = "crates/symphony-server" }
 
 # shared third-party versions (crates opt in with `workspace = true`)
-anyhow = "1"
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal", "sync", "fs", "io-util", "net"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-futures = "0.3"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-arc-swap = "1"
-async-trait = "0.1"
-serde_yaml_ng = "0.10"
-liquid = "0.26"
-sha2 = "0.10"
-hex = "0.4"
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "signal", "sync", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+futures = "0.3.34"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+arc-swap = "1.9.2"
+async-trait = "0.1.92"
+serde_yaml_ng = "0.10.0"
+liquid = "0.26.11"
+sha2 = "0.11.0"
+hex = "0.4.3"
 libc = "0.2"
-tempfile = "3"
+tempfile = "3.27.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
