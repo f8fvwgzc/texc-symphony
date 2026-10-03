@@ -1,0 +1,929 @@
+openapi: 3.1.0
+info:
+  title: Symphony Observability API
+  version: 1.0.0
+  summary: Runtime state, live updates and run history for a Symphony orchestrator.
+  description: |
+    HTTP API served by the `symphony-server` crate (axum) when `server.port` (WORKFLOW.md) or
+    `--port` is set. It binds `server.host` (default `127.0.0.1`).
+
+    **Compatibility.** `GET /api/v1/state`, `POST /api/v1/refresh`, `GET /api/v1/{issue_identifier}`
+    and the 404/405 error envelopes are byte-for-byte shape compatible with the Elixir reference
+    implementation (Phoenix). Everything else is new in the Rust port:
+    `health`, `events` (SSE), `runs`, `runs/{id}`, `runs/{id}/events`, `totals` and `/api/openapi.json`.
+
+    **Routing rules** (in priority order, first match wins):
+
+    1. Literal routes: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/health`, `/api/v1/events`,
+       `/api/v1/runs`, `/api/v1/totals`, `/api/openapi.json`. Their names are therefore reserved and
+       can never be looked up as issue identifiers.
+    2. `/api/v1/runs/{id}` and `/api/v1/runs/{id}/events`.
+    3. `/api/v1/{issue_identifier}` (exactly one path segment, URL-decoded, case-sensitive).
+    4. A defined path with an unsupported method answers `405` with code `method_not_allowed`.
+       `HEAD` is accepted wherever `GET` is (empty body).
+    5. The embedded web dashboard (`web/dist`) is served for `GET /` (`index.html`) and for each
+       file in the bundle at its own path (`/assets/<hashed>.js|css`, `/favicon.png`). The
+       dashboard uses hash routing (`/#/runs`), so no SPA fallback is needed.
+    6. Anything else answers `404` with code `not_found` / message `Route not found`
+       (e.g. `/unknown`, `/api/v1/a/b`, `POST /favicon.png`).
+
+    A single trailing slash is ignored (`/api/v1/state/` == `/api/v1/state`). Request bodies are
+    ignored everywhere. There is no authentication: bind to loopback or put a proxy in front.
+
+    **Timestamps.** RFC 3339 / ISO 8601 UTC with a `Z` suffix, truncated to whole seconds
+    (`2026-02-24T20:15:30Z`), except `requested_at` on refresh and the run-history timestamps,
+    which carry sub-second precision (`2026-02-24T20:15:30.123456Z`).
+
+    **Errors.** Every non-2xx response uses the envelope
+    `{"error": {"code": "<machine code>", "message": "<human text>"}}`. Codes:
+    `not_found`, `method_not_allowed`, `issue_not_found`, `orchestrator_unavailable`,
+    `run_not_found`, `invalid_parameter`, `store_disabled`, `request_failed`.
+    `GET /api/v1/state` never fails with an error status: snapshot failures are reported inside a
+    `200` body (`snapshot_timeout`, `snapshot_unavailable`).
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+security: []
+servers:
+  - url: http://127.0.0.1:4000
+    description: Local orchestrator (port comes from `server.port` or `--port`)
+tags:
+  - name: state
+    description: Live orchestrator state (Elixir compatible).
+  - name: control
+    description: Operator actions (Elixir compatible).
+  - name: live
+    description: Server-Sent Events stream of state snapshots.
+  - name: history
+    description: Run history persisted in SQLite (`symphony-store`). 503 `store_disabled` when persistence is off.
+  - name: meta
+    description: Health and API description.
+
+paths:
+  /api/v1/state:
+    get:
+      tags: [state]
+      operationId: getState
+      summary: Current orchestrator snapshot
+      description: |
+        Projection of the orchestrator snapshot. Always `200`: when the snapshot call times out
+        (15 s) or the orchestrator is not running, the body is `StateError` instead of
+        `StateSnapshot`. Lists are sorted by `issue_id`.
+      responses:
+        '200':
+          description: Snapshot (or an in-band snapshot error).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatePayload'
+              examples:
+                snapshot:
+                  $ref: '#/components/examples/StateSnapshot'
+                timeout:
+                  summary: Snapshot timed out
+                  value:
+                    generated_at: '2026-02-24T20:15:30Z'
+                    error: { code: snapshot_timeout, message: Snapshot timed out }
+                unavailable:
+                  summary: Orchestrator not running
+                  value:
+                    generated_at: '2026-02-24T20:15:30Z'
+                    error: { code: snapshot_unavailable, message: Snapshot unavailable }
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/refresh:
+    post:
+      tags: [control]
+      operationId: requestRefresh
+      summary: Queue an immediate poll + reconcile cycle
+      description: |
+        Asks the orchestrator to run its next poll tick now. The request body is ignored (empty,
+        `{}` or form-encoded are all fine). `coalesced` is `true` when a poll was already in
+        progress or already due, in which case nothing new is scheduled. `GET` on this path is `405`.
+      responses:
+        '202':
+          description: Refresh queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshAccepted'
+              example:
+                queued: true
+                coalesced: false
+                requested_at: '2026-02-24T20:15:30.123456Z'
+                operations: [poll, reconcile]
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          description: Orchestrator is not running (or did not answer within 5 s).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error: { code: orchestrator_unavailable, message: Orchestrator is unavailable }
+
+  /api/v1/health:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness and build information
+      description: Cheap check that never touches the orchestrator. Always `200` while the process serves HTTP.
+      responses:
+        '200':
+          description: Server is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                version: 0.1.0
+                uptime_seconds: 3725
+                store: sqlite
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/events:
+    get:
+      tags: [live]
+      operationId: streamEvents
+      summary: Live snapshot stream (Server-Sent Events)
+      description: |
+        `text/event-stream` that pushes the same JSON as `GET /api/v1/state`.
+
+        * The stream starts with `retry: 3000` and immediately sends one `snapshot` event.
+        * A new `snapshot` is sent whenever the orchestrator state changes. Changes are debounced
+          server-side (~200 ms, leading + trailing edge), so bursts of agent events produce at most
+          ~5 snapshots per second.
+        * `id:` is the orchestrator update *generation*, a monotonically increasing integer. Only
+          `snapshot` events carry an `id`.
+        * `event: heartbeat` is sent every 15 s (no `id`) so proxies keep the connection open and
+          clients can detect a dead stream.
+        * A reconnecting client that sends `Last-Event-ID` simply receives the current snapshot
+          first; missed intermediate snapshots are never replayed (each snapshot is complete).
+        * When a snapshot cannot be taken, the `snapshot` event carries a `StateError` body.
+
+        Response headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+        `X-Accel-Buffering: no`.
+
+        Wire example:
+
+        ```text
+        retry: 3000
+
+        event: snapshot
+        id: 42
+        data: {"generated_at":"2026-02-24T20:15:30Z","counts":{"running":1,"retrying":0,"blocked":0},...}
+
+        event: heartbeat
+        data: {"at":"2026-02-24T20:15:45Z","generation":42}
+
+        ```
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: Generation of the last snapshot seen. Accepted for compatibility; the current snapshot is always sent first.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event stream (never ends on its own).
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-cache }
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Sequence of SSE frames. `event: snapshot` frames carry `StatePayload` JSON in `data`;
+                  `event: heartbeat` frames carry `{"at": <timestamp>, "generation": <int>}`.
+              x-sse-events:
+                snapshot:
+                  description: '`id:` = generation. `data:` = StatePayload JSON (same body as GET /api/v1/state).'
+                  schema:
+                    $ref: '#/components/schemas/StatePayload'
+                heartbeat:
+                  description: 'Every 15 s, no `id:`. `data:` = `{at, generation}` JSON.'
+                  schema:
+                    type: object
+                    description: Payload of SSE `heartbeat` events.
+                    required: [at, generation]
+                    properties:
+                      at: { $ref: '#/components/schemas/Timestamp' }
+                      generation: { type: integer, minimum: 0, description: 'Latest generation (same as the last snapshot `id`).' }
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/runs:
+    get:
+      tags: [history]
+      operationId: listRuns
+      summary: Run history (newest first, keyset pagination)
+      description: |
+        Agent runs ordered by `id` descending. Pass `next_before_id` from a response as `before_id`
+        to fetch the next (older) page; it is `null` on the last page.
+      parameters:
+        - name: limit
+          in: query
+          description: Page size.
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: before_id
+          in: query
+          description: Only runs with `id < before_id`.
+          schema: { type: integer, minimum: 1 }
+        - name: issue
+          in: query
+          description: Only runs whose `issue_identifier` equals this value (exact, case-sensitive).
+          schema: { type: string, minLength: 1 }
+        - name: status
+          in: query
+          description: Only runs with this status.
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+      responses:
+        '200':
+          description: One page of runs.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunList'
+              example:
+                runs:
+                  - id: 42
+                    issue_id: issue-http
+                    issue_identifier: MT-HTTP
+                    issue_title: Render the HTTP dashboard
+                    attempt: 0
+                    worker_host: null
+                    workspace_path: /tmp/symphony_workspaces/MT-HTTP
+                    status: succeeded
+                    error: null
+                    turns: 7
+                    started_at: '2026-02-24T20:10:12.004Z'
+                    finished_at: '2026-02-24T20:31:40.250Z'
+                    duration_ms: 1288246
+                    tokens: { input: 18230, output: 2207, total: 20437 }
+                next_before_id: 42
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/StoreDisabled'
+
+  /api/v1/runs/{id}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [history]
+      operationId: getRun
+      summary: One run
+      responses:
+        '200':
+          description: The run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunRecord'
+              examples:
+                run:
+                  $ref: '#/components/examples/RunRecord'
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/StoreDisabled'
+
+  /api/v1/runs/{id}/events:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [history]
+      operationId: listRunEvents
+      summary: Timeline of one run (oldest first)
+      description: |
+        Events ordered by `seq` ascending (`seq` starts at 1 per run and has no gaps). To page,
+        pass the last `seq` you received as `after_seq`; a page shorter than `limit` is the end
+        (for a still-running run, poll again later).
+      parameters:
+        - name: after_seq
+          in: query
+          description: Only events with `seq > after_seq`.
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          description: Page size.
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        '200':
+          description: Events page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunEventList'
+              example:
+                events:
+                  - run_id: 42
+                    seq: 1
+                    at: '2026-02-24T20:10:12.004Z'
+                    kind: session_started
+                    message: session started (thread-http)
+                    payload: { session_id: thread-http }
+                  - run_id: 42
+                    seq: 2
+                    at: '2026-02-24T20:10:15.512Z'
+                    kind: notification
+                    message: rendered
+                    payload: null
+        '400':
+          $ref: '#/components/responses/InvalidParameter'
+        '404':
+          $ref: '#/components/responses/RunNotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/StoreDisabled'
+
+  /api/v1/totals:
+    get:
+      tags: [history]
+      operationId: getTotals
+      summary: All-time aggregates over the run history
+      responses:
+        '200':
+          description: Aggregates (retention-pruned runs are no longer counted).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Totals'
+              example:
+                runs_total: 128
+                runs_succeeded: 97
+                runs_failed: 21
+                tokens: { input: 1830211, output: 220407, total: 2050618 }
+                runtime_ms: 48210933
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/StoreDisabled'
+
+  /api/v1/{issue_identifier}:
+    parameters:
+      - name: issue_identifier
+        in: path
+        required: true
+        description: Tracker identifier such as `MT-123` (URL-decoded, exact, case-sensitive).
+        schema: { type: string }
+    get:
+      tags: [state]
+      operationId: getIssue
+      summary: Live detail of one issue known to the orchestrator
+      description: |
+        Looks the identifier up in `running`, then `retrying`, then `blocked`. Unknown issues, and
+        any snapshot failure, answer `404 issue_not_found`.
+      responses:
+        '200':
+          description: Issue detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueDetail'
+              examples:
+                running:
+                  $ref: '#/components/examples/IssueDetail'
+        '404':
+          description: Issue is not running, retrying or blocked (or the snapshot failed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error: { code: issue_not_found, message: Issue not found }
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/openapi.json:
+    get:
+      tags: [meta]
+      operationId: getOpenApi
+      summary: This document, as JSON
+      responses:
+        '200':
+          description: OpenAPI 3.1 document.
+          content:
+            application/json:
+              schema:
+                type: object
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+components:
+  parameters:
+    RunId:
+      name: id
+      in: path
+      required: true
+      description: Run id (positive integer). Non-integers answer `400 invalid_parameter`.
+      schema: { type: integer, minimum: 1 }
+
+  responses:
+    MethodNotAllowed:
+      description: The path exists but does not support this method.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: method_not_allowed, message: Method not allowed }
+    RunNotFound:
+      description: No run with this id (never existed or pruned by retention).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: run_not_found, message: Run not found }
+    InvalidParameter:
+      description: A path or query parameter failed validation. The message names the parameter.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: invalid_parameter, message: 'limit must be an integer between 1 and 200' }
+    StoreDisabled:
+      description: Run history persistence is disabled in this process.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: store_disabled, message: Run history store is disabled }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+
+    ErrorBody:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable code.
+          examples: [not_found, method_not_allowed, issue_not_found, orchestrator_unavailable, run_not_found, invalid_parameter, store_disabled, request_failed]
+        message:
+          type: string
+          description: Human-readable text (not localized, may change).
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: UTC RFC 3339 timestamp ending in `Z`.
+      examples: ['2026-02-24T20:15:30Z']
+
+    TokenUsage:
+      type: object
+      description: Token counters as reported by Codex. Values may be `null` before the first usage update.
+      required: [input_tokens, output_tokens, total_tokens]
+      properties:
+        input_tokens: { type: [integer, 'null'], minimum: 0 }
+        output_tokens: { type: [integer, 'null'], minimum: 0 }
+        total_tokens: { type: [integer, 'null'], minimum: 0 }
+
+    StatePayload:
+      description: Body of `GET /api/v1/state` and of every SSE `snapshot` event.
+      oneOf:
+        - $ref: '#/components/schemas/StateSnapshot'
+        - $ref: '#/components/schemas/StateError'
+
+    StateError:
+      type: object
+      required: [generated_at, error]
+      properties:
+        generated_at:
+          $ref: '#/components/schemas/Timestamp'
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [snapshot_timeout, snapshot_unavailable]
+            message:
+              type: string
+              enum: [Snapshot timed out, Snapshot unavailable]
+
+    StateSnapshot:
+      type: object
+      required: [generated_at, counts, running, retrying, blocked, codex_totals, rate_limits]
+      properties:
+        generated_at:
+          $ref: '#/components/schemas/Timestamp'
+        counts:
+          type: object
+          required: [running, retrying, blocked]
+          properties:
+            running: { type: integer, minimum: 0 }
+            retrying: { type: integer, minimum: 0 }
+            blocked: { type: integer, minimum: 0 }
+        running:
+          type: array
+          items: { $ref: '#/components/schemas/RunningEntry' }
+        retrying:
+          type: array
+          items: { $ref: '#/components/schemas/RetryEntry' }
+        blocked:
+          type: array
+          items: { $ref: '#/components/schemas/BlockedEntry' }
+        codex_totals:
+          $ref: '#/components/schemas/CodexTotals'
+        rate_limits:
+          $ref: '#/components/schemas/RateLimits'
+
+    CodexTotals:
+      type: object
+      description: |
+        Aggregate token usage and runtime. `seconds_running` counts **ended** sessions only
+        (Elixir parity); clients add `now - started_at` of each running row for a live total.
+      required: [input_tokens, output_tokens, total_tokens, seconds_running]
+      properties:
+        input_tokens: { type: integer, minimum: 0 }
+        output_tokens: { type: integer, minimum: 0 }
+        total_tokens: { type: integer, minimum: 0 }
+        seconds_running: { type: number, minimum: 0 }
+
+    RateLimits:
+      description: |
+        Last rate-limit object reported by Codex, passed through verbatim (or `null`). Commonly
+        `{limit_id?, limit_name?, primary?: Bucket, secondary?: Bucket, credits?: Credits}` where a
+        bucket has `remaining`, `limit` and a reset hint (`reset_in_seconds` / `resetInSeconds` /
+        `reset_at` / `resetAt` / `resets_at` / `resetsAt`) and credits has `unlimited`,
+        `has_credits`, `balance`. Clients must tolerate any JSON value here.
+      type: [object, 'null']
+      additionalProperties: true
+
+    RunningEntry:
+      type: object
+      required: [issue_id, issue_identifier, issue_url, state, worker_host, workspace_path, session_id, turn_count, last_event, last_message, started_at, last_event_at, tokens]
+      properties:
+        issue_id: { type: string }
+        issue_identifier: { type: string }
+        issue_url: { type: [string, 'null'] }
+        state: { type: [string, 'null'], description: 'Tracker state name, e.g. `In Progress`.' }
+        worker_host: { type: [string, 'null'], description: 'SSH worker host, `null` for local runs.' }
+        workspace_path: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        turn_count: { type: integer, minimum: 0 }
+        last_event: { type: [string, 'null'], description: 'Last Codex event name, e.g. `notification`.' }
+        last_message: { type: [string, 'null'], description: 'Humanized summary of the last Codex message (max ~143 chars).' }
+        started_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        last_event_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        tokens: { $ref: '#/components/schemas/TokenUsage' }
+
+    RetryEntry:
+      type: object
+      required: [issue_id, issue_identifier, issue_url, attempt, due_at, error, worker_host, workspace_path]
+      properties:
+        issue_id: { type: string }
+        issue_identifier: { type: string }
+        issue_url: { type: [string, 'null'] }
+        attempt: { type: [integer, 'null'], minimum: 0 }
+        due_at:
+          description: Recomputed from `now + due_in` on each request (may jitter by 1 s).
+          oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }]
+        error: { type: [string, 'null'] }
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+
+    BlockedEntry:
+      type: object
+      required: [issue_id, issue_identifier, issue_url, state, error, worker_host, workspace_path, session_id, blocked_at, last_event, last_message, last_event_at]
+      properties:
+        issue_id: { type: string }
+        issue_identifier: { type: string }
+        issue_url: { type: [string, 'null'] }
+        state: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        blocked_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        last_event: { type: [string, 'null'] }
+        last_message: { type: [string, 'null'] }
+        last_event_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+
+    IssueDetail:
+      type: object
+      required: [issue_identifier, issue_id, status, workspace, attempts, running, retry, blocked, logs, recent_events, last_error, tracked]
+      properties:
+        issue_identifier: { type: string }
+        issue_id: { type: string }
+        status:
+          type: string
+          enum: [running, retrying, blocked]
+          description: '`running` wins over `retrying`, which wins over `blocked`.'
+        workspace:
+          type: object
+          required: [path, host]
+          properties:
+            path: { type: string, description: 'First known workspace path, else `<workspace.root>/<workspace_key(identifier)>`.' }
+            host: { type: [string, 'null'] }
+        attempts:
+          type: object
+          required: [restart_count, current_retry_attempt]
+          properties:
+            restart_count: { type: integer, minimum: 0, description: '`max(current_retry_attempt - 1, 0)`.' }
+            current_retry_attempt: { type: integer, minimum: 0 }
+        running:
+          oneOf:
+            - $ref: '#/components/schemas/IssueRunning'
+            - type: 'null'
+        retry:
+          oneOf:
+            - $ref: '#/components/schemas/IssueRetry'
+            - type: 'null'
+        blocked:
+          oneOf:
+            - $ref: '#/components/schemas/IssueBlocked'
+            - type: 'null'
+        logs:
+          type: object
+          required: [codex_session_logs]
+          properties:
+            codex_session_logs:
+              type: array
+              description: Always empty (reserved).
+              maxItems: 0
+              items: {}
+        recent_events:
+          type: array
+          description: At most one entry (the last Codex event of the running or blocked session).
+          items:
+            $ref: '#/components/schemas/RecentEvent'
+        last_error: { type: [string, 'null'], description: '`blocked.error`, else `retry.error`.' }
+        tracked:
+          type: object
+          description: Always `{}` (reserved).
+          maxProperties: 0
+
+    IssueRunning:
+      type: object
+      required: [worker_host, workspace_path, session_id, turn_count, state, started_at, last_event, last_message, last_event_at, tokens]
+      properties:
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        turn_count: { type: integer, minimum: 0 }
+        state: { type: [string, 'null'] }
+        started_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        last_event: { type: [string, 'null'] }
+        last_message: { type: [string, 'null'] }
+        last_event_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        tokens: { $ref: '#/components/schemas/TokenUsage' }
+
+    IssueRetry:
+      type: object
+      required: [attempt, due_at, error, worker_host, workspace_path]
+      properties:
+        attempt: { type: [integer, 'null'] }
+        due_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        error: { type: [string, 'null'] }
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+
+    IssueBlocked:
+      type: object
+      required: [worker_host, workspace_path, session_id, state, error, blocked_at, last_event, last_message, last_event_at]
+      properties:
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+        session_id: { type: [string, 'null'] }
+        state: { type: [string, 'null'] }
+        error: { type: [string, 'null'] }
+        blocked_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+        last_event: { type: [string, 'null'] }
+        last_message: { type: [string, 'null'] }
+        last_event_at: { oneOf: [{ $ref: '#/components/schemas/Timestamp' }, { type: 'null' }] }
+
+    RecentEvent:
+      type: object
+      required: [at, event, message]
+      properties:
+        at: { $ref: '#/components/schemas/Timestamp' }
+        event: { type: [string, 'null'] }
+        message: { type: [string, 'null'] }
+
+    RefreshAccepted:
+      type: object
+      required: [queued, coalesced, requested_at, operations]
+      properties:
+        queued: { type: boolean, const: true }
+        coalesced: { type: boolean }
+        requested_at:
+          type: string
+          format: date-time
+          description: Microsecond precision, `Z` suffix.
+        operations:
+          type: array
+          items: { type: string }
+          examples: [[poll, reconcile]]
+
+    Health:
+      type: object
+      required: [status, version, uptime_seconds, store]
+      additionalProperties: false
+      properties:
+        status: { type: string, const: ok }
+        version: { type: string, description: 'Crate version of the `symphony` binary.' }
+        uptime_seconds: { type: integer, minimum: 0, description: 'Whole seconds since the HTTP server started.' }
+        store:
+          type: string
+          enum: [sqlite, disabled]
+          description: Whether run history endpoints are available.
+
+    RunStatus:
+      type: string
+      enum: [running, succeeded, failed, cancelled, blocked]
+
+    RunTokens:
+      type: object
+      required: [input, output, total]
+      additionalProperties: false
+      properties:
+        input: { type: integer, minimum: 0 }
+        output: { type: integer, minimum: 0 }
+        total: { type: integer, minimum: 0 }
+
+    RunRecord:
+      type: object
+      description: One agent run (one attempt of one issue).
+      required: [id, issue_id, issue_identifier, issue_title, attempt, worker_host, workspace_path, status, error, turns, started_at, finished_at, duration_ms, tokens]
+      additionalProperties: false
+      properties:
+        id: { type: integer, minimum: 1 }
+        issue_id: { type: string }
+        issue_identifier: { type: string }
+        issue_title: { type: [string, 'null'] }
+        attempt: { type: integer, minimum: 0, description: '0 for the first dispatch, then the retry attempt number.' }
+        worker_host: { type: [string, 'null'] }
+        workspace_path: { type: [string, 'null'] }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        error: { type: [string, 'null'] }
+        turns: { type: integer, minimum: 0 }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time, description: '`null` while `status` is `running`.' }
+        duration_ms: { type: [integer, 'null'], minimum: 0, description: '`finished_at - started_at`; `null` while running.' }
+        tokens: { $ref: '#/components/schemas/RunTokens' }
+
+    RunList:
+      type: object
+      required: [runs, next_before_id]
+      additionalProperties: false
+      properties:
+        runs:
+          type: array
+          items: { $ref: '#/components/schemas/RunRecord' }
+        next_before_id:
+          type: [integer, 'null']
+          description: Pass as `before_id` to get the next (older) page; `null` when there are no more runs.
+
+    RunEvent:
+      type: object
+      required: [run_id, seq, at, kind, message, payload]
+      additionalProperties: false
+      properties:
+        run_id: { type: integer, minimum: 1 }
+        seq: { type: integer, minimum: 1 }
+        at: { type: string, format: date-time }
+        kind:
+          type: string
+          description: |
+            Event kind, e.g. `session_started`, `turn_completed`, `notification`, `tool_call`,
+            `token_usage`, `turn_input_required`, `run_finished`. Open set; render unknown kinds verbatim.
+        message: { type: [string, 'null'], description: 'Humanized one-line summary.' }
+        payload:
+          description: Raw structured payload (secrets scrubbed) or `null`.
+          type: [object, array, string, number, boolean, 'null']
+
+    RunEventList:
+      type: object
+      required: [events]
+      additionalProperties: false
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/RunEvent' }
+
+    Totals:
+      type: object
+      required: [runs_total, runs_succeeded, runs_failed, tokens, runtime_ms]
+      additionalProperties: false
+      properties:
+        runs_total: { type: integer, minimum: 0 }
+        runs_succeeded: { type: integer, minimum: 0 }
+        runs_failed: { type: integer, minimum: 0 }
+        tokens: { $ref: '#/components/schemas/RunTokens' }
+        runtime_ms: { type: integer, minimum: 0, description: 'Sum of `duration_ms` of finished runs.' }
+
+  examples:
+    StateSnapshot:
+      summary: One running, one retrying, one blocked issue
+      value:
+        generated_at: '2026-02-24T20:15:30Z'
+        counts: { running: 1, retrying: 1, blocked: 1 }
+        running:
+          - issue_id: issue-http
+            issue_identifier: MT-HTTP
+            issue_url: https://example.org/issues/MT-HTTP
+            state: In Progress
+            worker_host: null
+            workspace_path: null
+            session_id: thread-http
+            turn_count: 7
+            last_event: notification
+            last_message: rendered
+            started_at: '2026-02-24T20:10:12Z'
+            last_event_at: null
+            tokens: { input_tokens: 4, output_tokens: 8, total_tokens: 12 }
+        retrying:
+          - issue_id: issue-retry
+            issue_identifier: MT-RETRY
+            issue_url: https://example.org/issues/MT-RETRY
+            attempt: 2
+            due_at: '2026-02-24T20:15:32Z'
+            error: boom
+            worker_host: null
+            workspace_path: null
+        blocked:
+          - issue_id: issue-blocked
+            issue_identifier: MT-BLOCKED
+            issue_url: https://example.org/issues/MT-BLOCKED
+            state: In Progress
+            error: codex turn requires operator input
+            worker_host: dm-dev2
+            workspace_path: /workspaces/MT-BLOCKED
+            session_id: thread-blocked
+            blocked_at: '2026-02-24T20:14:00Z'
+            last_event: turn_input_required
+            last_message: 'turn blocked: waiting for user input'
+            last_event_at: '2026-02-24T20:14:00Z'
+        codex_totals: { input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42 }
+        rate_limits: { primary: { remaining: 11 } }
+
+    IssueDetail:
+      summary: A running issue
+      value:
+        issue_identifier: MT-HTTP
+        issue_id: issue-http
+        status: running
+        workspace: { path: /tmp/symphony_workspaces/MT-HTTP, host: null }
+        attempts: { restart_count: 0, current_retry_attempt: 0 }
+        running:
+          worker_host: null
+          workspace_path: null
+          session_id: thread-http
+          turn_count: 7
+          state: In Progress
+          started_at: '2026-02-24T20:10:12Z'
+          last_event: notification
+          last_message: rendered
+          last_event_at: null
+          tokens: { input_tokens: 4, output_tokens: 8, total_tokens: 12 }
+        retry: null
+        blocked: null
+        logs: { codex_session_logs: [] }
+        recent_events: []
+        last_error: null
+        tracked: {}
+
+    RunRecord:
+      summary: A finished run
+      value:
+        id: 42
+        issue_id: issue-http
+        issue_identifier: MT-HTTP
+        issue_title: Render the HTTP dashboard
+        attempt: 0
+        worker_host: null
+        workspace_path: /tmp/symphony_workspaces/MT-HTTP
+        status: succeeded
+        error: null
+        turns: 7
+        started_at: '2026-02-24T20:10:12.004Z'
+        finished_at: '2026-02-24T20:31:40.250Z'
+        duration_ms: 1288246
+        tokens: { input: 18230, output: 2207, total: 20437 }

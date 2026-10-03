@@ -1,0 +1,58 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "jsx-a11y", "react", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "settings": {
+    "react": {
+      "version": "19.0.0"
+    }
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    "react/no-unknown-property": "off",
+    "react/immutability": "off",
+    "jsx-a11y/control-has-associated-label": "off",
+    "import/no-unassigned-import": [
+      "warn",
+      {
+        "allow": ["**/*.css", "@testing-library/jest-dom/vitest"]
+      }
+    ],
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/await-thenable": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/consistent-type-imports": "error",
+    "eqeqeq": [
+      "error",
+      "always",
+      {
+        "null": "ignore"
+      }
+    ],
+    "no-console": [
+      "error",
+      {
+        "allow": ["warn", "error"]
+      }
+    ],
+    "import/no-cycle": "error",
+    "jsx-a11y/anchor-is-valid": "error",
+    "jsx-a11y/no-autofocus": "error"
+  },
+  "ignorePatterns": ["dist", "coverage", "node_modules"],
+  "overrides": [
+    {
+      "files": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test/**"],
+      "rules": {
+        "vitest/require-mock-type-parameters": "off",
+        "unicorn/consistent-function-scoping": "off",
+        "react/globals": "off"
+      }
+    }
+  ]
+}

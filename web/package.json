@@ -1,0 +1,43 @@
+{
+  "name": "symphony-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Symphony observability dashboard (Preact + Vite), embedded by the symphony-server crate.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@10.18.1",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "oxlint --type-aware --deny-warnings src vite.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run test"
+  },
+  "dependencies": {
+    "preact": "11.0.0"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/preact": "3.2.4",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.0.3",
+    "happy-dom": "20.14.5",
+    "oxlint": "1.86.0",
+    "oxlint-tsgolint": "7.0.2003",
+    "prettier": "3.9.9",
+    "typescript": "7.0.2",
+    "vite": "8.3.2",
+    "vitest": "5.0.3"
+  }
+}
