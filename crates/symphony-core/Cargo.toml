@@ -1,5 +1,6 @@
 [package]
 name = "symphony-core"
+description = "Symphony core: WORKFLOW.md loading/reload, config casting and validation, Issue, prompt rendering, path safety."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +8,27 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+arc-swap = { workspace = true }
+tracing = { workspace = true }
+tokio-util = { workspace = true }
+serde_yaml_ng = { workspace = true }
+liquid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Declared locally (not `workspace = true`) so this crate only opts into the timer/sync parts of tokio and
+# never into networking; the workspace entry enables `net`, `process`, ... for the runtime crates.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "sync", "macros", "test-util"] }
 
 [lints]
 workspace = true
