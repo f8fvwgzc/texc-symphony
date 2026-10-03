@@ -211,3 +211,92 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   process environment, so `SendEnv` cannot forward them. Elixir relied only on the remote `unset`.
 - **Structured tracing.** The client uses `codex_session` and `codex_turn` spans with the issue
   id, identifier and worker host.
+
+## symphony-trackers
+
+- **Trait shape.** `Tracker` is an object-safe `async_trait`. Every read takes the *current*
+  `TrackerSettings` as an argument, because Elixir re-read the live config on every call. Tool
+  execution uses the snapshot captured by `ToolBinding::bind`, matching `Tracker.bind_agent_tools/0`.
+  `build_tracker` / `tracker_for_kind` dispatch on the six exact kind strings.
+- **Adapter validation and secret names reuse core.** The adapters call `config::resolve_*`,
+  `validate_tracker` and `secret_environment_names`; they do not duplicate those rules. `$VAR` and
+  default env vars are still resolved on every call, through an injected `EnvSource`.
+- **Writes.** Per SPEC §11.5 there is still no generic comment or state CRUD. Mutations go through
+  each adapter's agent tool, backed by the public raw passthroughs `LinearTracker::graphql` and
+  `{GitHub,GitLab,Jira,Asana}Tracker::request`. These return the status and body without status
+  mapping.
+- **Errors.** `TrackerError` keeps the Elixir reason tags in `Display`/`tag()`, for example
+  `github_api_status: 503` or `jira_missing_next_page_token`.
+  - `inspect()` renders the Elixir `inspect/1` form used in tool `"reason"` fields, such as
+    `:timeout` or `{:github_api_status, 503}`.
+  - `category()` maps each error to the SPEC §11.4 categories, with 429 mapped to
+    `tracker_rate_limited`.
+  - `user_message()` keeps the orchestrator's two special-cased Linear messages.
+- **Test seams.** Elixir injected `request_fun`/client closures. Rust injects a `Transport` instead:
+  production uses `ReqwestTransport`, and the tests use `wiremock`. The redirect test routes logical
+  origins (`https://gitlab.test`, `https://sink.test`) to mock servers via
+  `ReqwestTransport::with_origin_override`, so the redirect/credential logic runs unmodified.
+  Elixir tests that needed non-JSON terms (a PID body, a non-integer status, atom-keyed maps) are
+  N/A; a text body test replaces the PID case.
+- **Tool output.** The output is pretty JSON with sorted keys (`serde_json` without
+  `preserve_order`), byte-compatible with `Jason.encode!(pretty: true)` for these payloads. The
+  generic "unsupported" response (Memory) stays compact JSON. A non-object Linear body renders like
+  Elixir `inspect`: strings are quoted and `null` is `nil`.
+- **Query parameters.** Scalars are stringified (`10` becomes `"10"`, `true` becomes `"true"`,
+  `null` becomes `""`). Nested arrays/objects in `params`/`query` are rejected with the tool's
+  `invalid_params`/`invalid_query` message, where Elixir crashed in `URI.encode_query`. An empty map
+  never adds a trailing `?`. Inline `?query` in a tool path keeps working, and params are appended
+  with `&`.
+- **URL normalization.** Tool paths are parsed with the WHATWG `url` crate, which resolves `..`
+  segments before sending. Elixir sent them raw and the server resolved them. Either way the path
+  stays on the configured host, under the same credential.
+- **Content types.** `application/json` and any `*/*+json` are decoded as JSON. Other bodies become
+  JSON strings, and an empty body is `""`. Invalid JSON under a JSON type is a transport error
+  (`invalid_json`), as in Req.
+
+### Improvements
+
+- **Pagination safety cap.** Elixir had no cap, and a provider that repeated a cursor looped
+  forever.
+  - A read stops after `MAX_PAGES` = 1,000 pages with `<provider>_pagination_limit_exceeded`
+    (category `tracker_pagination`).
+  - Cursor-based providers (Linear `endCursor`, Jira `nextPageToken`, Asana `offset`) fail fast
+    with `<provider>_pagination_repeated_cursor` when a cursor repeats within one read.
+- **Token scrubbing.** Elixir had none.
+  - Every `TransportError` message is scrubbed before it leaves `HttpClient`. That covers the exact
+    credential values, any `Bearer …`/`Basic …` token, and URL user-info.
+  - reqwest errors drop their URL, and credential headers are marked sensitive.
+  - `Debug` for requests redacts header values.
+  - The Linear non-200 body log is scrubbed with the API key.
+  - Tool `"reason"` strings and logs therefore never carry a token. A test drives a transport whose
+    errors echo the `Authorization` header.
+- **Retry-After cap.** Req's `safe_transient` retry policy is reproduced: `GET`/`HEAD` only; status
+  408/429/500/502/503/504 or timeout/refused/closed; 3 retries at 1 s, 2 s and 4 s, or
+  `Retry-After`. A server-supplied `Retry-After` is now capped at 60 s
+  (`RetryPolicy::max_delay`), so one bad header cannot stall a poll for an hour. POST (Linear, Jira
+  search/bulkfetch) and all non-GET tool calls are still never retried.
+- **Redirects.** Redirects are followed manually: at most 10 hops, then `too_many_redirects`.
+  - On a scheme, host or port change, `Authorization`, `Private-Token`, `Cookie` and
+    `Proxy-Authorization` are dropped. They stay dropped for the rest of the chain, including a
+    bounce back to the origin.
+  - 301/302/303 turn a non-HEAD request into a body-less GET and drop `Content-Type`; 307/308 keep
+    the method and body.
+  - This is tested for same-origin, cross-origin and A→B→A chains.
+- **Linear: missing `pageInfo`.** A page with `data.issues.nodes` but an incomplete `pageInfo` now
+  ends pagination and returns the accumulated pages plus that page. Elixir returned only that page
+  and dropped the earlier ones (D1.5.4).
+- **Linear: missing API key in `graphql/3`.** It now returns `missing_linear_api_token`, so
+  `linear_graphql` shows the dedicated auth message. Elixir wrapped it as
+  `{:linear_api_request, :missing_linear_api_token}` and showed the generic transport message
+  (D1.9.1).
+- **GitLab: unassigned issues.** `assignee_id` only inspects `assignees[0]`/`assignee` objects, so
+  an unassigned issue gives `None`. Elixir fell through to the issue map and reported the issue's
+  own global id as the assignee (D1.7.4).
+- **Jira: ADF `attrs`.** Only *string* `attrs.text`/`shortName`/`url` values are used, and
+  non-strings fall through to the next attribute. Elixir's `||` could return a number and crash the
+  string concatenation.
+- **Asana: `permalink_url`.** A non-string `permalink_url` normalizes to `None` instead of leaking a
+  non-string into `Issue.url`.
+- **Structured tracing.** Each HTTP exchange runs in a `tracker_http` debug span with the method and
+  the query-less URL. Retry attempts log Req-style warnings:
+  `retry: got response with status 503, will retry in 1000ms, 3 attempts left`.
