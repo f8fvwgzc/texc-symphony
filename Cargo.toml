@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+default-members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/f8fvwgzc/texc-symphony"
+authors = ["Symphony contributors"]
+
+[workspace.dependencies]
+# internal crates
+symphony-core = { path = "crates/symphony-core" }
+symphony-trackers = { path = "crates/symphony-trackers" }
+symphony-codex = { path = "crates/symphony-codex" }
+symphony-runtime = { path = "crates/symphony-runtime" }
+symphony-store = { path = "crates/symphony-store" }
+symphony-server = { path = "crates/symphony-server" }
+
+# shared third-party versions (crates opt in with `workspace = true`)
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "signal", "sync", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+arc-swap = "1"
+async-trait = "0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

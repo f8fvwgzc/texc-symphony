@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Web UI
+/web/node_modules/
+/web/dist/
+/web/coverage/
+*.tsbuildinfo
+
+# Runtime data
+/data/
+*.db
+*.db-wal
+*.db-shm
+/log/
+/logs/
+
+# Local environment and secrets — never commit
+.env
+.env.*
+!.env.example
+.secrets
+.credentials
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

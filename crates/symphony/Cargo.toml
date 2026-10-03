@@ -1,0 +1,17 @@
+[package]
+name = "symphony"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Symphony: turn tracker work into isolated, autonomous coding-agent runs"
+
+[[bin]]
+name = "symphony"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
