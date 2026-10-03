@@ -326,7 +326,17 @@ impl AppServerSession {
     /// line. Server messages (with a string `method`) arriving meanwhile are buffered and replayed by the
     /// next turn loop instead of being dropped; other lines are logged and ignored.
     async fn await_response(&mut self, id: i64) -> Result<Value, CodexError> {
-        self.transport.set_label(StreamLabel::Response);
+        self.await_response_labelled(id, StreamLabel::Response)
+            .await
+    }
+
+    /// Like [`Self::await_response`], but attributes out-of-band (stderr) output to `label` while waiting.
+    async fn await_response_labelled(
+        &mut self,
+        id: i64,
+        label: StreamLabel,
+    ) -> Result<Value, CodexError> {
+        self.transport.set_label(label);
         let wait = Duration::from_millis(self.codex.read_timeout_ms);
         loop {
             let line = match self.transport.next(wait).await {
@@ -394,9 +404,15 @@ impl AppServerSession {
             &self.approval_policy,
             &self.turn_sandbox_policy,
         );
+        // stderr is a separate pipe, so the label must change before the request goes out: any output the
+        // server writes while handling `turn/start` is causally part of the turn (Elixir got this ordering for
+        // free because it merged stderr into stdout).
+        self.transport.set_label(StreamLabel::Turn);
         self.transport.send(&request).await;
         let started = async {
-            let result = self.await_response(TURN_START_ID).await?;
+            let result = self
+                .await_response_labelled(TURN_START_ID, StreamLabel::Turn)
+                .await?;
             protocol::turn_id_from_result(&result).map_err(CodexError::InvalidTurnPayload)
         }
         .instrument(span.clone())

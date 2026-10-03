@@ -27,14 +27,14 @@ services:
       - path: .env
         required: false
     environment:
-      # Fixed inside the container: the published port mapping below always targets 4000, so a
-      # SYMPHONY_PORT in .env only changes the *host* port.
+      # Fixed inside the container: the published port mapping below always targets 4000.
+      # Change the host side with SYMPHONY_HOST_PORT.
       SYMPHONY_HOST: 0.0.0.0
       SYMPHONY_PORT: "4000"
     ports:
       # SYMPHONY_PUBLISH=127.0.0.1 (default) keeps the unauthenticated API on this machine.
       # Use 0.0.0.0 only behind a firewall or an authenticating reverse proxy.
-      - "${SYMPHONY_PUBLISH:-127.0.0.1}:${SYMPHONY_PORT:-4000}:4000"
+      - "${SYMPHONY_PUBLISH:-127.0.0.1}:${SYMPHONY_HOST_PORT:-4000}:4000"
     volumes:
       # SQLite run history (+ WAL files) and log files.
       - symphony-data:/data

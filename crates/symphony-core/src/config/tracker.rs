@@ -45,7 +45,7 @@ pub struct LinearSettings {
     pub api_key: String,
     /// Project slug.
     pub project_slug: String,
-    /// Optional assignee routing filter (`me`, an id, or an email).
+    /// Optional assignee routing filter: `me` (the API key's viewer) or a Linear user id.
     pub assignee: Option<String>,
 }
 redacted_debug!(LinearSettings { endpoint, project_slug, assignee ; api_key });

@@ -225,7 +225,8 @@ fn log_config_error(err: &ConfigError) -> String {
             format!("Invalid WORKFLOW.md config: {message}")
         }
         ConfigError::MissingWorkflowFile { path, reason } => {
-            format!("Missing WORKFLOW.md at {}: {reason}", path.display())
+            // Elixir logs `inspect(reason)`, i.e. the atom form `:enoent` (matches ConfigError::user_message).
+            format!("Missing WORKFLOW.md at {}: :{reason}", path.display())
         }
         ConfigError::WorkflowFrontMatterNotAMap => {
             "Failed to parse WORKFLOW.md: workflow front matter must decode to a map".into()

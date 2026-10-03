@@ -17,11 +17,6 @@ web/coverage
 **/*.tsbuildinfo
 
 # Elixir reference implementation build output
-elixir/_build
-elixir/deps
-elixir/cover
-elixir/bin
-elixir/burrito_out
 
 # Runtime data, logs and local databases
 data

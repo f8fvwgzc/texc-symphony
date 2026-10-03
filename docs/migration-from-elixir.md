@@ -212,6 +212,12 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 - **Structured tracing.** The client uses `codex_session` and `codex_turn` spans with the issue
   id, identifier and worker host.
 
+- **Deterministic stderr attribution (found by stress testing).** stderr is a separate pipe in Rust, so the
+  stream label switches to the turn label *before* `turn/start` is written. Server output produced while handling
+  the turn is therefore always logged as `turn stream output`. With the label set only after the response, a
+  loaded machine could log it as `response stream output` (Elixir merged stderr into stdout and never had
+  this race).
+
 ## symphony-trackers
 
 - **Trait shape.** `Tracker` is an object-safe `async_trait`. Every read takes the *current*

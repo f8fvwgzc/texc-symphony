@@ -1,5 +1,5 @@
 //! Token accounting and rate-limit extraction (`Orchestrator.extract_token_delta/2`,
-//! `extract_rate_limits/1`; see `docs/token_accounting.md`).
+//! `extract_rate_limits/1`; see `docs/token-accounting.md`).
 //!
 //! Extraction prefers **absolute** thread totals (`thread/tokenUsage/updated.params.tokenUsage.total`,
 //! `codex/event/token_count ... info.total_token_usage`) and never reads `last`/`last_token_usage`

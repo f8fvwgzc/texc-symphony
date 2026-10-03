@@ -117,7 +117,6 @@ docker/               Dockerfile, Compose files, example workflow
 docs/                 configuration, CLI, deployment, architecture, API and migration notes
 SPEC.md               the Symphony specification
 WORKFLOW.md           example workflow for running Symphony on this repository
-elixir/               the original Elixir reference implementation, kept during the transition
 ```
 
 How the crates fit together: [`docs/architecture.md`](docs/architecture.md).
@@ -166,8 +165,8 @@ Symphony started as an Elixir/OTP reference implementation. This repository port
 keeping [`SPEC.md`](SPEC.md) as the contract: the same `WORKFLOW.md` format, tracker behaviour and
 HTTP API. It adds run history in SQLite, live updates over Server-Sent Events, a new web
 dashboard and multi-arch container images. Behaviour differences and fixes are listed
-in [`docs/migration-from-elixir.md`](docs/migration-from-elixir.md). The Elixir code stays in
-[`elixir/`](elixir/) for reference during the transition.
+in [`docs/migration-from-elixir.md`](docs/migration-from-elixir.md). The original Elixir
+implementation remains available in this repository's git history.
 
 You can also build your own: tell your favorite coding agent to implement Symphony according to
 the [specification](https://github.com/openai/symphony/blob/main/SPEC.md).
