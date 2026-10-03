@@ -1,5 +1,6 @@
 [package]
 name = "symphony-runtime"
+description = "Symphony runtime: orchestrator actor, agent runner, workspace manager + hooks, SSH workers, supervisor and snapshots."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +8,30 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+symphony-core = { workspace = true }
+symphony-trackers = { workspace = true }
+symphony-codex = { workspace = true }
+symphony-store = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Safe `killpg` wrapper (the workspace forbids `unsafe`); same version as symphony-codex.
+rustix = { version = "1.1.5", features = ["process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

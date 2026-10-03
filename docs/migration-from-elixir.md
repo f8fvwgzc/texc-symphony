@@ -396,3 +396,120 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   - Every response carries an `x-request-id`, and requests are traced with tower-http.
   - Responses are compressed with gzip or brotli when the client asks.
   - CORS is off by default. `cors_allowed_origins` opts in, and `*` allows any origin.
+
+## symphony-runtime
+
+- **Actor instead of GenServer.** The orchestrator is one tokio task that owns all scheduling state
+  and handles one event at a time from a biased `select!`: commands (snapshot, refresh), timer
+  events (tick, poll cycle, retry), worker runtime info, per-run Codex event streams, and worker
+  completions from a `JoinSet` (the monitor `DOWN`). Tracker calls are still awaited inline, so a
+  snapshot waits behind a slow tracker call, bounded by the client's 15 s timeout.
+- **Run ids replace monitor refs.** Each dispatch gets a `run_id`. Codex events arrive on a stream
+  keyed by that run id, so events from a killed run cannot reach a newer run of the same issue.
+  Elixir keyed updates by issue id. When a worker completes, its remaining runtime-info messages and
+  Codex events are drained before the exit is handled, which keeps Elixir's "messages before `DOWN`"
+  ordering.
+- **Timers.** Tick and retry timers still carry tokens and are checked on fire (G1). Superseded or
+  removed timers are also aborted. The 20 ms poll-cycle start has no token, as in Elixir.
+- **Time.** Durations use tokio's monotonic clock: backoff, poll countdown, runtime seconds and stall
+  detection. Tests therefore run on the paused clock. Displayed timestamps (`started_at`,
+  `blocked_at`, `due_at`) use `Utc::now()`. Stall detection measures monotonic time since the last
+  Codex activity, where Elixir used wall-clock `last_codex_timestamp || started_at`.
+- **Error strings are kept** (§12.2 #15): `agent exited: <reason>`, `retry poll failed: <reason>`,
+  `retry dispatch refresh failed: <reason>`, `stalled for <n>ms without codex activity` and
+  `no available orchestrator slots`. Reasons are rendered with their `Display` tag form, such as
+  `workspace_prepare_failed: worker_host=worker-a status=75 ...`, not Elixir `inspect`.
+- **Blocked state is typed.** A run is blocked when the entry's last event is
+  `turn_input_required`/`approval_required`, when its last message is an MCP elicitation, or (new)
+  when the worker fails with `CodexError::blocker()`. This resolves §12.1 risk #2 together with the
+  codex crate. The test-only `completion` field is gone; its test is ported as "normal exit after
+  an input-required event".
+- **Worker seam.** The orchestrator spawns `WorkerFactory` futures. Production uses
+  `CodexWorkerFactory`/`AgentRunner`, and tests use `FnWorkerFactory`. A worker reports through
+  `WorkerContext { events: EventSink, reporter, cancel, cancel_grace, ... }`. A spawn can no longer
+  fail, so the Elixir spawn-failure path (G6) is gone. `schedule_issue_retry` still claims the issue
+  defensively.
+- **Snapshot.** `Snapshot` is a typed struct with Elixir field names. The differences:
+  - Lists are sorted: running and blocked by identifier, retrying by `due_in_ms`.
+  - `polling.checking` replaces `checking?`.
+  - A blocked row's `session_id` is `Option`, and presenters render `None` as `"n/a"`.
+  - New fields: `generation`, `max_concurrent_agents`, `workspace_root`, `tracker {kind,
+    project_slug}`, retry `due_at`, and running `retry_attempt`.
+  - `Snapshot::issue(identifier)` implements the E.2.4 lookup, including the
+    `<workspace.root>/<workspace_key>` fallback.
+- **Handle.** `RuntimeHandle` survives orchestrator restarts. `snapshot()` returns `Timeout` or
+  `Unavailable`. `request_refresh()` returns `Unavailable` or a new `Timeout`, where Elixir crashed
+  the request with a 500. `subscribe()` returns a `watch::Receiver<u64>` generation counter that
+  replaces the PubSub topic and is bumped on every state change. The first command channel is
+  installed before `Runtime::start` returns, so early requests queue instead of failing.
+- **SSH configuration is explicit.** `SshConfig::from_env()` reads `SYMPHONY_SSH_CONFIG` once, and
+  the executable can be injected. Tests point it at a fake `ssh` instead of rewriting `PATH`, which
+  edition 2024 makes `unsafe`. As a result there is no `ssh_not_found` test that hides `PATH`; a
+  missing explicit executable reports `ssh_spawn_failed`.
+- **Normalized SSH hosts.** `worker.ssh_hosts` is trimmed and deduplicated once
+  (`workspace::worker_hosts`). The scheduler's per-host counts and the runner's host now agree
+  (B.14 "messy config").
+- **Humanized messages.** `humanize::humanize_codex_message` ports E.5.9 for the API `last_message`
+  and the dashboard EVENT column. It looks up string keys only, and compact JSON replaces
+  `inspect/1`. Session-level events now keep their details in `last_codex_message`, so they render
+  as `session started (<id>)` and `turn ended with error: <reason>`. Elixir stored `nil` and
+  rendered `... error: nil`.
+- **Missing identifiers.** `remove_issue_workspaces(None, _)` does nothing. Elixir derived the key
+  `"issue"` and removed `<root>/issue`.
+- **Startup cleanup** still finishes before the first tick (§12.2 #22), but it is concurrent; see
+  the improvements below.
+
+### Improvements
+
+- **`after_run` on cancellation (G4, D4).** Reconciliation, stall handling and shutdown cancel a
+  worker cooperatively. The runner then drops the Codex session (killing its process group) and
+  runs `after_run`, bounded by `min(hooks.timeout_ms, worker_cancel_grace)`. The orchestrator waits
+  `worker_cancel_grace` (10 s by default) plus 500 ms, then aborts the worker. It always waits for
+  the worker to be gone before `before_remove` and `rm -rf` (G3). An aborted or panicking worker
+  still skips `after_run`.
+- **Process groups for hooks and remote commands (G5).** Local hooks (`sh -lc`) and every `ssh`
+  invocation run in their own process group, and the whole group gets `SIGKILL` on timeout or when
+  the waiting future is dropped. Elixir left `sh` and its children running. Output is merged
+  stdout and stderr, as in Elixir, and drained for at most 250 ms after exit, so a background child
+  that holds the pipe cannot hang a hook.
+- **Hook timeout names and real timeout tests (G12, §12.2 #11).** Remote hook timeouts report the
+  hook name; prepare and remove scripts still report `remote_command`. Real timeout tests replace
+  the stale Elixir one, for local and remote hooks, and include a check that a timed-out hook's
+  background child dies.
+- **Hooks no longer receive tracker secrets (D10).** The tracker secret env vars
+  (`Settings::secret_environment_names`) are removed from hook processes and from the local `ssh`
+  of remote hooks, matching what Codex already got. `RunnerOptions::strip_hook_secrets = false`
+  restores the Elixir behaviour for workflows whose hooks need the token, for example a `git clone`
+  with `$GITHUB_TOKEN`.
+- **Remote workspace containment (§12.1 #10).** Remote paths ending in `/.` or `/..` (identifiers
+  `.` or `..`) are rejected locally. The prepare script also resolves `pwd -P` of the workspace and
+  of the root on the worker. If the workspace is not strictly inside the root it exits 3 with a
+  `__SYMPHONY_WORKSPACE_ESCAPE__` line, which becomes `workspace_outside_root`, before
+  `after_create` can run.
+- **Stall retries keep their host (G8).** The stall retry carries `worker_host` and
+  `workspace_path`, so it prefers the same machine and the recorded workspace.
+- **No stuck claims (G7).** If a retry dispatch finds no SSH capacity after revalidation, it is
+  requeued with `no available orchestrator slots` instead of being dropped with the claim held.
+- **Bounded, concurrent startup cleanup (G9, §12.2 #22).** Terminal-issue workspaces are removed
+  concurrently across (issue × host) pairs, capped by `startup_cleanup_concurrency` (8 by default).
+  Each SSH command is bounded by `hooks.timeout_ms`. Removing an issue's workspaces on every
+  configured host is concurrent as well.
+- **Tracker read timeout.** Every orchestrator and runner tracker read is bounded (120 s by default,
+  `TrackerClient::with_timeout`) and fails with `tracker_timeout: <ms>ms` instead of wedging the
+  actor.
+- **One-for-all restart without overlap.** If the orchestrator panics, the supervisor aborts every
+  worker of that incarnation **and awaits** them before a fresh orchestrator starts. Workers' Codex
+  and hook process groups die on drop. More than 3 restarts within 5 s end the runtime with
+  `RuntimeError::RestartBudgetExceeded`. A panicking worker is treated like a failed run
+  (`agent exited: worker panicked: ...`) and retried.
+- **Run history (new).** Each dispatch records a `symphony-store` run.
+  - Status mapping: normal exit → `succeeded`, error → `failed`, blocker → `blocked`, and
+    reconciliation, stall or shutdown → `cancelled` with the reason.
+  - Recorded data: runtime info, turns, cumulative tokens (written only when they change) and Codex
+    events.
+  - Streaming deltas and token-count notifications are throttled to one per method per second per
+    run.
+  - Writes are fire-and-forget on a per-run task, so store errors never affect scheduling. A run
+    whose recorder disappears (orchestrator crash) is closed as `cancelled`.
+- **Structured tracing.** Each worker runs inside a `worker` span (issue id and identifier, run id,
+  attempt, worker host), and the runner adds an `agent_run` span. The Elixir log texts are kept.
