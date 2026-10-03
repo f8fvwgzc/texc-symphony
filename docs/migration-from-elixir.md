@@ -118,3 +118,96 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 - **Errors.** `ConfigError`/`TrackerConfigError` `Display` keep the snake_case tags.
   `ConfigError::user_message()` reproduces `Config.format_config_error/1`, including
   `Missing WORKFLOW.md at <p>: :enoent` and `{:unsupported_tracker_kind, "x"}`.
+
+## symphony-codex
+
+- **Wire parity.** Newline-delimited JSON with no `"jsonrpc"` field. Request ids are fixed: 1 for
+  `initialize`, 2 for `thread/start` and 3 for every `turn/start`. Responses match only on exact
+  integer ids. Method names, approval decisions, the MCP auto-answer shape and tool-result
+  normalization are byte-compatible.
+  - `thread/start` always sends `dynamicTools`, even when the list is empty.
+  - `turn/start` sends no `model`, `effort` or `summary` fields.
+  - `turn/completed` always counts as success (C.13 #4). `turn/failed` and `turn/cancelled` end the
+    turn only when `params` is present.
+- **Launch.** The local launch is `bash -lc "[unset S… && ]exec <codex.command>"`, as in Elixir.
+  It uses bash rather than `sh`, so the login profile is sourced and `unset` strips any secrets the
+  profile re-exports. Secret names are the union of `Settings::secret_environment_names()` and
+  `DynamicToolHandler::secret_environment_names()`, with invalid names dropped.
+- **SSH is a hook.** The codex crate builds the remote command
+  `cd '<ws>' && [unset … && ]exec <cmd>` (exported as `launch::remote_launch_command` and
+  `shell_escape`). The runtime's `RemoteLauncher` turns it into the `ssh` process. A remote
+  `worker_host` without a launcher fails with `remote_launcher_missing`.
+- **Dynamic tools.** Codex does not depend on trackers. The runtime implements
+  `DynamicToolHandler`, which provides `tool_specs`, `execute(tool, args, issue)` and optional
+  extra secret names, as a session-start snapshot. `NoDynamicTools` reproduces the
+  adapter-without-tools reply. A result with no boolean `success` used to be `inspect/1` output;
+  it is now compact JSON.
+- **Events.** Events are typed: `CodexEvent { timestamp, codex_app_server_pid, worker_host, usage,
+  token_usage, rate_limits, data: CodexEventData }`, and `CodexEventKind` serializes to the Elixir
+  snake_case names.
+  - Events are delivered to an `EventSink`, which wraps an unbounded mpsc sender so the read loop
+    never blocks.
+  - `CodexEvent::to_json()` gives the flat Elixir message map.
+  - Token usage and rate limits are extracted per event, using the orchestrator's rules
+    (`tokens::extract_token_usage` and `extract_rate_limits`). `TokenAccumulator` keeps the
+    high-water-mark delta logic: the `turn/completed` `usage` fallback and snake_case-only
+    `limit_id` detection are kept for parity (C.13 #9).
+- **Errors.** Errors are typed as `CodexError`. `tag()` returns the Elixir reason atom
+  (`port_exit`, `turn_input_required`, `invalid_workspace_cwd`, …), and `Display` gives
+  `"<tag>: <detail>"`. The new tags are:
+  - `remote_launcher_missing`;
+  - `port_spawn_failed`, where Elixir crashed in `Port.open`;
+  - `invalid_turn_payload` (see below).
+
+  A sandbox-policy canonicalization failure keeps core's `path_canonicalize_failed`.
+- **Kept as Elixir:** `unsupported_tool_call` only for missing or blank tool names (C.13 #7); the
+  hard-coded `"Approve this Session"` decision text (C.13 #14); and a missing codex binary showing
+  as `port_exit: 127` (C.13 #10).
+
+### Improvements
+
+- **Blocked state is reachable (C.13 #8).** When a turn ends with `turn_input_required` or
+  `approval_required`, the client no longer emits `turn_ended_with_error` afterwards. The blocker
+  event therefore stays the session's last event, and the orchestrator's
+  `input_required_blocker?(last_codex_event)` check works on worker exit.
+  - The blocker is also explicit: `CodexError::blocker()`, `CodexEvent::blocker()` and
+    `CodexEventKind::blocker()` return a `Blocker` (`InputRequired` or `ApprovalRequired`).
+  - `Blocker::message()` returns the orchestrator's `blocker_error` texts.
+  - The runner and orchestrator should use the returned error to block instead of retrying.
+  - Every other failure still emits `turn_ended_with_error`.
+- **No silently dropped server messages (C.13 #13).** While the client waits for a response, any
+  message with a string `method` is buffered (up to 1024) and replayed at the start of the next
+  turn loop. An approval or tool call that arrives before the `turn/start` result is therefore
+  answered, not lost to a turn timeout. Stray non-method JSON is still ignored.
+- **Process-group cleanup (C.13 #11, §12.2).** The child is spawned with `process_group(0)` and
+  `kill_on_drop(true)`. `stop()` shuts it down in this order:
+  1. close stdin;
+  2. wait up to `stop_grace` (2 s by default);
+  3. `SIGKILL` the whole process group, even after a clean exit, to catch leftover grandchildren;
+  4. reap the child;
+  5. drain the reader tasks, with a bounded wait.
+
+  Dropping a session also kills the group. Elixir only closed the port, which could orphan children.
+- **Bounded waits.**
+  - Waiting for the exit after stdout EOF uses the same deadline as the read.
+  - Shutdown, reaping and reader draining are all time-bounded.
+  - A dynamic tool call is bounded by `turn_timeout_ms`. Elixir's turn clock did not run during a
+    tool call. On timeout the call gets a failure reply, `Dynamic tool call timed out after Nms.`,
+    and the turn continues.
+  - stdout lines go through a bounded channel, so a server that floods output gets backpressure
+    instead of unbounded buffering.
+- **Startup.** The sandbox policy is resolved before the process is spawned; Elixir opened the port
+  first. Payload errors are explicit:
+  - `thread/start` without `thread.id` gives `invalid_thread_payload` (C.13 #5).
+  - `turn/start` without `turn.id` gives `invalid_turn_payload`, plus a `startup_failed` event.
+    Elixir passed the raw map through, and it crashed later.
+
+  Numeric ids are stringified. Non-object JSON lines no longer crash the response wait (C.13 #6).
+- **stderr stays separate (C.13 #1).** It is logged line by line with the Elixir rules
+  (`Codex <label> output: …`, a warning when an error keyword appears, truncated to 1000
+  characters). It never yields `malformed`, and the last 50 lines are available through
+  `AppServerSession::stderr_tail()`.
+- **Secrets on remote launches (C.13 #12).** Secret env vars are also removed from the local `ssh`
+  process environment, so `SendEnv` cannot forward them. Elixir relied only on the remote `unset`.
+- **Structured tracing.** The client uses `codex_session` and `codex_turn` spans with the issue
+  id, identifier and worker host.
