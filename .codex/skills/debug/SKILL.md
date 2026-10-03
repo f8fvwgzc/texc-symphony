@@ -16,11 +16,19 @@ description:
 
 ## Log Sources
 
-- Primary runtime log: `log/symphony.log`
-  - Default comes from `SymphonyElixir.LogFile` (`log/symphony.log`).
+- Primary runtime log: `log/symphony.log` under the logs root
+  - The logs root is `--logs-root`, else `SYMPHONY_LOGS_ROOT`, else the
+    directory Symphony was started from (Docker: `/data/logs`, so
+    `/data/logs/log/symphony.log`). See `docs/cli.md` (Logging).
   - Includes orchestrator, agent runner, and Codex app-server lifecycle logs.
-- Rotated runtime logs: `log/symphony.log*`
+- Rotated runtime logs: `log/symphony.log*` (`symphony.log.1` .. `symphony.log.5`,
+  rotated at 10 MiB)
   - Check these when the relevant run is older.
+- The same lines also go to stdout when the terminal dashboard is not active
+  (`docker logs`, `journalctl`), as text or JSON (`SYMPHONY_LOG_FORMAT`).
+
+The commands below assume the logs root is the current directory; `cd` into it
+first or adjust the paths.
 
 ## Correlation Keys
 
@@ -28,8 +36,8 @@ description:
 - `issue_id`: Linear UUID (stable internal ID)
 - `session_id`: Codex thread-turn pair (`<thread_id>-<turn_id>`)
 
-`elixir/docs/logging.md` requires these fields for issue/session lifecycle logs. Use
-them as your join keys during debugging.
+The logging conventions in `docs/cli.md` (Logging) require these fields for
+issue/session lifecycle logs. Use them as your join keys during debugging.
 
 ## Quick Triage (Stuck Run)
 
@@ -115,4 +123,4 @@ concurrent runs.
 - Prefer `rg` over `grep` for speed on large logs.
 - Check rotated logs (`log/symphony.log*`) before concluding data is missing.
 - If required context fields are missing in new log statements, align with
-  `elixir/docs/logging.md` conventions.
+  the logging conventions in `docs/cli.md`.

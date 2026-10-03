@@ -1,7 +1,17 @@
 [package]
 name = "xtask"
+description = "Symphony repository chores (`cargo run -p xtask -- <task>`); never shipped."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

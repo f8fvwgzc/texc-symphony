@@ -513,3 +513,117 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
     whose recorder disappears (orchestrator crash) is closed as `cancelled`.
 - **Structured tracing.** Each worker runs inside a `worker` span (issue id and identifier, run id,
   attempt, worker host), and the runner adds an `agent_run` span. The Elixir log texts are kept.
+
+## symphony (binary)
+
+- **One `main`.** `SymphonyElixir.CLI` (escript), the Burrito `__BURRITO=1` path and
+  `Application.start/2` become `symphony_cli::app::main` (`crates/symphony/src/app.rs`); `main.rs`
+  only calls it. `cli::evaluate` is pure (CWD, environment and the `File.regular?/1` check are
+  injected), so the `cli_test.exs` cases run as unit tests without touching process state.
+- **CLI parity.** The Elixir check order is kept: parse/usage, then the acknowledgement banner
+  (byte-identical red box; `This Symphony implementation is a low key engineering preview.` is the
+  first line the release smoke test greps), then `--logs-root` (trimmed, last wins, empty is a
+  usage error), then `--port` (last wins), then the workflow file (`Workflow file not found:
+  <expanded path>`), then boot. Parsing still happens before the acknowledgement check. Bad
+  arguments print the exact Elixir line `Usage: symphony [--logs-root <path>] [--port <port>]
+  [path-to-WORKFLOW.md]` followed by a second line `Run \`symphony --help\` for all options.`
+  (the Rust CLI has more options than that line lists) and exit 1 instead of clap's 2.
+- **Superset of the CLI.** `--host`, `--db-path`/`--no-db`, `--help`, `--version` (crate version
+  plus the build-time `SYMPHONY_VERSION_SUFFIX`, e.g. `0.1.0-nightly`), environment fallbacks
+  (`SYMPHONY_WORKFLOW`, `SYMPHONY_HOST`, `SYMPHONY_PORT`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_DB_PATH`,
+  `SYMPHONY_DB_RETENTION_DAYS`, `SYMPHONY_LOG_FORMAT`; a flag always wins, the variable wins over
+  `WORKFLOW.md`), and the `workspace before-remove` subcommand. A workflow file literally named
+  `workspace` must be passed as `./workspace`.
+- **Startup order.** The workflow is loaded and validated before logging is configured (Elixir
+  configured the log handler first), because whether stdout carries logs depends on
+  `observability.dashboard_enabled`. Load errors still go to stderr with
+  `Failed to start Symphony with workflow <path>: <reason>`, where `<reason>` is
+  `ConfigError::user_message()` instead of an Elixir `inspect` term. A bad HTTP host or a busy port
+  aborts startup with the same prefix (Elixir: the `HttpServer` child failed to start).
+- **Exit codes.** 0 after SIGINT/SIGTERM (the BEAM had its own handling); 1 for usage, banner,
+  missing/invalid workflow, startup failures, a runtime that exceeded its restart budget, or a
+  second signal during shutdown.
+- **Log file.** `<logs_root>/log/symphony.log`, 10 MiB × 5, written by a small size-rotating
+  writer (`rotating.rs`; `tracing-appender` only rotates by time). Files are `symphony.log`
+  (active) and `symphony.log.1`..`.5`, not disk_log's `.1..5`/`.idx`/`.siz`. Lines are `tracing`'s
+  single-line text format; the `key=value` context stays in the message text, so the `debug`
+  skill's grep patterns still match.
+- **Terminal dashboard.** `dashboard::format` reproduces the E.5 frames byte for byte; the Elixir
+  golden fixtures are copied verbatim to `crates/symphony/tests/fixtures/status_dashboard_snapshots/`
+  and checked by `tests/status_dashboard_snapshots.rs` (`UPDATE_SNAPSHOTS=1` rewrites them, as in
+  Elixir). `dashboard::Scheduler` ports the render coalescing (one frame per
+  `render_interval_ms`, latest wins, identical frames skipped, re-render at least every second);
+  `dashboard::tps` ports the 5 s rolling throughput, its once-per-second throttle and the
+  (still unrendered) 10-minute sparkline with the Elixir test vectors. Without a TTY the dashboard
+  falls back to `COLUMNS`, 120 when unset and 115 when invalid, as in Elixir.
+  `observability.refresh_ms`/`render_interval_ms` are re-read on every tick and
+  `dashboard_enabled: false` stops a running dashboard (it cannot be switched on live), as in
+  Elixir.
+- **HTTP adapter.** `control::RuntimeControlPlane` implements `symphony_server::ControlPlane` over
+  `RuntimeHandle`: snapshot rows map onto the API views with `humanize_codex_message` for
+  `last_message`, `due_at` is recomputed per request from `due_in_ms` (Elixir parity, may jitter by
+  one second), `SnapshotError::{Timeout, Unavailable}` map to `snapshot_timeout`/
+  `snapshot_unavailable`, and both refresh failures map to `503 orchestrator_unavailable`.
+- **`workspace before-remove`** ports `mix workspace.before_remove` with the same messages, the
+  hard-coded `openai/symphony` default repository and the same no-op rules (no branch, no `gh`,
+  `gh auth status` failing, `gh pr list` failing). Commands are resolved on `PATH` at call time
+  through a `CommandRunner`, so tests inject fakes instead of mutating the global `PATH`.
+- **Not ported:** `mix specs.check` (Rust signatures are always typed; `missing_docs` and
+  `clippy -D warnings` replace the policy), and the Phoenix `secret_key_base`.
+
+### Improvements
+
+- **Logs reach `docker logs` and journald.** Elixir removed the console handler whenever the file
+  handler was installed, so a container or a systemd unit showed nothing. Logs now also go to
+  stdout whenever stdout is not a terminal or the terminal dashboard is disabled, as text or, with
+  `SYMPHONY_LOG_FORMAT=json`, as JSON lines.
+- **TTY check for the terminal dashboard** (E.9 #6). It only runs when stdout is a terminal, so
+  redirected output never fills with clear-screen escape sequences; the `app_status=offline` frame
+  is likewise only written when the dashboard was running.
+- **Live status colours** (E.9 #8). Elixir compared string literals with atom events, so nearly
+  every live row was blue. The colour key is now the event name, or the `codex/event/*` method of a
+  wrapper notification, so `turn_completed` (magenta), `codex/event/task_started` (green) and
+  `codex/event/token_count` (yellow) light up as intended. The golden fixtures are unchanged.
+- **One line per retry entry** (E.9 #9). Elixir joined retry rows with `", "` and split them again,
+  so an error text containing `", "` broke into unprefixed lines.
+- **Render fingerprint includes the frame context.** A change to `agent.max_concurrent_agents`,
+  the project slug or the bound URL redraws immediately instead of within the 1 s periodic
+  re-render.
+- **Graceful, bounded shutdown.** SIGINT/SIGTERM stop the dashboard, cancel agent runs (each gets
+  the runtime's 10 s grace for `after_run` before its process group is killed), drain the HTTP
+  server (10 s), flush the run-history store (bounded by 10 s) and exit 0. A second signal forces
+  exit 1 immediately; the tokio runtime is shut down with a 5 s bound so a stuck blocking task
+  cannot hang the exit.
+- **Run history lifecycle.** At startup the store closes runs left `running` by a crashed process
+  (`cancelled`, "interrupted by restart") and prunes by `SYMPHONY_DB_RETENTION_DAYS` (newest 100
+  runs always kept), then prunes every 24 h. An unopenable database aborts startup with a hint to
+  use `--no-db` instead of silently running without history.
+- **Memory tracker from `WORKFLOW.md`.** With `tracker.kind: memory`, `tracker.provider.issues`
+  seeds the in-memory tracker (applied synchronously before the first poll, re-applied when the
+  reloaded workflow changes it; `dispatchable` defaults to `true`). Elixir could only fill it from
+  application env in tests; this makes demos and the binary's end-to-end test possible without a
+  real tracker.
+- **`before-remove` reads PR numbers from stdout only.** Elixir merged stderr into stdout, so a
+  `gh` warning could be taken for a PR number. Failure output still includes both streams. A
+  process killed by a signal reports `exit signal` instead of crashing the task.
+- **Invalid environment values are named** (`Invalid SYMPHONY_PORT="abc": expected a port number
+  between 0 and 65535`) instead of falling back silently.
+
+## xtask
+
+- **`pr-body-check`** ports `mix pr_body.check` (`cargo run -p xtask -- pr-body-check --file F`).
+  Messages are byte-compatible (`Missing required heading: ...`, `Required headings are out of
+  order.`, the placeholder, empty-section, bullet and checkbox errors, `ERROR: ` prefixes on
+  stderr, `PR body format invalid. Read \`<template>\` and follow it precisely.`, `PR body format
+  OK`), and so are the matching rules: substring heading search, sections only when a heading is
+  followed by exactly `"\n\n"`, the next section starting at the first `"\n" + <any other
+  heading>`, CRLF headings keeping their `\r`. Invalid options print the Elixir
+  `Invalid option(s): [{"--wat", nil}]`; positional arguments are ignored.
+- The template is still looked up relative to the working directory
+  (`.github/pull_request_template.md`, then `../.github/pull_request_template.md`); new:
+  `--template <path>` overrides it and `$PR_BODY_FILE` stands in for `--file`. An unreadable body
+  reports the OS error text instead of an Elixir atom (`Unable to read missing.md: No such file or
+  directory (os error 2)`).
+- All 15 `pr_body_check_test.exs` cases are ported as unit tests (run against temporary
+  directories passed as the working directory, so they run in parallel), plus a test that the
+  repository's own template accepts a filled-in body.

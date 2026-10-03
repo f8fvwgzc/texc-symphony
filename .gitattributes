@@ -1,0 +1,2 @@
+# Golden terminal-dashboard frames (regenerate with UPDATE_SNAPSHOTS=1 cargo test -p symphony --test status_dashboard_snapshots).
+crates/symphony/tests/fixtures/status_dashboard_snapshots/* linguist-generated=true

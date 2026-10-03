@@ -4,8 +4,9 @@ The contract lives in [`openapi.yaml`](./openapi.yaml) (OpenAPI 3.1). A running 
 it as JSON at `GET /api/openapi.json`. This page is the human guide.
 
 - **Base URL:** `http://<server.host>:<port>`; the default host is `127.0.0.1`. The server starts
-  only when `server.port` is set in `WORKFLOW.md` or `--port` is passed. `0` binds an ephemeral
-  port, and the terminal dashboard prints the real URL.
+  only when `server.port` is set in `WORKFLOW.md`, `--port` is passed or `SYMPHONY_PORT` is
+  set. `0` binds an ephemeral port; the binary prints the real URL on stdout
+  (`Symphony listening on http://127.0.0.1:<port>/`).
 - **Auth:** none. Bind to loopback, or put an authenticating proxy in front.
 - **Format:** JSON (`application/json`). The one exception is the SSE stream, which is
   `text/event-stream`.

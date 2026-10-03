@@ -55,17 +55,18 @@ Rules that keep the graph acyclic and the builds fast:
 ## Runtime topology
 
 ```text
-main()
- ├─ cli::parse()                  exits 1 with the usage / guardrails banner on error
- ├─ logging::init(logs_root)      rotating file sink (10 MiB × 5)
+main()                            crates/symphony/src/app.rs
+ ├─ cli::evaluate(argv, env)      exits 1 with the usage / guardrails banner / not-found message
  ├─ WorkflowStore::start(path)?   a bad workflow refuses to boot; afterwards it reloads every 1 s
- ├─ Store::open(SYMPHONY_DB_PATH) mark_interrupted_runs(), prune(retention) (+ every 24 h)
- ├─ ctx = Arc<AppContext { workflow store, store, generation: watch<u64>, shutdown token, ... }>
- ├─ spawn supervise("agent_runtime", Runtime::run)   orchestrator task + JoinSet of agent runs
- ├─ if a port is configured: spawn symphony_server::serve(ControlPlane, store)
- ├─ if observability.dashboard_enabled: spawn the terminal status dashboard
- └─ select! { SIGINT | SIGTERM => shutdown.cancel(), runtime fatal => exit(1) }
-     then abort workers (kills codex / ssh / hook process groups), flush the store, exit 0
+ ├─ logging::init(logs_root)      rotating file sink (10 MiB × 5) + stdout unless the TUI owns it
+ ├─ Store (--db-path / SYMPHONY_DB_PATH) mark_interrupted_runs(), prune(retention) (+ every 24 h)
+ ├─ memory_seed                   tracker.provider.issues -> memory tracker (kind: memory only)
+ ├─ Runtime::start(options)       supervisor: orchestrator task + JoinSet of agent runs
+ ├─ if a port is configured: symphony_server::serve(RuntimeControlPlane, store); print the URL
+ ├─ if observability.dashboard_enabled && stdout is a TTY: spawn the terminal status dashboard
+ └─ select! { SIGINT | SIGTERM => graceful stop, runtime fatal => exit(1) }
+     graceful stop: dashboard -> runtime shutdown (workers cancelled, then their process groups
+     killed) -> HTTP drain -> store flush -> offline frame -> exit 0 (a second signal: exit 1)
 ```
 
 Invariants carried over from the Elixir OTP design:

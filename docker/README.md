@@ -42,8 +42,8 @@ checkout instead: `docker compose up -d --build`, or set `SYMPHONY_PULL_POLICY=b
 Useful commands:
 
 ```sh
-docker compose logs -f symphony                 # container output
-docker compose exec symphony ls /data/logs      # Symphony's own log files
+docker compose logs -f symphony                 # log stream (stdout; SYMPHONY_LOG_FORMAT=json for JSON)
+docker compose exec symphony ls /data/logs/log  # rotating log files (symphony.log*)
 curl -s http://127.0.0.1:4000/api/v1/health     # {"status":"ok",...}
 docker compose restart symphony                 # after editing .env (WORKFLOW.md reloads by itself)
 docker compose down                             # stop; volumes (history, workspaces) are kept

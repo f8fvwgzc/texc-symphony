@@ -20,17 +20,19 @@ symphony --version
 ```
 
 Without the acknowledgement flag Symphony prints the guardrails banner and exits 1. The workflow
-path defaults to `./WORKFLOW.md`.
+path defaults to `./WORKFLOW.md`. Flags win over environment variables, which win over
+`WORKFLOW.md`; the full reference is [`cli.md`](cli.md).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `SYMPHONY_WORKFLOW` | `./WORKFLOW.md` | workflow file (the positional argument wins) |
 | `SYMPHONY_HOST` | `127.0.0.1` | HTTP bind address (`0.0.0.0` in containers) |
 | `SYMPHONY_PORT` | unset (no HTTP server) | HTTP port; same as `--port` or `server.port` in `WORKFLOW.md`; `0` picks a free port |
-| `SYMPHONY_LOGS_ROOT` | `./log` | directory for the rotating log files |
+| `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
 | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`) |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
-| `RUST_LOG` | | `tracing` filter, e.g. `info` or `symphony=debug,info` |
+| `SYMPHONY_LOG_FORMAT` | `text` | `json` for one JSON object per line on stdout (the log file stays text) |
+| `RUST_LOG` | `info` | `tracing` filter, e.g. `info` or `symphony=debug,info` |
 | `SYMPHONY_SSH_CONFIG` | | SSH client config for `worker.ssh_hosts` |
 | `LINEAR_API_KEY`, `GITHUB_TOKEN`, `GITLAB_PAT`, `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`, `ASANA_PAT` | | tracker credentials (only the one your workflow uses); kept out of the Codex child environment |
 
@@ -159,7 +161,7 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now symphony
 systemctl status symphony
-journalctl -u symphony -f              # process output; Symphony's own logs are in /var/log/symphony
+journalctl -u symphony -f              # log stream (stdout); files in /var/log/symphony/log/
 curl -s http://127.0.0.1:4000/api/v1/health
 ```
 
@@ -219,7 +221,7 @@ blocked) is in memory and is rebuilt from the tracker after a restart; only hist
   `--no-db` disables it, and the history endpoints then answer `503 store_disabled`.
 
 Workspaces (`workspace.root`) are disposable: Symphony recreates them from the tracker and your
-hooks. Logs rotate at 10 MiB × 5 files under `SYMPHONY_LOGS_ROOT`.
+hooks. Logs rotate at 10 MiB × 5 files under `<SYMPHONY_LOGS_ROOT>/log/`.
 
 ## Upgrading
 

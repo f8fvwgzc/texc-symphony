@@ -51,6 +51,11 @@ wiremock = "0.6.5"
 axum = "0.8.9"
 tower = "0.5.3"
 tower-http = "0.7.1"
+# Binary + dev tooling (symphony, xtask)
+clap = { version = "4.6.7", features = ["derive"] }
+unicode-segmentation = "1.13.3"
+regex = "1.13.1"
+assert_cmd = "2.2.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

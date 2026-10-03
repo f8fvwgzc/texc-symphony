@@ -1,6 +1,6 @@
 ---
 # Container-oriented starting point. Copy to docker/config/WORKFLOW.md and edit.
-# Full contract: SPEC.md and the workflow reference in the main README.
+# Full contract: SPEC.md and the workflow reference in docs/configuration.md.
 tracker:
   kind: linear
   provider:

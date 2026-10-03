@@ -7,11 +7,47 @@ license.workspace = true
 repository.workspace = true
 description = "Symphony: turn tracker work into isolated, autonomous coding-agent runs"
 
+# The library holds everything testable (CLI evaluation, bootstrap, terminal dashboard, the
+# `workspace before-remove` subcommand); `main.rs` only calls it. A distinct lib name avoids the
+# lib/bin output-name collision in `cargo doc`.
+[lib]
+name = "symphony_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "symphony"
 path = "src/main.rs"
 
 [dependencies]
+symphony-core = { workspace = true }
+symphony-trackers = { workspace = true }
+symphony-codex = { workspace = true }
+symphony-runtime = { workspace = true }
+symphony-store = { workspace = true }
+symphony-server = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Terminal size (`tcgetwinsize`) without `unsafe`; same version as the other crates.
+rustix = { version = "1.1.5", features = ["termios"] }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.5", features = ["process", "termios"] }
 
 [lints]
 workspace = true
