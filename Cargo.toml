@@ -47,6 +47,10 @@ percent-encoding = "2.3.2"
 base64 = "0.23.1"
 httpdate = "1.0.3"
 wiremock = "0.6.5"
+# HTTP server stack (symphony-server)
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = "0.7.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

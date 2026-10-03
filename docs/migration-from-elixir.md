@@ -300,3 +300,99 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 - **Structured tracing.** Each HTTP exchange runs in a `tracker_http` debug span with the method and
   the query-less URL. Retry attempts log Req-style warnings:
   `retry: got response with status 503, will retry in 1000ms, 3 attempts left`.
+
+## symphony-server
+
+- **LiveView becomes a Vite SPA plus SSE.** Phoenix, LiveView, the `/live` socket, the session
+  cookie, CSRF, `secret_key_base`, `Plug.MethodOverride` and the vendored Phoenix JS are gone.
+  - `GET /` serves the `web/` dashboard (a Vite bundle that `build.rs` embeds from `web/dist` at
+    compile time).
+  - The dashboard reads the JSON API and subscribes to `GET /api/v1/events` (Server-Sent Events).
+  - The old `/dashboard.css` and `/vendor/...` routes are dropped and now answer the JSON 404.
+  - If `web/dist` is missing at build time, a small placeholder page is embedded instead
+    (`src/placeholder.html`, which tells you to run `pnpm --dir web build`). Cargo prints a
+    warning, but the Rust build never fails. `SYMPHONY_WEB_DIST` overrides the bundle path, and
+    `symphony_server::WEB_UI_EMBEDDED` tells the binary which page it embedded.
+  - Caching: `index.html` and the other unhashed files are `no-cache`, and hashed `/assets/*` are
+    `public, max-age=31536000, immutable`. Every file has a strong ETag, and `If-None-Match`
+    answers 304.
+  - There is no SPA fallback, because the dashboard uses hash routing. Every other non-API path
+    keeps the Elixir JSON `404 not_found`.
+- **No dependency on the runtime.** The server defines its own view model (`view::*`, which is
+  also the JSON contract) and the `ControlPlane` trait. The binary adapts the orchestrator to
+  that trait, using `state`, `refresh`, `workspace_root` and `changes` (a `watch::Receiver<u64>`
+  generation counter that replaces the PubSub topic). `issue` has a default implementation built
+  on `presenter::issue_view`.
+- **Kept as Elixir.** These keep their Elixir behavior:
+  - Routes, the 404/405 envelopes, and `GET /api/v1/state` always returning 200, with
+    `snapshot_timeout` / `snapshot_unavailable` reported in the body.
+  - Issue lookup: running, then retrying, then blocked; any snapshot failure gives
+    `issue_not_found`.
+  - `restart_count = max(attempt - 1, 0)`, `recent_events` taken from `running || blocked` and
+    dropped when there is no timestamp, and the workspace fallback
+    `Path.join(workspace.root, workspace_key(id))`.
+  - `logs.codex_session_logs` is always `[]`, `tracked` is always `{}`, and `due_at` is
+    recomputed per request (E.9 #5).
+  - `codex_totals.seconds_running` counts ended sessions only, and is passed through (E.9 #1).
+  - Timestamps are second-truncated with a `Z` suffix, except `requested_at`, which has
+    microseconds.
+  - A single trailing slash is ignored (`NormalizePathLayer`), and `HEAD` works on every `GET`
+    route.
+  - The bind host must be an IP literal or a name that resolves, preferring IPv4. A bad host
+    or a busy port is a startup error.
+  - Lists are sorted by `issue_id` (E.9 #14).
+- **Serialization details.** `seconds_running` serializes whole values as integers (`42`) and
+  others as floats (`42.5`), as Jason did for integer and float terms. JSON key order is the
+  struct order; clients must not depend on it.
+- **Reserved identifiers.** Literal routes win, so `state`, `refresh`, `health`, `events`, `runs`
+  and `totals` cannot be looked up as issues. An identifier that is not valid UTF-8 after
+  percent-decoding answers `404 issue_not_found`.
+- **New endpoints.** These follow `docs/api/openapi.yaml`:
+  - `health`, which never touches the orchestrator;
+  - `events` (SSE);
+  - `runs`, `runs/{id}`, `runs/{id}/events` and `totals`, backed by `symphony-store`. They answer
+    `503 store_disabled` when persistence is off. Bad values answer `400 invalid_parameter`, and
+    the message names the parameter. An unknown run answers `404 run_not_found`.
+  - `/api/openapi.json`. `build.rs` converts the YAML contract at compile time, keeping key order.
+
+### Improvements
+
+- **Debounced, shared snapshots for live updates (E.9 #12).** Elixir broadcast on every Codex
+  event, and each LiveView took a full snapshot per message.
+  - One SSE hub task debounces generation changes on both edges (200 ms by default), so a burst
+    yields at most about 5 snapshots per second.
+  - The hub takes **one** snapshot per window for all clients, and none while no client is
+    connected.
+  - Each client is pull-based and reads a `watch` channel that holds only the latest frame. A
+    slow client skips intermediate snapshots and always gets the newest one, with constant memory
+    per client.
+  - The hub subscribes to changes before the first client takes its initial snapshot, so no
+    change can fall between them. A test caught this race.
+- **SSE protocol.**
+  - The stream opens with `retry: 3000`.
+  - Each `snapshot` event's `id` is the generation.
+  - A `heartbeat` (`{at, generation}`, no id) is sent every 15 s.
+  - A client that reconnects with `Last-Event-ID` gets the current snapshot first.
+  - Headers are `Cache-Control: no-cache` and `X-Accel-Buffering: no`. SSE is never compressed or
+    subject to the request timeout.
+  - `max_sse_clients` (default 64) bounds streams; extra clients get `503 request_failed`.
+  - Streams end as soon as shutdown starts, so graceful shutdown never hangs on open dashboards.
+    `shutdown_grace` (10 s) bounds how long other connections may take to finish.
+- **Timeouts are enforced by the server, not the implementor.**
+  - Snapshot: 15 s, reported as `snapshot_timeout`.
+  - Issue lookup: 15 s, answered as a 404.
+  - Refresh: 5 s, answered as `503 orchestrator_unavailable`. Elixir crashed into a 500 here
+    (E.9 #13).
+  - Every non-streaming request: 30 s, answered as `503 request_failed`.
+- **Failures keep the JSON envelope.**
+  - A handler panic is caught and answers `500 request_failed`, matching Phoenix
+    `render_errors`, instead of dropping the connection.
+  - Store errors map to `request_failed` (500, or 503 when the store thread is gone) and are
+    logged.
+- **Hardening.**
+  - Security headers go on every response, not just `GET /`: `nosniff`, `SAMEORIGIN`,
+    `strict-origin-when-cross-origin`, `x-permitted-cross-domain-policies: none`, and a strict
+    CSP (`script-src 'self'`).
+  - Every response carries an `x-request-id`, and requests are traced with tower-http.
+  - Responses are compressed with gzip or brotli when the client asks.
+  - CORS is off by default. `cors_allowed_origins` opts in, and `*` allows any origin.

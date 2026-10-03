@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Symphony Observability</title>
+  </head>
+  <body>
+    <main>
+      <h1>Symphony Observability</h1>
+      <p>
+        The web dashboard was not embedded in this build because <code>web/dist</code> was missing
+        when <code>symphony-server</code> was compiled.
+      </p>
+      <p>Build it, then rebuild Symphony:</p>
+      <pre><code>pnpm --dir web install
+pnpm --dir web build
+cargo build</code></pre>
+      <p>
+        The JSON API works without the dashboard: <a href="/api/v1/state">/api/v1/state</a>,
+        <a href="/api/v1/health">/api/v1/health</a> and
+        <a href="/api/openapi.json">/api/openapi.json</a>.
+      </p>
+    </main>
+  </body>
+</html>
