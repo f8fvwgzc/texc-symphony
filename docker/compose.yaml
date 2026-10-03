@@ -1,0 +1,76 @@
+# Symphony with Docker Compose. Run from this directory:
+#
+#   cp .env.example .env                  # then fill in tracker credentials
+#   mkdir -p config && cp WORKFLOW.example.md config/WORKFLOW.md   # then edit it
+#   docker compose up -d                  # pulls the published image, or builds it locally
+#   open http://127.0.0.1:4000            # dashboard; API under /api/v1
+#
+# See README.md in this directory for Apple Silicon/Intel, Linux servers and reverse proxies.
+
+name: symphony
+
+services:
+  symphony:
+    image: ${SYMPHONY_IMAGE:-ghcr.io/f8fvwgzc/texc-symphony}:${SYMPHONY_IMAGE_TAG:-latest}
+    # `docker compose build` (or `up --build`) builds the image from this checkout instead.
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        INSTALL_CODEX: ${INSTALL_CODEX:-true}
+        CODEX_VERSION: ${CODEX_VERSION:-0.160.0}
+    # missing: use a local image if present, otherwise pull, otherwise build.
+    pull_policy: ${SYMPHONY_PULL_POLICY:-missing}
+    restart: unless-stopped
+    init: false # the image already runs tini as PID 1
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Fixed inside the container: the published port mapping below always targets 4000, so a
+      # SYMPHONY_PORT in .env only changes the *host* port.
+      SYMPHONY_HOST: 0.0.0.0
+      SYMPHONY_PORT: "4000"
+    ports:
+      # SYMPHONY_PUBLISH=127.0.0.1 (default) keeps the unauthenticated API on this machine.
+      # Use 0.0.0.0 only behind a firewall or an authenticating reverse proxy.
+      - "${SYMPHONY_PUBLISH:-127.0.0.1}:${SYMPHONY_PORT:-4000}:4000"
+    volumes:
+      # SQLite run history (+ WAL files) and log files.
+      - symphony-data:/data
+      # Per-issue agent workspaces; WORKFLOW.md must use `workspace.root: /workspaces`.
+      - symphony-workspaces:/workspaces
+      # Directory holding WORKFLOW.md. A directory (not a single-file bind) so edits that replace
+      # the file are still seen by the 1 s reload poll.
+      - ${SYMPHONY_CONFIG_DIR:-./config}:/config:ro
+      # Codex state (sessions, logs, auth written by `codex login` inside the container).
+      - codex-home:/home/symphony/.codex
+      # Optional: reuse the host's Codex login read-only. Uncomment, or enable it from .env with
+      # COMPOSE_FILE=compose.yaml:compose.codex-auth.yaml (see compose.codex-auth.yaml).
+      # - ${CODEX_AUTH_JSON:-~/.codex/auth.json}:/home/symphony/.codex/auth.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:4000/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    # Running agents are killed and the SQLite store is flushed on SIGTERM; give it time.
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "${SYMPHONY_CPUS:-4}"
+          memory: ${SYMPHONY_MEMORY:-8g}
+          pids: ${SYMPHONY_PIDS:-4096}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  symphony-data:
+  symphony-workspaces:
+  codex-home:

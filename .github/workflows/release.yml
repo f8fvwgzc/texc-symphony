@@ -1,0 +1,374 @@
+name: release
+
+# v* tags: build the four release binaries, smoke-test them on native runners, publish them to
+# the GitHub release with checksums, and push the multi-arch image to GHCR with semver tags.
+# Manual runs build + smoke-test only (assets labelled with the short SHA), unless `nightly` is
+# set: then the rolling `nightly` prerelease and the `nightly` image tag are updated from the
+# selected branch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: Publish the rolling `nightly` prerelease and image tag
+        type: boolean
+        default: false
+  # Optional automatic nightly: uncomment to rebuild main every night.
+  # schedule:
+  #   - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ (inputs.nightly || github.event_name == 'schedule') && 'nightly' || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  ZIG_VERSION: 0.16.0
+  CARGO_ZIGBUILD_VERSION: 0.23.4
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      nightly: ${{ steps.version.outputs.nightly }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
+
+      - name: Resolve version (and check tag == Cargo version)
+        id: version
+        env:
+          NIGHTLY: ${{ inputs.nightly == true || github.event_name == 'schedule' }}
+        run: |
+          crate_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "symphony") | .version')"
+          if test "$GITHUB_REF_TYPE" = "tag"; then
+            if test -z "$crate_version" || test "$GITHUB_REF_NAME" != "v$crate_version"; then
+              echo "Release tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version." >&2
+              exit 1
+            fi
+            version="$GITHUB_REF_NAME"; publish=true
+          elif test "$NIGHTLY" = "true"; then
+            version="nightly"; publish=true
+          else
+            version="${GITHUB_SHA::7}"; publish=false
+          fi
+          {
+            echo "version=$version"
+            echo "nightly=$NIGHTLY"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "symphony $crate_version -> assets labelled $version (publish=$publish)"
+
+  web:
+    name: web bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6 # v6.1.0; version from web/package.json "packageManager"
+        with:
+          package_json_file: web/package.json
+
+      - name: Install Node.js 22
+        uses: actions/setup-node@v7 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build web/dist
+        run: |
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web build
+
+      - name: Upload web/dist
+        uses: actions/upload-artifact@v7 # v7.0.1
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    name: build-${{ matrix.target }}
+    needs: [prepare, web]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: fully static musl binaries, cross-linked with zig (cargo-zigbuild) so the C
+          # dependencies (aws-lc-sys, bundled SQLite) need no per-target toolchain.
+          - target: linux_x86_64
+            triple: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          - target: linux_arm64
+            triple: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+          # macOS: native builds (SDK/framework linking stays with Apple's toolchain).
+          - target: macos_x86_64
+            triple: x86_64-apple-darwin
+            os: macos-15-intel
+            zig: false
+          - target: macos_arm64
+            triple: aarch64-apple-darwin
+            os: macos-15
+            zig: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install Rust 1.99.0 (${{ matrix.triple }})
+        uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install zig
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2 # v2.87.22
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2 # v2.9.2
+        with:
+          key: release-${{ matrix.triple }}
+
+      - name: Download web/dist
+        uses: actions/download-artifact@v8 # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Build symphony
+        env:
+          ZIG: ${{ matrix.zig }}
+          TRIPLE: ${{ matrix.triple }}
+          SYMPHONY_WEB_DIST: ${{ github.workspace }}/web/dist
+          SYMPHONY_VERSION_SUFFIX: ${{ needs.prepare.outputs.nightly == 'true' && '-nightly' || '' }}
+        run: |
+          test -f "$SYMPHONY_WEB_DIST/index.html" # never ship the placeholder page
+          if test "$ZIG" = "true"; then
+            cargo zigbuild --release --locked -p symphony --target "$TRIPLE"
+          else
+            cargo build --release --locked -p symphony --target "$TRIPLE"
+          fi
+
+      - name: Stage release assets
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          artifact="symphony-${VERSION}-${TARGET}"
+          mkdir -p dist
+          cp "target/${TRIPLE}/release/symphony" "dist/$artifact"
+          chmod 0755 "dist/$artifact"
+          cd dist
+          shasum -a 256 "$artifact" > "$artifact.sha256"
+          cat "$artifact.sha256"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v7 # v7.0.1
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  smoke:
+    name: smoke-${{ matrix.target }}
+    needs: [prepare, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux_x86_64
+            runner: ubuntu-24.04
+          - target: linux_arm64
+            runner: ubuntu-24.04-arm
+          - target: macos_x86_64
+            runner: macos-15-intel
+          - target: macos_arm64
+            runner: macos-15
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8 # v8.0.1
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist
+
+      - name: Smoke test executable
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cd dist
+          shasum -a 256 -c ./*.sha256
+          artifact="$(find . -type f ! -name '*.sha256' -print -quit)"
+          test -n "$artifact"
+          chmod +x "$artifact"
+
+          # Without the acknowledgement flag the binary must print the guardrails banner and
+          # exit 1 (CLI contract, blueprint A.6 / F.3).
+          set +e
+          output="$("$artifact" 2>&1)"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          grep -F "This Symphony implementation is a low key engineering preview." <<<"$output"
+
+          # The embedded version must equal the tag without its leading "v".
+          version_output="$("$artifact" --version)"
+          echo "$version_output"
+          case "$VERSION" in
+            v*) grep -F "${VERSION#v}" <<<"$version_output" ;;
+            nightly) grep -F -- "-nightly" <<<"$version_output" ;;
+          esac
+
+  release:
+    name: publish binaries
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, build, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Download release assets
+        uses: actions/download-artifact@v8 # v8.0.1
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+
+      - name: Combined checksums
+        run: |
+          cd dist
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Publish rolling nightly prerelease
+        if: needs.prepare.outputs.nightly == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git tag --force nightly "$GITHUB_SHA"
+          git push --force origin refs/tags/nightly
+          printf 'Build of %s at %s. May contain unreleased changes.\n' "$GITHUB_REF_NAME" "$GITHUB_SHA" > "$RUNNER_TEMP/nightly-notes.md"
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly dist/* --clobber
+            gh release edit nightly --title "Symphony nightly" --notes-file "$RUNNER_TEMP/nightly-notes.md" --prerelease --latest=false
+          else
+            gh release create nightly dist/* --verify-tag --title "Symphony nightly" --notes-file "$RUNNER_TEMP/nightly-notes.md" --prerelease --latest=false
+          fi
+
+      - name: Create or update GitHub release
+        if: needs.prepare.outputs.nightly != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --generate-notes
+          fi
+
+  image:
+    name: publish image (linux/amd64 + linux/arm64)
+    if: needs.prepare.outputs.publish == 'true'
+    needs: [prepare, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4 # v4.4.0
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4 # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v6 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=raw,value=nightly,enable=${{ needs.prepare.outputs.nightly == 'true' }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7 # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ github.sha }}
+            SYMPHONY_VERSION_SUFFIX=${{ needs.prepare.outputs.nightly == 'true' && '-nightly' || '' }}
+          cache-from: type=gha,scope=symphony-image
+          cache-to: type=gha,scope=symphony-image,mode=max
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v4 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -15,6 +15,7 @@
 *.db-shm
 /log/
 /logs/
+/docker/config/
 
 # Local environment and secrets — never commit
 .env

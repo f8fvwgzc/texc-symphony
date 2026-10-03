@@ -1,0 +1,45 @@
+# Build context for docker/Dockerfile (built from the repository root).
+# The Dockerfile copies only Cargo.*, crates/, xtask/ and web/; everything below is either
+# host-specific (node_modules with native binaries, target/) or must never enter an image.
+
+# VCS and CI metadata
+.git
+.github/media
+
+# Rust build output
+target
+**/*.rs.bk
+
+# Web dependencies and build output (rebuilt inside the image)
+web/node_modules
+web/dist
+web/coverage
+**/*.tsbuildinfo
+
+# Elixir reference implementation build output
+elixir/_build
+elixir/deps
+elixir/cover
+elixir/bin
+elixir/burrito_out
+
+# Runtime data, logs and local databases
+data
+log
+logs
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# Secrets and local environment
+**/.env
+**/.env.*
+!**/.env.example
+.secrets
+.credentials
+docker/config
+
+# Editor / OS
+**/.DS_Store
+.idea
+.vscode

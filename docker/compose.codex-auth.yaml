@@ -1,0 +1,18 @@
+# Optional overlay: mount the host's Codex login (auth.json) read-only into the container.
+#
+#   docker compose -f compose.yaml -f compose.codex-auth.yaml up -d
+#   # or put COMPOSE_FILE=compose.yaml:compose.codex-auth.yaml in .env
+#
+# The file must exist (run `codex login` on the host first); Compose refuses to start otherwise
+# instead of silently creating an empty directory. A read-only auth.json cannot be refreshed by
+# Codex, so for long-running servers prefer `docker compose exec symphony codex login` (stored
+# in the writable codex-home volume).
+services:
+  symphony:
+    volumes:
+      - type: bind
+        source: ${CODEX_AUTH_JSON:-~/.codex/auth.json}
+        target: /home/symphony/.codex/auth.json
+        read_only: true
+        bind:
+          create_host_path: false
