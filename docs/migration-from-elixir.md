@@ -175,6 +175,15 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   - `Blocker::message()` returns the orchestrator's `blocker_error` texts.
   - The runner and orchestrator should use the returned error to block instead of retrying.
   - Every other failure still emits `turn_ended_with_error`.
+- **Default approval policy.** Elixir's default `{reject: {sandbox_approval: true, rules: true,
+  mcp_elicitations: true}}` is refused by current Codex versions (`unknown variant reject`). The
+  default is now the equivalent `{granular: {sandbox_approval: false, rules: false,
+  mcp_elicitations: false}}`: Codex renamed the variant and inverted the booleans.
+- **`turn/completed` carries the outcome.** Current Codex versions end failed and interrupted
+  turns with `turn/completed` and `turn.status` `failed` / `interrupted` instead of `turn/failed` /
+  `turn/cancelled`. Those are now `turn_failed` / `turn_cancelled` errors, so the run is recorded
+  as failed and retried with backoff. Elixir counted every `turn/completed` as a success, which
+  turned a rejected model call into an endless one-second continuation loop.
 - **No silently dropped server messages (C.13 #13).** While the client waits for a response, any
   message with a string `method` is buffered (up to 1024) and replayed at the start of the next
   turn loop. An approval or tool call that arrives before the `turn/start` result is therefore

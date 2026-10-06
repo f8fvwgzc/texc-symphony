@@ -9,8 +9,8 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 use support::{Harness, TestEnv, assert_invalid_config, default_workspace_root, write_workflow};
 use symphony_core::config::{
-    self, CodexSettings, Settings, StringOrMap, WorkspaceSettings, default_turn_sandbox_policy,
-    normalize_state_limits, validate_state_limits,
+    self, CodexProvider, CodexSettings, Settings, StringOrMap, WorkspaceSettings,
+    default_turn_sandbox_policy, normalize_state_limits, validate_state_limits,
 };
 use symphony_core::error::TrackerConfigError;
 use symphony_core::path_safety::{self, PathError, expand_path};
@@ -396,7 +396,7 @@ fn config_reads_defaults_for_optional_settings() {
     assert_eq!(config.codex.command, "codex app-server");
     assert_eq!(
         config.codex.approval_policy.to_value(),
-        json!({"reject": {"sandbox_approval": true, "rules": true, "mcp_elicitations": true}})
+        json!({"granular": {"sandbox_approval": false, "rules": false, "mcp_elicitations": false}})
     );
     assert_eq!(config.codex.thread_sandbox, "workspace-write");
 
@@ -903,6 +903,73 @@ fn sandbox_settings(policy: Option<Value>, root: &str) -> Settings {
         },
         workspace: WorkspaceSettings { root: root.into() },
         ..Settings::default()
+    }
+}
+
+#[test]
+fn codex_model_and_provider_are_optional_and_validated() {
+    let env = MapEnv::new();
+    let codex = |codex: Value| {
+        parse(json!({"tracker": {"kind": "memory"}, "codex": codex}), &env)
+            .map(|settings| settings.codex)
+    };
+
+    let defaults = codex(json!({})).unwrap();
+    assert_eq!(defaults.model, None);
+    assert_eq!(defaults.provider, None);
+
+    let settings = codex(json!({
+        "model": "qwen3-coder",
+        "provider": {
+            "name": "ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "api_key_env": "OLLAMA_API_KEY"
+        }
+    }))
+    .unwrap();
+    assert_eq!(settings.model.as_deref(), Some("qwen3-coder"));
+    assert_eq!(
+        settings.provider,
+        Some(CodexProvider {
+            name: "ollama".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key_env: Some("OLLAMA_API_KEY".into()),
+        })
+    );
+
+    for (bad, fragment) in [
+        (json!({"model": "two words"}), "codex.model is invalid"),
+        (json!({"provider": "ollama"}), "codex.provider is invalid"),
+        (
+            json!({"provider": {"base_url": "https://api.example.com/v1"}}),
+            "codex.provider.name can't be blank",
+        ),
+        (
+            json!({"provider": {"name": "a.b", "base_url": "https://api.example.com/v1"}}),
+            "codex.provider.name is invalid",
+        ),
+        (
+            json!({"provider": {"name": "x"}}),
+            "codex.provider.base_url can't be blank",
+        ),
+        (
+            json!({"provider": {"name": "x", "base_url": "ftp://example.com"}}),
+            "codex.provider.base_url is invalid",
+        ),
+        (
+            json!({"provider": {"name": "x", "base_url": "https://e.com/v1", "api_key_env": "sk-123"}}),
+            "codex.provider.api_key_env is invalid",
+        ),
+    ] {
+        match codex(bad) {
+            Err(ConfigError::InvalidWorkflowConfig(message)) => {
+                assert!(
+                    message.contains(fragment),
+                    "{message:?} should contain {fragment:?}"
+                );
+            }
+            other => panic!("expected invalid config containing {fragment:?}, got {other:?}"),
+        }
     }
 }
 

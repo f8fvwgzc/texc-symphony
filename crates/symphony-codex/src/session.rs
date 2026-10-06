@@ -20,7 +20,7 @@ use crate::dynamic_tool::{
 use crate::error::CodexError;
 use crate::event::{CodexEvent, CodexEventData, EventSink, StreamMessage};
 use crate::launch::{
-    RemoteLauncher, find_executable, local_launch_command, remote_launch_command,
+    RemoteLauncher, codex_command, find_executable, local_launch_command, remote_launch_command,
     valid_secret_names, validate_local_workspace, validate_remote_workspace,
 };
 use crate::protocol::{
@@ -205,7 +205,7 @@ impl AppServerSession {
                 let mut command = Command::new(bash);
                 command
                     .arg("-lc")
-                    .arg(local_launch_command(&codex.command, &secret_names))
+                    .arg(local_launch_command(&codex_command(&codex), &secret_names))
                     .current_dir(&workspace);
                 command
             }
@@ -215,7 +215,7 @@ impl AppServerSession {
                     .ok_or_else(|| CodexError::RemoteLauncherMissing(host.clone()))?;
                 launcher.command(
                     host,
-                    &remote_launch_command(&workspace, &codex.command, &secret_names),
+                    &remote_launch_command(&workspace, &codex_command(&codex), &secret_names),
                 )?
             }
         };
@@ -515,6 +515,22 @@ impl AppServerSession {
         };
         let params = message.payload.get("params").cloned();
         match (method.as_str(), params) {
+            // Current Codex versions report every turn end as `turn/completed` and put the outcome in
+            // `turn.status`; only a missing or `completed` status is a success.
+            ("turn/completed", Some(details))
+                if protocol::turn_status(&details) == Some("failed") =>
+            {
+                let reason = CodexError::TurnFailed(details.clone());
+                events.emit(self.stream_event(CodexEventData::TurnFailed { message, details }));
+                Step::Done(Err(reason))
+            }
+            ("turn/completed", Some(details))
+                if protocol::turn_status(&details) == Some("interrupted") =>
+            {
+                let reason = CodexError::TurnCancelled(details.clone());
+                events.emit(self.stream_event(CodexEventData::TurnCancelled { message, details }));
+                Step::Done(Err(reason))
+            }
             ("turn/completed", _) => {
                 events.emit(self.stream_event(CodexEventData::TurnCompleted(message)));
                 Step::Done(Ok(()))

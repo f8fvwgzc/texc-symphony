@@ -151,6 +151,11 @@ pub fn turn_id_from_result(result: &Value) -> Result<String, Value> {
     nested_id(result, "turn").ok_or_else(|| result.clone())
 }
 
+/// `params.turn.status` of a `turn/completed` notification (`completed`, `failed`, `interrupted`).
+pub fn turn_status(params: &Value) -> Option<&str> {
+    params.get("turn")?.get("status")?.as_str()
+}
+
 /// Approval request methods and the decision sent when auto-approving.
 pub fn approval_decision(method: &str) -> Option<&'static str> {
     match method {

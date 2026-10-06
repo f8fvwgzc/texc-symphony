@@ -27,6 +27,10 @@ impl Errors {
         self.list.is_empty()
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.list.len()
+    }
+
     pub(crate) fn join(&self) -> String {
         self.list.join(", ")
     }

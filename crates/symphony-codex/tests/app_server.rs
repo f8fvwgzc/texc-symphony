@@ -403,7 +403,7 @@ async fn default_turn_policy_and_cwd_use_the_canonical_workspace() {
     assert_eq!(thread_start["params"]["sandbox"], json!("workspace-write"));
     assert_eq!(
         thread_start["params"]["approvalPolicy"],
-        json!({"reject": {"sandbox_approval": true, "rules": true, "mcp_elicitations": true}})
+        json!({"granular": {"sandbox_approval": false, "rules": false, "mcp_elicitations": false}})
     );
     let turn_start = messages
         .iter()
@@ -1287,6 +1287,61 @@ async fn process_exit_during_a_turn_is_port_exit_and_ends_with_error() {
     );
     assert_eq!(events[2].session_id(), Some("t-u"));
     assert_eq!(events[2].reason(), Some(&CodexError::PortExit(0)));
+}
+
+#[tokio::test]
+async fn turn_completed_with_a_failed_or_interrupted_status_is_an_error() {
+    let h = Harness::new();
+    let ws = h.workspace("MT-STATUS");
+    let handshake = "1 {\"id\":1,\"result\":{}}\n3 {\"id\":2,\"result\":{\"thread\":{\"id\":\"t\"}}}\n\
+                     4 {\"id\":3,\"result\":{\"turn\":{\"id\":\"u\"}}}\n";
+    let completed = |status: &str| {
+        let params = json!({"threadId": "t", "turn": {"id": "u", "status": status,
+            "error": {"message": "model not supported"}}});
+        let line = json!({"method": "turn/completed", "params": params});
+        (format!("{handshake}4 {line}\n"), params)
+    };
+
+    let (script, params) = completed("failed");
+    let mut events = Events::new();
+    let err = run(
+        h.options_for(&ws, h.scripted(&script), json!({})),
+        "p",
+        &issue("MT-STATUS"),
+        &events.sink,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, CodexError::TurnFailed(params));
+    assert_eq!(
+        kinds(&events.drain()),
+        vec![
+            CodexEventKind::SessionStarted,
+            CodexEventKind::TurnFailed,
+            CodexEventKind::TurnEndedWithError
+        ]
+    );
+
+    let (script, params) = completed("interrupted");
+    let err = run(
+        h.options_for(&ws, h.scripted(&script), json!({})),
+        "p",
+        &issue("MT-STATUS"),
+        &EventSink::none(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, CodexError::TurnCancelled(params));
+
+    let (script, _) = completed("completed");
+    run(
+        h.options_for(&ws, h.scripted(&script), json!({})),
+        "p",
+        &issue("MT-STATUS"),
+        &EventSink::none(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

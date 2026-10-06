@@ -223,12 +223,43 @@ Counts must fit in an unsigned 32-bit integer.
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
 | `codex.command` | string | `codex app-server` | Must not be blank (`can't be blank`). Run as `bash -lc "<command>"` in the workspace, so `~` and `$NAME` are expanded by the shell, not by Symphony. | live |
-| `codex.approval_policy` | string or map | `{reject: {sandbox_approval: true, rules: true, mcp_elicitations: true}}` | Passed to Codex unchanged; no local check of the value (`""` is accepted). Current Codex versions accept `untrusted`, `on-failure`, `on-request`, `never` or a `reject` map. | live |
+| `codex.model` | string | none (Codex's own default) | No whitespace, else `is invalid`. Passed to Codex as `--config model="..."`. | live |
+| `codex.provider` | map | none (Codex's own default) | The model provider to use; see [Model providers](#model-providers). | live |
+| `codex.approval_policy` | string or map | `{granular: {sandbox_approval: false, rules: false, mcp_elicitations: false}}` | Passed to Codex unchanged; no local check of the value (`""` is accepted). Current Codex versions accept `untrusted`, `on-request`, `never` or a `granular` map, in which `false` means "reject without asking". The default makes Codex auto-reject sandbox escalations, rule prompts and MCP elicitations. | live |
 | `codex.thread_sandbox` | string | `workspace-write` | Passed to Codex unchanged (`read-only`, `workspace-write`, `danger-full-access`). | live |
 | `codex.turn_sandbox_policy` | map | see below | When set, passed to Codex unchanged (keys as Codex expects them, for example `type`, `networkAccess`). | live |
 | `codex.turn_timeout_ms` | integer | `3600000` | `> 0`. Inactivity limit while a turn streams: every Codex message restarts it. It is not a cap on total turn time. Also bounds each dynamic tool call. | live |
 | `codex.read_timeout_ms` | integer | `5000` | `> 0`. How long to wait for Codex to answer a request (`initialize`, `thread/start`, ...). | live |
 | `codex.stall_timeout_ms` | integer | `300000` | `>= 0`. When a running issue shows no Codex activity for this long, the run is stopped and retried with backoff (`Issue stalled ... restarting with backoff`). `0` disables stall detection. | live |
+
+#### Model providers
+
+By default Codex uses whatever its own configuration says (for example a ChatGPT login). Set
+`codex.provider` to point it at another model provider instead:
+
+```yaml
+codex:
+  model: qwen3-coder
+  provider:
+    name: ollama
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: OLLAMA_API_KEY   # optional
+```
+
+| `provider.` key | Required | Validation and notes |
+|---|---|---|
+| `name` | yes | Letters, digits, `_` and `-`. Used as the Codex `model_providers` id. |
+| `base_url` | yes | `http://` or `https://` with a host, no whitespace. The provider's OpenAI-compatible API root. |
+| `api_key_env` | no | Name of the environment variable that holds the API key. Codex reads the value itself; the key never appears in `WORKFLOW.md` or in Symphony's logs. |
+
+- Symphony appends `--config` overrides for these keys to `codex.command`, so the command must
+  end with `app-server` (or flags of `app-server`).
+- The provider must speak the OpenAI **Responses API** (`POST <base_url>/responses`). Current Codex
+  versions accept no other wire format. OpenAI, Ollama, LM Studio and OpenRouter expose it
+  directly; for providers that do not (for example the Anthropic API), run a gateway such as
+  LiteLLM in front and use the gateway's URL.
+- The variable named by `api_key_env` must be set in Symphony's environment, and on each SSH
+  worker when `worker.ssh_hosts` is used.
 
 When `turn_sandbox_policy` is not set, each turn uses:
 

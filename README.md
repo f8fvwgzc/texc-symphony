@@ -33,6 +33,10 @@ Outside Docker you need the [Codex CLI](https://developers.openai.com/codex/) in
 in (`codex login`) and `git`; in every case, a token for your tracker. Then pick one way to get
 `symphony`.
 
+Codex uses its own login by default. To run agents on another model provider (Ollama, OpenRouter,
+an OpenAI API key, a LiteLLM gateway, ...), set `codex.model` and `codex.provider` in `WORKFLOW.md`;
+see [Model providers](docs/configuration.md#model-providers).
+
 **A. Release binary** (Linux x86_64/arm64, macOS x86_64/arm64). Each release has raw executables
 named `symphony-<vX.Y.Z|nightly>-<linux_x86_64|linux_arm64|macos_x86_64|macos_arm64>` with a
 matching `.sha256` checksum file:

@@ -68,7 +68,7 @@ fn defaults() -> Vec<(&'static str, Value)> {
         ("codex_command", json!("codex app-server")),
         (
             "codex_approval_policy",
-            json!({"reject": {"sandbox_approval": true, "rules": true, "mcp_elicitations": true}}),
+            json!({"granular": {"sandbox_approval": false, "rules": false, "mcp_elicitations": false}}),
         ),
         ("codex_thread_sandbox", json!("workspace-write")),
         ("codex_turn_sandbox_policy", Value::Null),

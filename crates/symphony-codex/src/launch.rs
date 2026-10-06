@@ -9,6 +9,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use symphony_core::config::CodexSettings;
 use symphony_core::env::{uniq, valid_env_name};
 use symphony_core::path_safety::{self, PathError};
 
@@ -45,6 +46,53 @@ where
             .map(Into::into)
             .filter(|name| valid_env_name(name)),
     )
+}
+
+/// A TOML basic string, as Codex parses `--config key=value` values.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `codex.command` followed by the `--config` overrides for `codex.model` and `codex.provider`.
+///
+/// The overrides are appended, so the command must end with the `app-server` subcommand (or its
+/// own flags). Custom providers always use the Responses API: Codex accepts no other wire format.
+pub fn codex_command(codex: &CodexSettings) -> String {
+    let mut overrides = Vec::new();
+    if let Some(model) = &codex.model {
+        overrides.push(format!("model={}", toml_string(model)));
+    }
+    if let Some(provider) = &codex.provider {
+        let key = format!("model_providers.{}", provider.name);
+        overrides.push(format!("model_provider={}", toml_string(&provider.name)));
+        overrides.push(format!("{key}.name={}", toml_string(&provider.name)));
+        overrides.push(format!(
+            "{key}.base_url={}",
+            toml_string(&provider.base_url)
+        ));
+        overrides.push(format!("{key}.wire_api=\"responses\""));
+        if let Some(env_key) = &provider.api_key_env {
+            overrides.push(format!("{key}.env_key={}", toml_string(env_key)));
+        }
+    }
+    overrides
+        .iter()
+        .fold(codex.command.clone(), |command, value| {
+            format!("{command} --config {}", shell_escape(value))
+        })
 }
 
 fn join_parts(parts: [Option<String>; 3]) -> String {
@@ -158,6 +206,41 @@ pub fn validate_remote_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_command_appends_model_and_provider_overrides() {
+        use symphony_core::config::CodexProvider;
+
+        let mut codex = CodexSettings::default();
+        assert_eq!(codex_command(&codex), "codex app-server");
+
+        codex.model = Some("qwen3-coder".into());
+        codex.provider = Some(CodexProvider {
+            name: "ollama".into(),
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            api_key_env: Some("OLLAMA_API_KEY".into()),
+        });
+        assert_eq!(
+            codex_command(&codex),
+            concat!(
+                "codex app-server",
+                " --config 'model=\"qwen3-coder\"'",
+                " --config 'model_provider=\"ollama\"'",
+                " --config 'model_providers.ollama.name=\"ollama\"'",
+                " --config 'model_providers.ollama.base_url=\"http://127.0.0.1:11434/v1\"'",
+                " --config 'model_providers.ollama.wire_api=\"responses\"'",
+                " --config 'model_providers.ollama.env_key=\"OLLAMA_API_KEY\"'",
+            )
+        );
+
+        // Quotes cannot break out of the TOML string or the shell word.
+        codex.provider = None;
+        codex.model = Some(r#"a"b'c\d"#.into());
+        assert_eq!(
+            codex_command(&codex),
+            r#"codex app-server --config 'model="a\"b'"'"'c\\d"'"#
+        );
+    }
 
     #[test]
     fn launch_commands_match_elixir() {

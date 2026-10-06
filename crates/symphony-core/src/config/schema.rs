@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use super::cast::{Errors, Section};
+use super::tracker::is_https_url;
 use super::value::drop_nil_values;
 use crate::env::{self, EnvSource};
 use crate::error::ConfigError;
@@ -66,14 +67,18 @@ impl StringOrMap {
     }
 }
 
-/// Default `codex.approval_policy`: reject sandbox approvals, rules and MCP elicitations.
+/// Default `codex.approval_policy`: Codex auto-rejects sandbox approvals, rule prompts and MCP
+/// elicitations instead of asking (in `granular`, `false` means "do not prompt, reject").
+///
+/// Elixir sent `{reject: {...: true}}`; Codex renamed that variant to `granular` and inverted the
+/// booleans, and current versions refuse `reject` as an unknown variant.
 pub fn default_approval_policy() -> StringOrMap {
-    let mut reject = Map::new();
-    reject.insert("sandbox_approval".into(), Value::Bool(true));
-    reject.insert("rules".into(), Value::Bool(true));
-    reject.insert("mcp_elicitations".into(), Value::Bool(true));
+    let mut granular = Map::new();
+    granular.insert("sandbox_approval".into(), Value::Bool(false));
+    granular.insert("rules".into(), Value::Bool(false));
+    granular.insert("mcp_elicitations".into(), Value::Bool(false));
     let mut policy = Map::new();
-    policy.insert("reject".into(), Value::Object(reject));
+    policy.insert("granular".into(), Value::Object(granular));
     StringOrMap::Map(policy)
 }
 
@@ -214,11 +219,29 @@ impl Default for AgentSettings {
     }
 }
 
+/// `codex.provider`: the model provider Codex uses instead of its configured default.
+///
+/// Codex talks to it with the OpenAI Responses API, the only wire format current Codex versions
+/// support for custom providers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexProvider {
+    /// Provider id (`[A-Za-z0-9_-]+`), used as the Codex `model_providers` key.
+    pub name: String,
+    /// Base URL of the provider's OpenAI-compatible API (`http://` or `https://` with a host).
+    pub base_url: String,
+    /// Name of the env var holding the API key; Codex reads the value itself, Symphony never does.
+    pub api_key_env: Option<String>,
+}
+
 /// `codex:` section.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodexSettings {
     /// Launch command, passed verbatim to `bash -lc` (no `~`/`$VAR` expansion here).
     pub command: String,
+    /// Model override, passed to Codex as `--config model=...` when set.
+    pub model: Option<String>,
+    /// Model provider override, passed to Codex as `--config model_providers...` when set.
+    pub provider: Option<CodexProvider>,
     /// Approval policy (string or map; no enum check, `""` accepted).
     pub approval_policy: StringOrMap,
     /// Thread sandbox (no enum check, `""` accepted).
@@ -237,6 +260,8 @@ impl Default for CodexSettings {
     fn default() -> Self {
         Self {
             command: DEFAULT_CODEX_COMMAND.into(),
+            model: None,
+            provider: None,
             approval_policy: default_approval_policy(),
             thread_sandbox: DEFAULT_THREAD_SANDBOX.into(),
             turn_sandbox_policy: None,
@@ -509,6 +534,16 @@ fn cast_codex(s: &Section<'_>, errors: &mut Errors) -> CodexSettings {
             out.command = command;
         }
     }
+    if let Some(model) = s.string("model", errors) {
+        if has_blank_or_control(&model) {
+            errors.push(&s.path("model"), "is invalid");
+        } else {
+            out.model = Some(model);
+        }
+    }
+    if let Some(provider) = s.map("provider", errors) {
+        out.provider = cast_codex_provider(&provider, &s.path("provider"), errors);
+    }
     if let Some(policy) = s.string_or_map("approval_policy", errors) {
         out.approval_policy = policy;
     }
@@ -533,6 +568,60 @@ fn cast_codex(s: &Section<'_>, errors: &mut Errors) -> CodexSettings {
         out.stall_timeout_ms = v;
     }
     out
+}
+
+/// `true` for an empty value or one with whitespace or control characters.
+fn has_blank_or_control(value: &str) -> bool {
+    value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn cast_codex_provider(
+    provider: &Map<String, Value>,
+    path: &str,
+    errors: &mut Errors,
+) -> Option<CodexProvider> {
+    let before = errors.len();
+    let mut field =
+        |key: &str, required: bool, valid: &dyn Fn(&str) -> bool| match provider.get(key) {
+            None | Some(Value::Null) => {
+                if required {
+                    errors.push(&format!("{path}.{key}"), "can't be blank");
+                }
+                None
+            }
+            Some(Value::String(value)) if valid(value) => Some(value.clone()),
+            Some(_) => {
+                errors.push(&format!("{path}.{key}"), "is invalid");
+                None
+            }
+        };
+    let name = field("name", true, &|v| {
+        !v.is_empty()
+            && v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    });
+    let base_url = field("base_url", true, &|v| {
+        !has_blank_or_control(v) && is_http_url(v)
+    });
+    let api_key_env = field("api_key_env", false, &env::valid_env_name);
+    if errors.len() != before {
+        return None;
+    }
+    Some(CodexProvider {
+        name: name?,
+        base_url: base_url?,
+        api_key_env,
+    })
+}
+
+/// `http://` or `https://` with a host (plain HTTP is allowed for local servers such as Ollama).
+fn is_http_url(value: &str) -> bool {
+    match value.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => {
+            is_https_url(&format!("https://{rest}"), false)
+        }
+        _ => is_https_url(value, false),
+    }
 }
 
 fn cast_hooks(s: &Section<'_>, errors: &mut Errors) -> HooksSettings {
