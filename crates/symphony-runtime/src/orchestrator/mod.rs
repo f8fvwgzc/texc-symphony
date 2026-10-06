@@ -40,8 +40,8 @@ pub(crate) use state::{
     blocker_error, candidate_issue, next_retry_attempt_from_running,
 };
 pub use state::{
-    CONTINUATION_RETRY_DELAY, DelayType, FAILURE_RETRY_BASE_MS, HostChoice,
-    POLL_TRANSITION_RENDER_DELAY, retry_delay, sort_issues_for_dispatch,
+    DelayType, FAILURE_RETRY_BASE_MS, HostChoice, POLL_TRANSITION_RENDER_DELAY, retry_delay,
+    sort_issues_for_dispatch,
 };
 
 use crate::handle::RuntimeCommand;

@@ -215,6 +215,7 @@ there through `bash -lc`.
 | `agent.max_concurrent_agents_by_state` | map of state to integer | `{}` | Per-state caps; keys are compared after trim + lowercase. Every key must be non-blank (`state names must not be blank`) and every value a positive YAML integer (`limits must be positive integers`; `"2"` is rejected here). One bad entry rejects the whole file. A state without an entry uses `max_concurrent_agents`. | live |
 | `agent.max_turns` | integer | `20` | `> 0`. Maximum back-to-back Codex turns in one agent run while the issue stays active. | live |
 | `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. A run that ends normally is re-checked after 1 s instead. | live |
+| `agent.continuation_delay_ms` | integer | `1000` | `> 0`. How long to wait after a run ends normally before checking whether the issue is still active (and running it again if so). Raise it when something outside the agent moves the issue to a terminal state after the run, for example an orchestrating service. | live |
 
 Counts must fit in an unsigned 32-bit integer.
 

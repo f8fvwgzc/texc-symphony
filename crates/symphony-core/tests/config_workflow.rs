@@ -907,6 +907,26 @@ fn sandbox_settings(policy: Option<Value>, root: &str) -> Settings {
 }
 
 #[test]
+fn continuation_delay_defaults_to_one_second_and_must_be_positive() {
+    let env = MapEnv::new();
+    let agent = |agent: Value| {
+        parse(json!({"tracker": {"kind": "memory"}, "agent": agent}), &env)
+            .map(|settings| settings.agent.continuation_delay_ms)
+    };
+    assert_eq!(agent(json!({})).unwrap(), 1_000);
+    assert_eq!(
+        agent(json!({"continuation_delay_ms": 15000})).unwrap(),
+        15_000
+    );
+    match agent(json!({"continuation_delay_ms": 0})) {
+        Err(ConfigError::InvalidWorkflowConfig(message)) => {
+            assert!(message.contains("agent.continuation_delay_ms must be greater than 0"));
+        }
+        other => panic!("expected an invalid config, got {other:?}"),
+    }
+}
+
+#[test]
 fn codex_model_and_provider_are_optional_and_validated() {
     let env = MapEnv::new();
     let codex = |codex: Value| {

@@ -32,11 +32,7 @@ impl Orchestrator<'_> {
         let next_attempt =
             attempt.unwrap_or_else(|| previous.as_ref().map_or(0, |p| p.attempt) + 1);
         let settings = self.settings();
-        let delay = retry_delay(
-            next_attempt,
-            delay_type,
-            settings.agent.max_retry_backoff_ms,
-        );
+        let delay = retry_delay(next_attempt, delay_type, &settings.agent);
         let token = self.tokens.next();
         let pick = |new: Option<String>, old: Option<&Option<String>>| {
             new.or_else(|| old.and_then(Clone::clone))

@@ -7,6 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use symphony_codex::{CodexEvent, CodexEventData, CodexEventKind, TokenAccumulator, TokenCounts};
+use symphony_core::config::AgentSettings;
 use symphony_core::issue::{normalize_state, present_string};
 use symphony_core::{Issue, Settings};
 use tokio::sync::oneshot;
@@ -18,8 +19,6 @@ use crate::recorder::RunRecorder;
 use crate::snapshot::{CodexMessage, CodexTotals};
 use crate::workspace::worker_hosts;
 
-/// Delay of the re-check scheduled after a normal worker exit.
-pub const CONTINUATION_RETRY_DELAY: Duration = Duration::from_millis(1_000);
 /// Base of the exponential failure backoff.
 pub const FAILURE_RETRY_BASE_MS: u64 = 10_000;
 /// Gap between the tick (`checking now…` rendered) and the poll cycle.
@@ -124,15 +123,16 @@ pub enum DelayType {
     Failure,
 }
 
-/// `retry_delay/2`: continuation attempt 1 → 1 s; otherwise
-/// `min(10_000 · 2^min(attempt − 1, 10), max_retry_backoff_ms)`. No jitter, no maximum count.
-pub fn retry_delay(attempt: u32, delay_type: DelayType, max_retry_backoff_ms: u64) -> Duration {
+/// `retry_delay/2`: continuation attempt 1 → `agent.continuation_delay_ms` (1 s by default);
+/// otherwise `min(10_000 · 2^min(attempt − 1, 10), max_retry_backoff_ms)`. No jitter, no maximum
+/// count.
+pub fn retry_delay(attempt: u32, delay_type: DelayType, agent: &AgentSettings) -> Duration {
     if delay_type == DelayType::Continuation && attempt == 1 {
-        return CONTINUATION_RETRY_DELAY;
+        return Duration::from_millis(agent.continuation_delay_ms);
     }
     let power = attempt.saturating_sub(1).min(10);
     let delay = FAILURE_RETRY_BASE_MS.saturating_mul(1 << power);
-    Duration::from_millis(delay.min(max_retry_backoff_ms))
+    Duration::from_millis(delay.min(agent.max_retry_backoff_ms))
 }
 
 /// Normalized active/terminal state sets (blank entries dropped).
@@ -506,8 +506,8 @@ mod tests {
 
     #[test]
     fn retry_delays_follow_the_elixir_formula() {
-        let cap = 300_000;
-        let ms = |a, t| retry_delay(a, t, cap).as_millis();
+        let agent = AgentSettings::default();
+        let ms = |a, t| retry_delay(a, t, &agent).as_millis();
         assert_eq!(ms(1, DelayType::Continuation), 1_000);
         assert_eq!(ms(2, DelayType::Continuation), 20_000);
         assert_eq!(ms(1, DelayType::Failure), 10_000);
@@ -516,9 +516,18 @@ mod tests {
         assert_eq!(ms(5, DelayType::Failure), 160_000);
         assert_eq!(ms(6, DelayType::Failure), 300_000);
         assert_eq!(ms(500, DelayType::Failure), 300_000);
+        let uncapped = AgentSettings {
+            max_retry_backoff_ms: u64::MAX,
+            continuation_delay_ms: 15_000,
+            ..AgentSettings::default()
+        };
         assert_eq!(
-            retry_delay(40, DelayType::Failure, u64::MAX).as_millis(),
+            retry_delay(40, DelayType::Failure, &uncapped).as_millis(),
             10_240_000
+        );
+        assert_eq!(
+            retry_delay(1, DelayType::Continuation, &uncapped).as_millis(),
+            15_000
         );
     }
 

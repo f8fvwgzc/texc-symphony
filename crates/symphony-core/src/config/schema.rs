@@ -204,6 +204,8 @@ pub struct AgentSettings {
     pub max_turns: u32,
     /// Retry backoff cap in ms (`> 0`, default 300 000).
     pub max_retry_backoff_ms: u64,
+    /// Delay in ms before re-checking an issue whose run ended normally (`> 0`, default 1 000).
+    pub continuation_delay_ms: u64,
     /// Per-state concurrency caps keyed by normalized (trim + lowercase) state name.
     pub max_concurrent_agents_by_state: BTreeMap<String, u32>,
 }
@@ -214,6 +216,7 @@ impl Default for AgentSettings {
             max_concurrent_agents: 10,
             max_turns: 20,
             max_retry_backoff_ms: 300_000,
+            continuation_delay_ms: 1_000,
             max_concurrent_agents_by_state: BTreeMap::new(),
         }
     }
@@ -501,6 +504,12 @@ fn cast_agent(s: &Section<'_>, errors: &mut Errors) -> AgentSettings {
     let v = s.positive("max_retry_backoff_ms", v, errors);
     if let Some(v) = s.fit("max_retry_backoff_ms", v, errors) {
         out.max_retry_backoff_ms = v;
+    }
+
+    let v = s.integer("continuation_delay_ms", errors);
+    let v = s.positive("continuation_delay_ms", v, errors);
+    if let Some(v) = s.fit("continuation_delay_ms", v, errors) {
+        out.continuation_delay_ms = v;
     }
 
     let field = "max_concurrent_agents_by_state";
