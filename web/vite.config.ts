@@ -1,3 +1,4 @@
+import tailwindcss from '@tailwindcss/vite';
 import { loadEnv } from 'vite';
 import { defineConfig } from 'vitest/config';
 
@@ -13,6 +14,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     base: '/',
+    plugins: [tailwindcss()],
     // Preact through the automatic JSX runtime; no Babel preset needed.
     oxc: { jsx: { runtime: 'automatic', importSource: 'preact' } },
     server: { proxy },

@@ -2,7 +2,7 @@ import { render } from 'preact';
 
 import { App } from './App';
 import { applyThemePreference, readThemePreference } from './lib/theme';
-import './styles/app.css';
+import './styles/index.css';
 
 applyThemePreference(readThemePreference());
 

@@ -2,7 +2,7 @@
   "name": "symphony-web",
   "version": "0.1.0",
   "private": true,
-  "description": "Symphony observability dashboard (Preact + Vite), embedded by the symphony-server crate.",
+  "description": "Symphony observability dashboard (Preact + Vite + Tailwind CSS), embedded by the symphony-server crate.",
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "pnpm@10.18.1",
@@ -23,9 +23,12 @@
     "check": "pnpm run typecheck && pnpm run lint && pnpm run test"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "5.3.0",
+    "@fontsource-variable/geist-mono": "5.3.0",
     "preact": "11.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
     "@testing-library/dom": "10.4.2",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/preact": "3.2.4",
@@ -36,6 +39,7 @@
     "oxlint": "1.86.0",
     "oxlint-tsgolint": "7.0.2003",
     "prettier": "3.9.9",
+    "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.3.2",
     "vitest": "5.0.3"

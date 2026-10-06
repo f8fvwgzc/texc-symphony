@@ -101,7 +101,9 @@ describe('App', () => {
       window.location.hash = '#/runs';
       window.dispatchEvent(new HashChangeEvent('hashchange'));
     });
-    expect(await screen.findByRole('heading', { name: 'Run history' })).toBeInTheDocument();
+    expect(
+      await screen.findByRole('heading', { name: 'Run history', level: 1 }),
+    ).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Run history' })).toHaveAttribute(
       'aria-current',
       'page',
