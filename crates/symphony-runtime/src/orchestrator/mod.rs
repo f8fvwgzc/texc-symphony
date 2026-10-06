@@ -155,6 +155,12 @@ impl<'w> Orchestrator<'w> {
 
     /// `init/1`: startup terminal cleanup, then an immediate tick.
     pub(crate) async fn startup(&mut self) {
+        // Before anything is dispatched: agents of a hard-killed predecessor must not run next to
+        // the ones this process starts for the same issues.
+        let root = self
+            .settings()
+            .local_workspace_root(&self.ctx.workflow.workflow_file_path());
+        crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
     }

@@ -179,6 +179,12 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   mcp_elicitations: true}}` is refused by current Codex versions (`unknown variant reject`). The
   default is now the equivalent `{granular: {sandbox_approval: false, rules: false,
   mcp_elicitations: false}}`: Codex renamed the variant and inverted the booleans.
+- **Agents of a hard-killed Symphony are stopped at the next start (new).** While a local agent
+  runs it is recorded in `<workspace root>/.symphony/agents/<pid>.json` (agent and owner pid, each
+  with its start time). Startup kills the process groups of recorded agents whose owner process is
+  gone, before anything is dispatched, so a hung agent that survived a `SIGKILL` of Symphony no
+  longer runs next to the new agent for the same issue. A pid whose start time no longer matches is
+  never killed, and records of a live owner are left alone. Agents on SSH workers are not covered.
 - **`turn/completed` carries the outcome.** Current Codex versions end failed and interrupted
   turns with `turn/completed` and `turn.status` `failed` / `interrupted` instead of `turn/failed` /
   `turn/cancelled`. Those are now `turn_failed` / `turn_cancelled` errors, so the run is recorded

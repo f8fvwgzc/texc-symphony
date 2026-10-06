@@ -32,6 +32,7 @@
 
 #![warn(missing_docs)]
 
+mod agents;
 pub mod handle;
 pub mod humanize;
 pub mod orchestrator;

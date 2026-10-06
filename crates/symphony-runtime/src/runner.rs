@@ -23,6 +23,7 @@ use symphony_core::{Issue, Settings, WorkflowStore};
 use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
+use crate::agents;
 use crate::process::EnvPolicy;
 use crate::ssh::{SshConfig, SshLauncher};
 use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
@@ -125,6 +126,11 @@ impl Default for RunnerOptions {
             max_turns: None,
         }
     }
+}
+
+/// OS pid of a session's app-server process.
+fn local_agent_pid(session: &AppServerSession) -> Option<u32> {
+    session.codex_app_server_pid()?.parse().ok()
 }
 
 /// Runs one issue end to end (see the module docs).
@@ -293,6 +299,15 @@ impl AgentRunner {
         }
 
         let mut session = AppServerSession::start(options).await?;
+        // Recorded while it runs, so a Symphony restarted after a hard kill can stop it.
+        let _registered = match (worker_host, local_agent_pid(&session)) {
+            (None, Some(pid)) => {
+                let root = settings.local_workspace_root(&self.workflow.workflow_file_path());
+                let dir = agents::registry_dir(&root);
+                agents::register(&dir, pid, ctx.issue.identifier.as_deref()).await
+            }
+            _ => None,
+        };
         let result = self.run_turns(&mut session, ctx, workspace).await;
         session.stop().await;
         result
