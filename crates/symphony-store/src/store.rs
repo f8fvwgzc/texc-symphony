@@ -16,8 +16,8 @@ use tokio::sync::oneshot;
 
 use crate::error::{Result, StoreError};
 use crate::model::{
-    NewRun, PruneStats, RunEvent, RunId, RunPage, RunQuery, RunRecord, RunStatus, TokenUsage,
-    TotalsRecord,
+    NewRun, PruneStats, RetryRecord, RunEvent, RunId, RunPage, RunQuery, RunRecord, RunStatus,
+    TokenUsage, TotalsRecord,
 };
 use crate::ops::{self, NewEvent};
 use crate::schema;
@@ -287,6 +287,30 @@ impl Store {
             || 0,
             move |conn| ops::mark_interrupted_runs(conn, now),
         )
+    }
+
+    /// Queue (or replace) the retry of `retry.issue_id` so it survives a restart.
+    pub fn save_retry(&self, retry: RetryRecord) -> Pending<()> {
+        self.submit(
+            "save_retry",
+            || (),
+            move |conn| ops::save_retry(conn, &retry),
+        )
+    }
+
+    /// Remove the queued retry of `issue_id`, if any.
+    pub fn delete_retry(&self, issue_id: impl Into<String>) -> Pending<()> {
+        let issue_id = issue_id.into();
+        self.submit(
+            "delete_retry",
+            || (),
+            move |conn| ops::delete_retry(conn, &issue_id),
+        )
+    }
+
+    /// Every queued retry, soonest first (empty for a disabled store).
+    pub fn list_retries(&self) -> Pending<Vec<RetryRecord>> {
+        self.submit("list_retries", Vec::new, |conn| ops::list_retries(conn))
     }
 
     /// Retention: delete finished runs (and their events) that started more than `older_than`

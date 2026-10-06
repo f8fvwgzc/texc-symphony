@@ -120,6 +120,27 @@ pub struct TokenUsage {
     pub total: u64,
 }
 
+/// One queued retry, as kept across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryRecord {
+    /// Tracker issue id (the queue holds at most one retry per issue).
+    pub issue_id: String,
+    /// Attempt number the retry will run as.
+    pub attempt: u32,
+    /// When the retry is due. Stored with millisecond precision.
+    pub due_at: DateTime<Utc>,
+    /// Human issue identifier.
+    pub identifier: String,
+    /// Tracker URL of the issue, if known.
+    pub issue_url: Option<String>,
+    /// Why the previous attempt ended, if it failed.
+    pub error: Option<String>,
+    /// SSH worker host of the previous attempt, `None` for local runs.
+    pub worker_host: Option<String>,
+    /// Workspace directory of the previous attempt, if known.
+    pub workspace_path: Option<String>,
+}
+
 /// Arguments for `Store::start_run`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewRun {

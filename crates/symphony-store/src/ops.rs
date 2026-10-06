@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 
 use crate::error::{Result, StoreError};
 use crate::model::{
-    MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES, NewRun, PruneStats, RunEvent, RunId, RunPage, RunQuery,
-    RunRecord, RunStatus, TokenUsage, TotalsRecord, effective_event_limit,
+    MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES, NewRun, PruneStats, RetryRecord, RunEvent, RunId,
+    RunPage, RunQuery, RunRecord, RunStatus, TokenUsage, TotalsRecord, effective_event_limit,
 };
 
 /// Error text recorded on runs that were still `running` when the process restarted.
@@ -411,6 +411,63 @@ fn encode_payload(payload: &serde_json::Value) -> Result<String> {
         return Ok(text);
     }
     Ok(serde_json::json!({"truncated": true, "original_bytes": text.len()}).to_string())
+}
+
+/// Queues (or replaces) the retry of `retry.issue_id`.
+pub(crate) fn save_retry(conn: &Connection, retry: &RetryRecord) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO retry_queue \
+         (issue_id, attempt, due_at, identifier, issue_url, error, worker_host, workspace_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?
+    .execute(params![
+        retry.issue_id,
+        retry.attempt,
+        retry.due_at.timestamp_millis(),
+        retry.identifier,
+        retry.issue_url,
+        retry.error,
+        retry.worker_host,
+        retry.workspace_path,
+    ])?;
+    Ok(())
+}
+
+/// Removes the queued retry of `issue_id`, if any.
+pub(crate) fn delete_retry(conn: &Connection, issue_id: &str) -> Result<()> {
+    conn.prepare_cached("DELETE FROM retry_queue WHERE issue_id = ?1")?
+        .execute(params![issue_id])?;
+    Ok(())
+}
+
+/// Every queued retry, soonest first.
+pub(crate) fn list_retries(conn: &Connection) -> Result<Vec<RetryRecord>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT issue_id, attempt, due_at, identifier, issue_url, error, worker_host, workspace_path \
+         FROM retry_queue ORDER BY due_at, issue_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            RetryRecord {
+                issue_id: row.get(0)?,
+                attempt: row.get(1)?,
+                due_at: DateTime::UNIX_EPOCH,
+                identifier: row.get(3)?,
+                issue_url: row.get(4)?,
+                error: row.get(5)?,
+                worker_host: row.get(6)?,
+                workspace_path: row.get(7)?,
+            },
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (retry, due_ms) = row?;
+        let due_at = DateTime::from_timestamp_millis(due_ms)
+            .ok_or_else(|| StoreError::CorruptRow(format!("invalid retry due_at {due_ms}")))?;
+        Ok(RetryRecord { due_at, ..retry })
+    })
+    .collect()
 }
 
 #[cfg(test)]

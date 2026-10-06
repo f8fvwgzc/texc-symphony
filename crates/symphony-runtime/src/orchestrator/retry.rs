@@ -5,11 +5,60 @@ use super::*;
 impl Orchestrator<'_> {
     pub(crate) fn remove_retry_entry(&mut self, issue_id: &str) -> Option<RetryEntry> {
         let entry = self.state.retry_attempts.remove(issue_id)?;
+        self.ctx.store.delete_retry(issue_id).detach();
         // Tokens already neutralize the timer; aborting just avoids a pointless wake-up.
         if let Some(timer) = &entry.timer {
             timer.abort();
         }
         Some(entry)
+    }
+
+    /// Startup: re-queues the retries a previous process had pending, with their attempt counts and
+    /// what is left of their delays (new in the Rust port). The issues are claimed again, and when a
+    /// retry fires it goes through the normal path, which re-fetches the issue first, so an entry
+    /// whose issue has since been closed or removed is simply released.
+    pub(crate) async fn restore_retry_queue(&mut self) {
+        let retries = match self.ctx.store.list_retries().await {
+            Ok(retries) => retries,
+            Err(err) => {
+                tracing::warn!("Failed to restore the retry queue: {err}");
+                return;
+            }
+        };
+        if retries.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Restoring {} queued retries from the previous run",
+            retries.len()
+        );
+        let now = chrono::Utc::now();
+        for retry in retries {
+            let delay = (retry.due_at - now).to_std().unwrap_or(Duration::ZERO);
+            let token = self.tokens.next();
+            let timer = self.spawn_timer(
+                delay,
+                TimerEvent::RetryDue {
+                    issue_id: retry.issue_id.clone(),
+                    token,
+                },
+            );
+            self.state.claimed.insert(retry.issue_id.clone());
+            self.state.retry_attempts.insert(
+                retry.issue_id,
+                RetryEntry {
+                    attempt: retry.attempt,
+                    token,
+                    timer: Some(timer),
+                    due_at: Instant::now() + delay,
+                    identifier: retry.identifier,
+                    issue_url: retry.issue_url,
+                    error: retry.error,
+                    worker_host: retry.worker_host,
+                    workspace_path: retry.workspace_path,
+                },
+            );
+        }
     }
 
     /// `release_issue_claim/2`.
@@ -63,6 +112,24 @@ impl Orchestrator<'_> {
             "Retrying issue_id={issue_id} issue_identifier={identifier} in {}ms (attempt {next_attempt}){error_suffix}",
             delay.as_millis()
         );
+        // Kept across restarts (a no-op without a store); see `restore_retry_queue`.
+        let wait = chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
+        let due = chrono::Utc::now()
+            .checked_add_signed(wait)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        self.ctx
+            .store
+            .save_retry(RetryRecord {
+                issue_id: issue_id.to_owned(),
+                attempt: next_attempt,
+                due_at: due,
+                identifier: identifier.clone(),
+                issue_url: issue_url.clone(),
+                error: error.clone(),
+                worker_host: worker_host.clone(),
+                workspace_path: workspace_path.clone(),
+            })
+            .detach();
         self.state.claimed.insert(issue_id.to_owned());
         self.state.retry_attempts.insert(
             issue_id.to_owned(),
@@ -87,7 +154,7 @@ impl Orchestrator<'_> {
             .retry_attempts
             .get(issue_id)
             .is_some_and(|entry| entry.token == token);
-        if matches && let Some(entry) = self.state.retry_attempts.remove(issue_id) {
+        if matches && let Some(entry) = self.remove_retry_entry(issue_id) {
             let attempt = entry.attempt;
             let meta = entry.meta();
             self.handle_retry_issue(issue_id, attempt, meta).await;

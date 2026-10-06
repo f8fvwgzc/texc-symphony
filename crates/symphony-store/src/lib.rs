@@ -40,8 +40,8 @@ pub use config::{
 pub use error::{Result, StoreError};
 pub use model::{
     DEFAULT_EVENT_LIMIT, DEFAULT_RUN_LIMIT, MAX_EVENT_LIMIT, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES,
-    MAX_RUN_LIMIT, NewRun, PruneStats, RunEvent, RunId, RunPage, RunQuery, RunRecord, RunStatus,
-    TokenUsage, TotalsRecord,
+    MAX_RUN_LIMIT, NewRun, PruneStats, RetryRecord, RunEvent, RunId, RunPage, RunQuery, RunRecord,
+    RunStatus, TokenUsage, TotalsRecord,
 };
 pub use ops::{INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND};
 pub use schema::{BUSY_TIMEOUT, SCHEMA_VERSION};

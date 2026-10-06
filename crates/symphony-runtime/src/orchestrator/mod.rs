@@ -25,7 +25,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
 use symphony_core::{ConfigError, Issue, Settings, TrackerConfigError};
-use symphony_store::{NewRun, RunStatus};
+use symphony_store::{NewRun, RetryRecord, RunStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -161,6 +161,7 @@ impl<'w> Orchestrator<'w> {
             .settings()
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
+        self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
     }

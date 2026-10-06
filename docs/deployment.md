@@ -194,8 +194,10 @@ must appear immediately, not in bursts.
 
 Symphony keeps run history in one SQLite database (`SYMPHONY_DB_PATH`, default
 `./data/symphony.db`; `/data/symphony.db` in Docker). It runs in WAL mode, so the live files are
-`symphony.db`, `symphony.db-wal` and `symphony.db-shm`. Live scheduling state (running, retrying,
-blocked) is in memory and is rebuilt from the tracker after a restart; only history is stored.
+`symphony.db`, `symphony.db-wal` and `symphony.db-shm`. The same database holds the retry queue,
+so issues that were waiting for a retry keep their attempt count and due time across a restart.
+The rest of the live scheduling state (running, blocked) is in memory and is rebuilt from the
+tracker after a restart. With `--no-db` nothing is kept.
 
 - **Online backup** (safe while Symphony runs; needs the `sqlite3` CLI):
 

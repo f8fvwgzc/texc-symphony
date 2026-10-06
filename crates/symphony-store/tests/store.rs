@@ -5,8 +5,8 @@ use std::time::Duration;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
 use symphony_store::{
-    INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND, NewRun, RunId, RunQuery, RunStatus, SCHEMA_VERSION,
-    Store, StoreError, TokenUsage,
+    INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND, NewRun, RetryRecord, RunId, RunQuery, RunStatus,
+    SCHEMA_VERSION, Store, StoreError, TokenUsage,
 };
 
 fn memory() -> Store {
@@ -599,6 +599,48 @@ async fn prune_deletes_old_finished_runs_and_their_events() {
     let stats = store.prune(Duration::ZERO, 0).await.unwrap();
     assert_eq!(stats.runs_deleted, 1);
     assert!(store.get_run(old_ids[2]).await.unwrap().is_some());
+}
+
+fn retry(issue_id: &str, attempt: u32, due_in_ms: i64) -> RetryRecord {
+    // Millisecond precision, as stored.
+    let due_at = chrono::DateTime::from_timestamp_millis(
+        (Utc::now() + ChronoDuration::milliseconds(due_in_ms)).timestamp_millis(),
+    )
+    .unwrap();
+    RetryRecord {
+        issue_id: issue_id.into(),
+        attempt,
+        due_at,
+        identifier: format!("MT-{issue_id}"),
+        issue_url: Some(format!("https://example.org/{issue_id}")),
+        error: Some("agent exited: boom".into()),
+        worker_host: None,
+        workspace_path: Some(format!("/tmp/ws/MT-{issue_id}")),
+    }
+}
+
+#[tokio::test]
+async fn the_retry_queue_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let (late, soon) = (retry("a", 3, 60_000), retry("b", 1, 1_000));
+    {
+        let store = Store::open(&path).unwrap();
+        store.save_retry(retry("a", 2, 30_000)).detach();
+        // One retry per issue: the newer one replaces the older.
+        store.save_retry(late.clone()).detach();
+        store.save_retry(soon.clone()).detach();
+        store.save_retry(retry("gone", 1, 0)).detach();
+        store.delete_retry("gone").detach();
+        store.delete_retry("never-queued").await.unwrap();
+        store.flush().await.unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.list_retries().await.unwrap(), vec![soon, late]);
+
+    let disabled = Store::disabled();
+    disabled.save_retry(retry("a", 1, 0)).await.unwrap();
+    assert!(disabled.list_retries().await.unwrap().is_empty());
 }
 
 #[tokio::test]

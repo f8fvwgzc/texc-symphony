@@ -11,7 +11,10 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Embedded migrations; entry `i` upgrades the schema from version `i` to `i + 1`.
 /// Append new files, never edit shipped ones.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_init.sql"),
+    include_str!("migrations/0002_retry_queue.sql"),
+];
 
 /// Schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;

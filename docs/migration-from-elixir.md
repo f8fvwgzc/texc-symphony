@@ -179,6 +179,14 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   mcp_elicitations: true}}` is refused by current Codex versions (`unknown variant reject`). The
   default is now the equivalent `{granular: {sandbox_approval: false, rules: false,
   mcp_elicitations: false}}`: Codex renamed the variant and inverted the booleans.
+- **The retry queue survives a restart (new).** With the run-history database enabled, every queued
+  retry is also written to its `retry_queue` table (issue, attempt, due time and metadata) and
+  removed when it fires or is released. Startup re-claims those issues and re-arms their timers
+  with what is left of the delay, so a failing issue continues its backoff instead of starting
+  again at attempt 0. A restored retry takes the normal path when it fires: the issue is fetched
+  from the tracker first, and one that was closed or removed meanwhile is released. Runs that were
+  in flight when Symphony stopped are not restored; the next poll dispatches them as new runs.
+  With `--no-db` nothing is kept, as before.
 - **Agents of a hard-killed Symphony are stopped at the next start (new).** While a local agent
   runs it is recorded in `<workspace root>/.symphony/agents/<pid>.json` (agent and owner pid, each
   with its start time). Startup kills the process groups of recorded agents whose owner process is

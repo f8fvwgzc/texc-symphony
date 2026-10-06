@@ -1262,6 +1262,59 @@ async fn startup_cleanup_fans_out_to_every_ssh_host() {
 
 // ----- store integration ---------------------------------------------------------------------------
 
+#[tokio::test(start_paused = true)]
+async fn queued_retries_survive_a_restart_with_their_attempt_and_remaining_delay() {
+    let store = Store::open_in_memory().unwrap();
+    let failing = || result_factory(|| Err(RunError::Other("boom".into())));
+
+    // First process: the run fails and its retry is queued for 10 s later.
+    let mut h = Harness::with_store(json!({}), failing(), store.clone());
+    h.memory.set(vec![issue("i-1", "MT-559", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-559", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    store.flush().await.unwrap();
+    let saved = store.list_retries().await.unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!((saved[0].issue_id.as_str(), saved[0].attempt), ("i-1", 1));
+    // The process dies here: nothing is released.
+    drop(orch);
+    drop(workers);
+
+    // Second process on the same database.
+    let mut h = Harness::with_store(json!({}), failing(), store.clone());
+    h.memory.set(vec![issue("i-1", "MT-559", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.restore_retry_queue().await;
+    assert!(orch.state.claimed.contains("i-1"));
+    let entry = &orch.state.retry_attempts["i-1"];
+    assert_eq!(entry.attempt, 1);
+    assert_eq!(entry.identifier, "MT-559");
+    assert_eq!(entry.error.as_deref(), Some("agent exited: boom"));
+    assert!(retry_due_in(&orch, "i-1") <= 10_500);
+
+    // The restored retry fires, fails again and is queued as attempt 2: the backoff continued.
+    run_until(&mut orch, |o| {
+        o.state
+            .retry_attempts
+            .get("i-1")
+            .is_some_and(|entry| entry.attempt == 2)
+    })
+    .await;
+    store.flush().await.unwrap();
+    assert_eq!(store.list_retries().await.unwrap()[0].attempt, 2);
+
+    // An issue that disappeared while Symphony was down is released when its retry fires.
+    h.memory.set(vec![]);
+    run_until(&mut orch, |o| !o.state.retry_attempts.contains_key("i-1")).await;
+    assert!(!orch.state.claimed.contains("i-1"));
+    store.flush().await.unwrap();
+    assert!(store.list_retries().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn runs_are_recorded_with_their_final_status() {
     let store = Store::open_in_memory().unwrap();

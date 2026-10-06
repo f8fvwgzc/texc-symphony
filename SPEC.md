@@ -2236,7 +2236,9 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - Provider-native agent tools, when shipped, execute through the app-server session using
   host-side configured adapter auth without passing tracker secrets to the child.
-- TODO: Persist retry queue and session metadata across process restarts.
+- Persist the retry queue across process restarts (attempt counts and due times), re-validating
+  each restored entry against the tracker when it fires.
+- TODO: Persist session metadata of in-flight runs across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.
 - TODO: Extract common semantic helper tools only after multiple adapters demonstrate real
