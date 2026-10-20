@@ -1,7 +1,8 @@
-# Symphony
+# texc-symphony
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+texc-symphony is a Rust orchestrator for coding agents. It turns tracker issues (Linear, GitHub,
+GitLab, Jira, Asana) into isolated, autonomous implementation runs driven by Codex or Claude Code,
+so teams manage work instead of supervising agents.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
