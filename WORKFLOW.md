@@ -1,6 +1,8 @@
 ---
 # Example workflow for running Symphony on this repository (github.com/f8fvwgzc/texc-symphony).
 # Reference for every key: docs/configuration.md. CLI and environment: docs/cli.md.
+# Prompt sections between <!-- reference NAME: WHEN --> and <!-- /reference --> load on demand
+# (docs/configuration.md, "Reference sections"); check the token budget with `symphony workflow audit`.
 tracker:
   kind: linear
   provider:
@@ -184,6 +186,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
       - resulting `HEAD` short SHA.
 10. Compact context and proceed to execution.
 
+<!-- reference pr-feedback-sweep: before moving a ticket with an attached PR to `Human Review`, and at kickoff when a `Todo` ticket already has a PR -->
 ## PR feedback sweep protocol (required)
 
 When a ticket has an attached PR, run this protocol before moving to `Human Review`:
@@ -199,7 +202,9 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 4. Update the workpad plan/checklist to include each feedback item and its resolution status.
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this sweep until there are no outstanding actionable comments.
+<!-- /reference -->
 
+<!-- reference blocked-access: when a required tool, auth or permission is missing -->
 ## Blocked-access escape hatch (required behavior)
 
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
@@ -211,6 +216,7 @@ Use this only when completion is blocked by missing required tools or missing au
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
+<!-- /reference -->
 
 ## Step 2: Execution phase (Todo -> In Progress -> Human Review)
 
@@ -257,6 +263,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - Ensure branch was pushed with any required updates.
     - Then move to `Human Review`.
 
+<!-- reference merging: when the ticket is in `Human Review` or `Merging` -->
 ## Step 3: Human Review and merge handling
 
 1. When the issue is in `Human Review`, do not code or change ticket content.
@@ -265,7 +272,9 @@ Use this only when completion is blocked by missing required tools or missing au
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
 6. After merge is complete, move the issue to `Done`.
+<!-- /reference -->
 
+<!-- reference rework: when the ticket is in `Rework` -->
 ## Step 4: Rework handling
 
 1. Treat `Rework` as a full approach reset, not incremental patching.
@@ -277,6 +286,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - If current issue state is `Todo`, move it to `In Progress`; otherwise keep the current state.
    - Create a new bootstrap `## Codex Workpad` comment.
    - Build a fresh plan/checklist and execute end-to-end.
+<!-- /reference -->
 
 ## Completion bar before Human Review
 
@@ -308,6 +318,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.
 
+<!-- reference workpad-template: when you create or restore the `## Codex Workpad` comment -->
 ## Workpad template
 
 Use this exact structure for the persistent workpad comment and keep it updated in place throughout execution:
@@ -343,3 +354,4 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 - <only include when something was confusing during execution>
 ````
+<!-- /reference -->

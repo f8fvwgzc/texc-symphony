@@ -104,7 +104,7 @@ pub trait Tracker: Send + Sync {
         _arguments: &Value,
         _ctx: &ToolContext,
     ) -> ToolResult {
-        ToolResult::unsupported_generic(tool)
+        ToolResult::unsupported(tool, &[])
     }
 
     /// Candidate poll: `fetch_issues_by_states(settings.active_states)`.

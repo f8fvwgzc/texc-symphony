@@ -17,7 +17,7 @@ and the differences from the Elixir reference implementation are in
 | `symphony-store` | SQLite run history: runs, per-run events, token usage, retention; one dedicated DB thread, fire-and-forget writes | `rusqlite` (bundled SQLite, WAL) |
 | `symphony-runtime` | The orchestrator actor (scheduling state, dispatch, retries, reconciliation), agent runner, workspace manager and hooks, SSH workers, supervisor, snapshot model, `RuntimeHandle`, run recorder | the four crates above |
 | `symphony-server` | axum HTTP server: Elixir-compatible `/api/v1` routes, health, SSE, run history endpoints, OpenAPI JSON, the embedded web UI; defines the `ControlPlane` trait it serves | `axum`, `tower-http` |
-| `symphony` | The binary: clap CLI and guardrail banner, bootstrap, logging, terminal status dashboard, `workspace before-remove` subcommand; implements `ControlPlane` over `RuntimeHandle` | everything |
+| `symphony` | The binary: clap CLI and guardrail banner, bootstrap, logging, terminal status dashboard, `workspace before-remove` and `workflow audit` subcommands; implements `ControlPlane` over `RuntimeHandle` | everything |
 | `xtask` | Repository chores (`pr-body-check`); never shipped | |
 | `web/` | Preact + Vite dashboard, built to `web/dist` and embedded by `symphony-server` at compile time | |
 
@@ -45,7 +45,8 @@ Rules that keep the graph acyclic and the builds fast:
 - `symphony-core` has no network or server dependencies, so the config and prompt tests compile
   quickly.
 - `symphony-codex` does not know about trackers. It calls a `DynamicToolHandler` trait, and the
-  runtime implements that trait by routing tool calls to the active tracker's tools.
+  runtime implements that trait by routing tool calls to the active tracker's tools and serving
+  `workflow_reference` from the run's rendered reference sections.
 - `symphony-server` does not depend on the runtime. It serves anything that implements
   `ControlPlane` (snapshot, refresh, generation counter); the binary adapts `RuntimeHandle` to it.
   This lets the server be tested against fakes and keeps axum out of the runtime.
@@ -102,10 +103,11 @@ sequenceDiagram
     O->>A: dispatch (JoinSet), claim the issue
     A->>S: start_run (via RunRecorder, fire-and-forget)
     A->>W: create or reuse the workspace, after_create (new only), before_run
-    A->>C: initialize → thread/start (dynamic tools)
+    A->>A: render the turn-1 prompt and its reference sections
+    A->>C: initialize → thread/start (tracker tools, plus workflow_reference when the prompt has sections)
     loop up to agent.max_turns
         A->>C: turn/start with the rendered prompt
-        C-->>A: streamed events, tool calls (→ tracker tools), token usage
+        C-->>A: streamed events, tool calls (→ tracker tools, workflow_reference), token usage
         A-->>O: worker updates (last event, tokens, rate limits)
         A->>S: events, token usage, turn count
         A->>T: refresh the issue; stop if it is no longer active

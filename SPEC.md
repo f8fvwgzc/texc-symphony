@@ -508,6 +508,9 @@ Template input variables:
   - `null`/absent on first attempt.
   - Integer on retry or continuation run.
 
+Optional extension: the template MAY mark reference sections that are left out of the first-turn
+prompt and loaded on demand (Section 12.5).
+
 Fallback prompt behavior:
 
 - If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
@@ -1355,6 +1358,34 @@ If prompt rendering fails:
 
 - Fail the run attempt immediately.
 - Let the orchestrator treat it like any other worker failure and decide retry behavior.
+
+### 12.5 Optional Reference Sections Extension
+
+The first-turn prompt stays in the agent's context for the whole run, so situational instructions in
+it are paid for on every model request. An implementation MAY support reference sections:
+
+- A section is delimited inside the prompt template by marker lines
+  (`<!-- reference NAME: WHEN -->` ... `<!-- /reference -->` in this implementation), outside any
+  template block and outside fenced code. Each section has a unique name and a required load
+  condition.
+- The template MUST be rendered once, with the same inputs and strictness as a template without
+  sections (Sections 12.1 and 12.2), and the sections cut out of the rendered text. Content is moved,
+  not rewritten: the first-turn prompt, with each stub replaced by its section, equals the rendering
+  of the template without its markers, apart from blank lines at the edges of a section and
+  whitespace control next to a marker. Rendered issue content MUST NOT be able to open or close a
+  section. A section that renders blank MAY be left out together with its stub.
+- The first-turn prompt replaces each section with one line that names the section, the tool that
+  loads it and the load condition.
+- The sections MUST be served by a dynamic tool advertised at session startup and bound to the
+  session snapshot like adapter tools (Section 10.5). The tool SHOULD only be advertised when the
+  prompt has at least one section. An unknown section name MUST return a tool failure and the
+  session continues.
+- Malformed markers are workflow validation errors (Section 5.5), not per-run failures. Template
+  errors keep the per-run semantics of Section 12.4.
+- Because the sections decide the tools advertised at session startup, an implementation of this
+  extension renders the first-turn prompt before it starts the app-server session; Section 16.5
+  renders it inside the turn loop. A render failure is still a worker failure, and `after_run` still
+  runs.
 
 ## 13. Logging, Status, and Observability
 

@@ -44,7 +44,8 @@ You are working on {{ issue.identifier }}: {{ issue.title }}
 - **Front matter** is present only when the very first line is exactly `---`. It ends at the next
   line that is exactly `---`. Without a closing `---`, everything after the opener is front
   matter and the prompt is empty. Without an opening `---`, the whole file is the prompt and the
-  configuration is empty (which then fails with `missing_tracker_kind`).
+  configuration is empty (which then fails with `missing_tracker_kind`, unless the prompt has a
+  malformed reference marker, which is reported first).
 - The front matter must decode to a YAML mapping. Empty or comment-only front matter is an empty
   mapping.
 - YAML is parsed with YAML 1.2 core rules: `yes`/`no`/`on`/`off` are strings, not booleans;
@@ -60,7 +61,8 @@ You are working on {{ issue.identifier }}: {{ issue.title }}
 The prompt body is a [Liquid](https://shopify.github.io/liquid/) template, rendered once per agent
 run for turn 1. Later turns of the same run (up to `agent.max_turns`) send a fixed
 "Continuation guidance" message instead, because the original instructions are already in the
-Codex thread.
+Codex thread. Parts of the prompt can be marked as [reference sections](#reference-sections) that
+the agent loads only when it needs them.
 
 ### Variables
 
@@ -100,6 +102,83 @@ Rendering is strict:
 A render failure fails the agent run with `template_render_error: ...` (or
 `template_parse_error: ... template="..."` for a syntax error); the orchestrator then retries the
 issue with backoff. Fix the template and the next attempt uses the reloaded file.
+
+### Reference sections
+
+The turn-1 prompt stays in the agent's context for the whole run, so its size is paid again on
+every model request. Provider prompt caching bills those repeats at a discount, but they still fill
+the context window. Situational instructions, such as the flow for one tracker state or a comment
+template, can be marked as reference sections. Symphony leaves them out of the turn-1 prompt and
+serves them through a `workflow_reference` tool that the agent calls when a section applies. The
+design follows SkillReducer ([arXiv:2603.29919](https://arxiv.org/abs/2603.29919)): keep the rules
+the agent always needs in the prompt and load the rest on demand.
+
+```markdown
+## Status map
+
+- `Rework` -> reviewer requested changes.
+
+<!-- reference rework: when the ticket is in `Rework` -->
+## Rework handling
+
+1. Treat `Rework` as a full approach reset.
+2. Close the existing PR and start over from the kickoff flow.
+<!-- /reference -->
+```
+
+The turn-1 prompt gets one line in place of the section:
+
+```text
+Reference `rework`: call the `workflow_reference` tool with name `rework` when the ticket is in `Rework`.
+```
+
+Rules:
+
+- Each marker is a line of its own: `<!-- reference NAME: WHEN -->` opens a section and
+  `<!-- /reference -->` closes it.
+- Markers must be outside every Liquid block (`{% if %}`, `{% for %}`, `{% capture %}`,
+  `{% raw %}`, `{% comment %}`, ...) and outside multi-line tags and outputs, so that each renders
+  exactly once. A marker inside a fenced code block is ordinary prompt text, so a prompt can show
+  the syntax in an example.
+- `NAME` is 1 to 64 characters of `a-z`, `0-9`, `-` and `_`, starts with a letter or digit, and is
+  unique within the prompt.
+- `WHEN` follows a colon and a space, is required and must not contain Liquid. Write it to
+  complete the stub sentence, for example `when the ticket is in Rework` or
+  `before you move the ticket to Human Review`.
+- A comment without the `reference NAME: ` shape, such as `<!-- reference material below -->` or
+  `<!-- reference https://example.org/runbook -->`, is ordinary prompt text.
+  `<!-- /reference -->` is reserved: without an open section it is an error.
+- Sections do not nest and must not be blank.
+- The whole template renders once at the start of the run, as it would without the markers, and
+  the sections are then cut out of the rendered text. So `assign`, `capture` and whitespace control
+  work across sections as usual, and text that comes from the issue cannot open or close a section.
+  Blank lines at the edges of a section are dropped, and whitespace control next to a marker can
+  put the stub on the same line as the text beside it.
+- A section that renders blank, for example a body wrapped in `{% if attempt %}` on a first run,
+  is left out with its stub, and the tool does not offer it.
+- A malformed marker is a `workflow_parse_error` that names its file line. Symphony refuses to
+  start with it, and a reload keeps the last good workflow. Liquid errors are unchanged: they fail
+  only the affected run, as described above.
+- The `workflow_reference` tool is advertised only when the prompt has at least one section. It
+  takes `{"name": "<section>"}` and returns the rendered section text. An unknown or missing name
+  returns a tool failure that lists the section names. Like the tracker tools, the sections are a
+  snapshot taken when the run starts.
+- The coding agent must support dynamic tools, as Codex app-server does.
+
+Choosing between a reference section and a Liquid condition:
+
+- A condition that cannot change during the run, such as `attempt`, is best written as
+  `{% if attempt %}...{% endif %}`. A false condition costs nothing and needs no tool call.
+- The issue state is known at dispatch, but a human can move the ticket while the run works, and
+  the prompt is not re-rendered. A per-state block can be a Liquid condition when that is
+  acceptable, or a reference section when the agent should still find it after a state change.
+- A condition the agent discovers while it works, such as missing access or a PR that needs a
+  feedback sweep, belongs in a reference section.
+- Keep core rules, quality bars and guardrails in the prompt. A rule that must always apply is
+  not safe behind a tool call the agent might skip.
+
+`symphony workflow audit` reports what the prompt costs per request and what to move
+([CLI reference](cli.md#symphony-workflow-audit)).
 
 ### Default prompt
 
@@ -509,8 +588,8 @@ Agents that push code need their own git credentials (for example an SSH deploy 
 ## Validation errors
 
 `WORKFLOW.md` is loaded and validated at startup and on every reload, in this order: read the
-file, parse the front matter, check every key's type and range, then check `tracker.kind` and the
-adapter settings. At startup any error stops Symphony (see [`cli.md`](cli.md#exit-codes)); later it
+file, parse the front matter, check the prompt's [reference markers](#reference-sections), check
+every key's type and range, then check `tracker.kind` and the adapter settings. At startup any error stops Symphony (see [`cli.md`](cli.md#exit-codes)); later it
 only affects dispatch (see [Reloading](#reloading)).
 
 | Problem | Message |
@@ -518,6 +597,7 @@ only affects dispatch (see [Reloading](#reloading)).
 | File missing or unreadable | `Missing WORKFLOW.md at <path>: :enoent` (or another POSIX reason) |
 | YAML syntax error | `Failed to parse WORKFLOW.md: <parser message>` |
 | Front matter is not a mapping | `Failed to parse WORKFLOW.md: workflow front matter must decode to a map` |
+| Malformed reference marker | `Failed to parse WORKFLOW.md: invalid prompt reference: line <n>: <message>` |
 | Wrong type or range | `Invalid WORKFLOW.md config: <key> <message>[, <key> <message>...]` |
 | `tracker.kind` absent | `Invalid WORKFLOW.md config: :missing_tracker_kind` |
 | Unsupported kind | `Invalid WORKFLOW.md config: {:unsupported_tracker_kind, "Linear"}` |

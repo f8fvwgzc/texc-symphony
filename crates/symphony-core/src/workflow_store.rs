@@ -84,6 +84,10 @@ pub fn load_snapshot(path: &Path, env: &dyn EnvSource) -> Result<WorkflowSnapsho
 
 fn load_state(path: &Path, env: &dyn EnvSource) -> Result<(WorkflowSnapshot, Stamp), ConfigError> {
     let loaded = workflow::load(path)?;
+    if !loaded.prompt_template.trim().is_empty() {
+        prompt::check_references(&loaded.prompt_template, loaded.prompt_line)
+            .map_err(ConfigError::WorkflowParseError)?;
+    }
     let settings = config::parse(&loaded.config, env)?;
     config::validate_settings(&settings, env)?;
     let stamp = current_stamp(path).map_err(|reason| ConfigError::WorkflowFileUnreadable {

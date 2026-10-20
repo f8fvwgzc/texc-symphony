@@ -18,7 +18,7 @@ use symphony_core::{BlockerRef, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError, inspect_string};
 use crate::rest::{opt_string, present_str, uniq};
-use crate::tool::{ToolContext, ToolResult, pretty_json};
+use crate::tool::{ToolContext, ToolResult, tool_json};
 use crate::transport::{HttpClient, HttpRequest, Method, scrub_secrets};
 use crate::{MAX_PAGES, Tracker};
 
@@ -586,7 +586,7 @@ fn graphql_response(body: &Value) -> ToolResult {
         .and_then(Value::as_array)
         .is_some_and(|errors| !errors.is_empty());
     let output = match body {
-        Value::Object(_) | Value::Array(_) => pretty_json(body),
+        Value::Object(_) | Value::Array(_) => tool_json(body),
         Value::String(text) => inspect_string(text),
         Value::Null => "nil".into(),
         other => other.to_string(),

@@ -5,6 +5,7 @@ symphony [--i-understand-that-this-will-be-running-without-the-usual-guardrails]
          [--logs-root <path>] [--port <port>] [--host <addr>]
          [--db-path <path> | --no-db] [path-to-WORKFLOW.md]
 symphony workspace before-remove [--branch <name>] [--repo <owner/name>]
+symphony workflow audit [path-to-WORKFLOW.md]
 symphony --version | -V
 symphony --help | -h
 ```
@@ -113,7 +114,7 @@ tracker); more than 3 crashes within 5 s end the process with exit 1.
 
 | Code | Meaning |
 |---|---|
-| `0` | Graceful stop after SIGINT/SIGTERM; `--help`; `--version`. |
+| `0` | Graceful stop after SIGINT/SIGTERM; `--help`; `--version`; a `workflow audit` report. |
 | `1` | Usage error, missing acknowledgement, missing or invalid workflow file, invalid environment value, startup failure (bad host, port in use, database cannot be opened), fatal runtime error (orchestrator crash loop), or forced shutdown (second signal). |
 
 ## Logging
@@ -203,6 +204,64 @@ hooks:
   `gh` printed something).
 - It exits 0 even when closing a pull request fails. The only failure exit is for invalid options
   (`Invalid option(s): ...`, exit 1). `--help` exits 0.
+
+## `symphony workflow audit`
+
+```text
+symphony workflow audit [path-to-WORKFLOW.md]
+```
+
+Reads a workflow file and estimates what its prompt costs in the agent's context. It only reads the
+file: it sends nothing, needs no tracker credentials and does not need the acknowledgement flag. The
+path follows the same rules as for `symphony`: the argument, else `SYMPHONY_WORKFLOW`, else
+`./WORKFLOW.md`.
+
+The report has up to four parts:
+
+- **In context for every model request**: the turn-1 prompt with its
+  [reference sections](configuration.md#reference-sections) replaced by their stub lines, and the
+  dynamic tool specs (the tools of `tracker.kind`, plus `workflow_reference` when there are
+  sections).
+- **Loaded on demand**: each reference section with its size, file line and load condition.
+- **Largest core sections**: the biggest headings of the prompt outside the sections, the first
+  candidates to move or trim.
+- **Findings**: a prompt of 1,500 tokens or more with no reference sections, a fenced block of 40
+  tokens or more in the core (templates and examples are usually needed at one step only), and a
+  reference section under 30 tokens (its stub and the tool call cost about as much).
+
+Token counts are estimates of about four characters per token, taken over the template text. Every
+Liquid branch is counted, and the report says so when the core has Liquid tags, so a single run can
+get less. Issue fields such as `{{ issue.description }}` add their own size for every issue. Use the
+numbers to compare sections and versions of a prompt, not as billing figures.
+
+The command exits 0 with a report. It exits 1 with:
+
+- `Workflow file not found: <path>` when the path is not a regular file;
+- `Invalid option(s): ...` for an unknown option or a second path;
+- the reason `symphony` would print at startup, without its
+  `Failed to start Symphony with workflow <path>: ` prefix, when the file cannot be read, is not
+  UTF-8, has front matter that is not a YAML mapping, or has a malformed reference marker.
+
+It does not check the settings themselves (for example `agent.max_turns`) or tracker credentials.
+
+Excerpt of the report for this repository's `WORKFLOW.md` (the header, the largest core sections
+and the findings are left out):
+
+```text
+In context for every model request of a run:
+  core prompt         4,117 tokens
+  tool specs            203 tokens  linear_graphql, workflow_reference
+  total               4,320 tokens
+  The core has Liquid tags; every branch is counted, so one run can get less.
+
+Loaded on demand with the workflow_reference tool:
+  pr-feedback-sweep     225 tokens  line 189  before moving a ticket with an attached PR to `Human Review`, and at kickoff when a `Todo` ticket already has a PR
+  blocked-access        216 tokens  line 207  when a required tool, auth or permission is missing
+  merging               148 tokens  line 266  when the ticket is in `Human Review` or `Merging`
+  rework                157 tokens  line 277  when the ticket is in `Rework`
+  workpad-template      139 tokens  line 321  when you create or restore the `## Codex Workpad` comment
+  total                 885 tokens  (17% of the prompt is out of the core)
+```
 
 ## Examples
 
