@@ -186,7 +186,6 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
       - resulting `HEAD` short SHA.
 10. Compact context and proceed to execution.
 
-<!-- reference pr-feedback-sweep: before moving a ticket with an attached PR to `Human Review`, and at kickoff when a `Todo` ticket already has a PR -->
 ## PR feedback sweep protocol (required)
 
 When a ticket has an attached PR, run this protocol before moving to `Human Review`:
@@ -202,7 +201,6 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 4. Update the workpad plan/checklist to include each feedback item and its resolution status.
 5. Re-run validation after feedback-driven changes and push updates.
 6. Repeat this sweep until there are no outstanding actionable comments.
-<!-- /reference -->
 
 <!-- reference blocked-access: when a required tool, auth or permission is missing -->
 ## Blocked-access escape hatch (required behavior)

@@ -249,18 +249,17 @@ and the findings are left out):
 
 ```text
 In context for every model request of a run:
-  core prompt         4,117 tokens
-  tool specs            203 tokens  linear_graphql, workflow_reference
-  total               4,320 tokens
+  core prompt        4,288 tokens
+  tool specs           198 tokens  linear_graphql, workflow_reference
+  total              4,486 tokens
   The core has Liquid tags; every branch is counted, so one run can get less.
 
 Loaded on demand with the workflow_reference tool:
-  pr-feedback-sweep     225 tokens  line 189  before moving a ticket with an attached PR to `Human Review`, and at kickoff when a `Todo` ticket already has a PR
-  blocked-access        216 tokens  line 207  when a required tool, auth or permission is missing
-  merging               148 tokens  line 266  when the ticket is in `Human Review` or `Merging`
-  rework                157 tokens  line 277  when the ticket is in `Rework`
-  workpad-template      139 tokens  line 321  when you create or restore the `## Codex Workpad` comment
-  total                 885 tokens  (17% of the prompt is out of the core)
+  blocked-access       216 tokens  line 205  when a required tool, auth or permission is missing
+  merging              148 tokens  line 264  when the ticket is in `Human Review` or `Merging`
+  rework               157 tokens  line 275  when the ticket is in `Rework`
+  workpad-template     139 tokens  line 319  when you create or restore the `## Codex Workpad` comment
+  total                660 tokens  (13% of the prompt is out of the core)
 ```
 
 ## Examples
