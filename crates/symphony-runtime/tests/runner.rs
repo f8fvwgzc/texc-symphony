@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use support::{TestWorkflow, codex_fixture, executable_copy, fixture, issue, read, sh_quote};
+use support::{
+    TestWorkflow, codex_fixture, default_config, executable_copy, fixture, issue, merge, read,
+    sh_quote, write_workflow,
+};
 use symphony_codex::{CodexEvent, CodexEventKind, EventSink};
 use symphony_core::Issue;
 use symphony_runtime::runner::continue_with_issue;
@@ -412,4 +415,176 @@ async fn cancelled_runs_stop_codex_and_still_run_after_run() {
             .unwrap_or(false)
     })
     .await;
+}
+
+const SECTIONED_PROMPT: &str = "Work on {{ issue.identifier }}.
+<!-- reference rework: when the ticket is in Rework -->
+Rework steps for {{ issue.identifier }}: answer every review comment.
+<!-- /reference -->
+Report blockers only.";
+
+/// The workflow config running the scripted fake app-server with `script`, plus `extra`.
+fn scripted_config(s: &Setup, script: &str, extra: Value) -> Value {
+    let script_path = s.wf.path("server.script");
+    fs::write(&script_path, script).unwrap();
+    let mut config = default_config(&s.wf.workspace_root());
+    merge(
+        &mut config,
+        &json!({"codex": {"command": format!(
+            "sh {} {}",
+            sh_quote(&codex_fixture("scripted.sh").to_string_lossy()),
+            sh_quote(&script_path.to_string_lossy())
+        )}}),
+    );
+    merge(&mut config, &extra);
+    config
+}
+
+/// Rewrites the workflow with `prompt` and the scripted fake app-server running `script`.
+fn scripted_workflow(s: &Setup, prompt: &str, script: &str) {
+    write_workflow(&s.wf.path, &scripted_config(s, script, json!({})), prompt);
+    s.wf.store.force_reload().unwrap();
+}
+
+const ONE_TURN_WITH_REFERENCE_CALL: &str = r#"1 {"id":1,"result":{}}
+3 {"id":2,"result":{"thread":{"id":"thread-r"}}}
+4 {"id":3,"result":{"turn":{"id":"turn-r"}}}
+4 {"id":101,"method":"item/tool/call","params":{"tool":"workflow_reference","callId":"call-1","threadId":"thread-r","turnId":"turn-r","arguments":{"name":"rework"}}}
+5 {"id":102,"method":"item/tool/call","params":{"tool":"workflow_reference","callId":"call-2","threadId":"thread-r","turnId":"turn-r","arguments":{"name":"land"}}}
+6 {"id":103,"method":"item/tool/call","params":{"tool":"workflow_references","callId":"call-3","threadId":"thread-r","turnId":"turn-r","arguments":{}}}
+7 {"method":"turn/completed"}
+"#;
+
+#[tokio::test]
+async fn reference_sections_leave_the_prompt_and_are_served_by_the_workflow_reference_tool() {
+    let fetcher = ScriptedFetcher::new(vec![vec![issue("i-1", "MT-REF", "Done")]]);
+    let s = setup(json!({}), Some(fetcher), None);
+    scripted_workflow(&s, SECTIONED_PROMPT, ONE_TURN_WITH_REFERENCE_CALL);
+    s.runner
+        .run(WorkerContext::standalone(issue("i-1", "MT-REF", "Rework")))
+        .await
+        .unwrap();
+    let messages = traced_messages(&s.trace);
+
+    let tools = &methods(&messages, "thread/start")[0]["params"]["dynamicTools"];
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|spec| spec["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["workflow_reference"]);
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]["name"]["enum"],
+        json!(["rework"])
+    );
+
+    let prompt = methods(&messages, "turn/start")[0]["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(prompt.starts_with("Work on MT-REF."));
+    assert!(prompt.contains(
+        "Reference `rework`: call the `workflow_reference` tool with name `rework` when the ticket is in Rework."
+    ));
+    assert!(!prompt.contains("answer every review comment"));
+
+    let reply = |id: u64| {
+        messages
+            .iter()
+            .find(|m| m["id"] == json!(id) && m.get("result").is_some())
+            .unwrap_or_else(|| panic!("reply {id} sent"))["result"]
+            .clone()
+    };
+    let served = reply(101);
+    assert_eq!(served["success"], json!(true));
+    assert_eq!(
+        served["contentItems"][0]["text"],
+        json!("Rework steps for MT-REF: answer every review comment.")
+    );
+    let unknown = reply(102);
+    assert_eq!(unknown["success"], json!(false));
+    assert_eq!(
+        unknown["output"],
+        json!(
+            r#"{"error":{"message":"Unknown workflow reference: \"land\".","references":["rework"]}}"#
+        )
+    );
+    // An unknown tool is told about every advertised tool, the reference tool included.
+    let unsupported = reply(103);
+    assert_eq!(unsupported["success"], json!(false));
+    assert_eq!(
+        unsupported["output"],
+        json!(
+            r#"{"error":{"message":"Unsupported dynamic tool: \"workflow_references\".","supportedTools":["workflow_reference"]}}"#
+        )
+    );
+}
+
+const ONE_PLAIN_TURN: &str = "1 {\"id\":1,\"result\":{}}\n3 {\"id\":2,\"result\":{\"thread\":{\"id\":\"t\"}}}\n4 {\"id\":3,\"result\":{\"turn\":{\"id\":\"u\"}}}\n4 {\"method\":\"turn/completed\"}\n";
+
+#[tokio::test]
+async fn a_workflow_edited_during_before_run_does_not_mix_into_the_starting_session() {
+    let fetcher = ScriptedFetcher::new(vec![vec![issue("i-1", "MT-SNAP", "Done")]]);
+    let s = setup(json!({}), Some(fetcher), None);
+    // before_run replaces WORKFLOW.md with a version whose prompt has a reference section.
+    let replacement = s.wf.path("WORKFLOW.v2.md");
+    let config = scripted_config(
+        &s,
+        ONE_PLAIN_TURN,
+        json!({"hooks": {"before_run": format!(
+            "cp {} {}",
+            sh_quote(&replacement.to_string_lossy()),
+            sh_quote(&s.wf.path.to_string_lossy())
+        )}}),
+    );
+    write_workflow(
+        &replacement,
+        &config,
+        "Version two.\n<!-- reference late: when needed -->\nLate section.\n<!-- /reference -->",
+    );
+    write_workflow(
+        &s.wf.path,
+        &config,
+        "Version one for {{ issue.identifier }}.",
+    );
+    s.wf.store.force_reload().unwrap();
+    s.runner
+        .run(WorkerContext::standalone(issue("i-1", "MT-SNAP", "Todo")))
+        .await
+        .unwrap();
+    let messages = traced_messages(&s.trace);
+    assert_eq!(
+        methods(&messages, "turn/start")[0]["params"]["input"][0]["text"],
+        json!("Version one for MT-SNAP.")
+    );
+    assert_eq!(
+        methods(&messages, "thread/start")[0]["params"]["dynamicTools"],
+        json!([])
+    );
+    assert!(read(&s.wf.path).contains("Version two."), "the hook ran");
+}
+
+#[tokio::test]
+async fn a_prompt_without_reference_sections_advertises_no_reference_tool() {
+    let fetcher = ScriptedFetcher::new(vec![vec![issue("i-1", "MT-NOREF", "Done")]]);
+    let s = setup(json!({}), Some(fetcher), None);
+    scripted_workflow(
+        &s,
+        "Plain prompt for {{ issue.identifier }}.",
+        ONE_PLAIN_TURN,
+    );
+    s.runner
+        .run(WorkerContext::standalone(issue("i-1", "MT-NOREF", "Todo")))
+        .await
+        .unwrap();
+    let messages = traced_messages(&s.trace);
+    assert_eq!(
+        methods(&messages, "thread/start")[0]["params"]["dynamicTools"],
+        json!([])
+    );
+    assert_eq!(
+        methods(&messages, "turn/start")[0]["params"]["input"][0]["text"],
+        json!("Plain prompt for MT-NOREF.")
+    );
 }

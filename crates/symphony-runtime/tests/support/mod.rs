@@ -144,15 +144,30 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// Copies `source` to `dir/name` and makes it executable (fixtures may lose their mode bits).
+/// An executable `dir/name` that runs `source`.
+///
+/// On Unix an executable fixture is symlinked, not copied: writing a fresh executable while a parallel
+/// test forks lets the child inherit the write handle for a moment, and exec of the new file then fails
+/// with `Text file busy` (ETXTBSY). `$0` stays `dir/name`, so scripts still find files next to
+/// themselves. A fixture that lost its mode bits in the checkout is copied and made executable.
 pub fn executable_copy(source: &Path, dir: &Path, name: &str) -> PathBuf {
     let target = dir.join(name);
-    fs::copy(source, &target).expect("copy fixture");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let source = fs::canonicalize(source).expect("fixture path");
+        let executable = fs::metadata(&source)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if executable {
+            std::os::unix::fs::symlink(&source, &target).expect("symlink fixture");
+            return target;
+        }
+        fs::copy(&source, &target).expect("copy fixture");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
+    #[cfg(not(unix))]
+    fs::copy(source, &target).expect("copy fixture");
     target
 }
 

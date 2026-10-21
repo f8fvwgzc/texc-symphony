@@ -20,6 +20,10 @@ pub struct LoadedWorkflow {
     pub prompt: String,
     /// Same as `prompt` (kept for Elixir API parity).
     pub prompt_template: String,
+    /// 1-based file line of the prompt's first line (prompt line `n` is file line
+    /// `prompt_line + n - 1`); 1 when the prompt is empty, 0 in `LoadedWorkflow::default()`. Lines are
+    /// counted as [`parse`] splits them, so a vertical tab or form feed also starts a line.
+    pub prompt_line: usize,
 }
 
 /// `Workflow.load/1`: reads and parses `path`.
@@ -62,15 +66,20 @@ fn split_lines(content: &str) -> Vec<&str> {
     lines
 }
 
-fn split_front_matter(content: &str) -> (Vec<&str>, Vec<&str>) {
+/// `(front matter lines, prompt lines, 1-based file line of the first prompt line)`.
+fn split_front_matter(content: &str) -> (Vec<&str>, Vec<&str>, usize) {
     let lines = split_lines(content);
     match lines.split_first() {
         Some((&"---", tail)) => match tail.iter().position(|line| *line == "---") {
-            Some(close) => (tail[..close].to_vec(), tail[close + 1..].to_vec()),
+            Some(close) => (
+                tail[..close].to_vec(),
+                tail[close + 1..].to_vec(),
+                close + 3,
+            ),
             // Unterminated front matter: everything after the opener is YAML, the prompt is empty.
-            None => (tail.to_vec(), Vec::new()),
+            None => (tail.to_vec(), Vec::new(), 1),
         },
-        _ => (Vec::new(), lines),
+        _ => (Vec::new(), lines, 1),
     }
 }
 
@@ -96,19 +105,40 @@ fn front_matter_to_map(lines: &[&str]) -> Result<Map<String, Value>, ConfigError
 /// is empty. Otherwise the whole file is the prompt. The prompt is re-joined with `\n` (CRLF becomes LF)
 /// and trimmed.
 pub fn parse(content: &str) -> Result<LoadedWorkflow, ConfigError> {
-    let (front, prompt_lines) = split_front_matter(content);
+    let (front, prompt_lines, first_line) = split_front_matter(content);
     let config = front_matter_to_map(&front)?;
     let prompt = prompt_lines.join("\n").trim().to_owned();
+    // `trim` drops the leading blank lines; the first kept line is the first non-blank one.
+    let prompt_line = prompt_lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .map_or(1, |skipped| first_line + skipped);
     Ok(LoadedWorkflow {
         config,
         prompt_template: prompt.clone(),
         prompt,
+        prompt_line,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_the_file_line_where_the_prompt_starts() {
+        assert_eq!(
+            parse("---\na: 1\n---\n\n  \nBody\nmore")
+                .unwrap()
+                .prompt_line,
+            6
+        );
+        assert_eq!(parse("---\n---\nBody").unwrap().prompt_line, 3);
+        assert_eq!(parse("\r\nBody").unwrap().prompt_line, 2);
+        assert_eq!(parse("Body").unwrap().prompt_line, 1);
+        assert_eq!(parse("---\na: 1\n---\n").unwrap().prompt_line, 1);
+        assert_eq!(parse("---\na: 1").unwrap().prompt_line, 1);
+    }
 
     #[test]
     fn splits_like_elixir_r_escape() {

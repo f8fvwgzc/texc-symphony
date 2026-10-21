@@ -183,7 +183,7 @@ async fn linear_graphql_returns_successful_graphql_responses_as_tool_text() {
         .await;
     assert!(result.success);
     assert_eq!(serde_json::from_str::<Value>(&result.output).unwrap(), body);
-    assert_eq!(result.output, serde_json::to_string_pretty(&body).unwrap());
+    assert_eq!(result.output, r#"{"data":{"viewer":{"id":"usr_123"}}}"#);
     assert_eq!(result.content_items[0].text, result.output);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(

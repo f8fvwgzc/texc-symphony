@@ -82,8 +82,13 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   - `workflow_unavailable: …`;
   - `template_parse_error: <msg> template="<template>"` (same prefix and shape as Elixir);
   - `template_render_error: …` (Elixir raised `Solid.RenderError` unwrapped).
-- **Continuation prompt.** `prompt::continuation_prompt` and `build_turn_prompt` reproduce the
-  agent runner's fixed turn 2+ guidance byte for byte.
+- **Continuation prompt.** `prompt::continuation_prompt` reproduces the agent runner's fixed turn
+  2+ guidance byte for byte.
+- **Reference sections (new).** A prompt can mark situational sections with
+  `<!-- reference NAME: WHEN -->` ... `<!-- /reference -->`. They are cut from the turn-1 prompt and
+  served by a `workflow_reference` dynamic tool, so the turn-1 prompt is rendered before the
+  app-server starts. Without markers the prompt is unchanged. See
+  [`configuration.md`](configuration.md#reference-sections).
 - **Workflow line splitting.** Lines split on CRLF, LF, CR, VT and FF. Elixir's non-unicode `\R`
   also matched a raw `0x85` byte, which splits and corrupts characters such as `ą`. That
   latent bug is fixed.
@@ -123,8 +128,9 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 
 - **Wire parity.** Newline-delimited JSON with no `"jsonrpc"` field. Request ids are fixed: 1 for
   `initialize`, 2 for `thread/start` and 3 for every `turn/start`. Responses match only on exact
-  integer ids. Method names, approval decisions, the MCP auto-answer shape and tool-result
-  normalization are byte-compatible.
+  integer ids. Method names, approval decisions, the MCP auto-answer shape and the shape of
+  tool-result normalization are byte-compatible; tool output text is compact JSON (see the
+  tracker notes).
   - `thread/start` always sends `dynamicTools`, even when the list is empty.
   - `turn/start` sends no `model`, `effort` or `summary` fields.
   - `turn/completed` always counts as success (C.13 #4). `turn/failed` and `turn/cancelled` end the
@@ -267,10 +273,11 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   `ReqwestTransport::with_origin_override`, so the redirect/credential logic runs unmodified.
   Elixir tests that needed non-JSON terms (a PID body, a non-integer status, atom-keyed maps) are
   N/A; a text body test replaces the PID case.
-- **Tool output.** The output is pretty JSON with sorted keys (`serde_json` without
-  `preserve_order`), byte-compatible with `Jason.encode!(pretty: true)` for these payloads. The
-  generic "unsupported" response (Memory) stays compact JSON. A non-object Linear body renders like
-  Elixir `inspect`: strings are quoted and `null` is `nil`.
+- **Tool output.** The output is compact JSON with sorted keys (`serde_json` without
+  `preserve_order`). Elixir sent `Jason.encode!(pretty: true)`; the data is the same, but every later
+  model request of the run re-sends a tool result, and the indentation was about a third of the
+  bytes of a typical tracker payload. A non-object Linear body renders like Elixir `inspect`:
+  strings are quoted and `null` is `nil`.
 - **Query parameters.** Scalars are stringified (`10` becomes `"10"`, `true` becomes `"true"`,
   `null` becomes `""`). Nested arrays/objects in `params`/`query` are rejected with the tool's
   `invalid_params`/`invalid_query` message, where Elixir crashed in `URI.encode_query`. An empty map
@@ -561,8 +568,8 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   plus the build-time `SYMPHONY_VERSION_SUFFIX`, e.g. `0.1.0-nightly`), environment fallbacks
   (`SYMPHONY_WORKFLOW`, `SYMPHONY_HOST`, `SYMPHONY_PORT`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_DB_PATH`,
   `SYMPHONY_DB_RETENTION_DAYS`, `SYMPHONY_LOG_FORMAT`; a flag always wins, the variable wins over
-  `WORKFLOW.md`), and the `workspace before-remove` subcommand. A workflow file literally named
-  `workspace` must be passed as `./workspace`.
+  `WORKFLOW.md`), and the `workspace before-remove` and `workflow audit` subcommands. A workflow
+  file literally named `workspace` or `workflow` must be passed as `./workspace` or `./workflow`.
 - **Startup order.** The workflow is loaded and validated before logging is configured (Elixir
   configured the log handler first), because whether stdout carries logs depends on
   `observability.dashboard_enabled`. Load errors still go to stderr with

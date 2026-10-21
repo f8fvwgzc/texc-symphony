@@ -1,5 +1,5 @@
-//! Agent (dynamic) tool plumbing shared by every adapter: the response shape, Elixir-compatible JSON
-//! rendering, and the session-bound [`ToolBinding`].
+//! Agent (dynamic) tool plumbing shared by every adapter: the response shape, the compact JSON
+//! encoding of tool output, and the session-bound [`ToolBinding`].
 
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ pub struct ContentItem {
 pub struct ToolResult {
     /// Whether the call succeeded.
     pub success: bool,
-    /// The output text (pretty JSON for adapter tools).
+    /// The output text (compact JSON for adapter tools).
     pub output: String,
     /// One `inputText` item mirroring `output`.
     #[serde(rename = "contentItems")]
@@ -46,12 +46,12 @@ impl ToolResult {
         }
     }
 
-    /// `success` with `output = pretty_json(payload)`.
+    /// `success` with `output = tool_json(payload)`.
     pub fn from_payload(success: bool, payload: &Value) -> Self {
-        Self::new(success, pretty_json(payload))
+        Self::new(success, tool_json(payload))
     }
 
-    /// A failure whose output is `pretty_json(payload)`.
+    /// A failure whose output is `tool_json(payload)`.
     pub fn failure(payload: &Value) -> Self {
         Self::from_payload(false, payload)
     }
@@ -61,14 +61,10 @@ impl ToolResult {
         Self::failure(&json!({ "error": { "message": message } }))
     }
 
-    /// An adapter's "unsupported tool" failure (pretty JSON listing its tools).
+    /// An adapter's "unsupported tool" failure listing its tools (`supportedTools: []` for adapters
+    /// without tools, such as Memory).
     pub fn unsupported(tool: Option<&str>, supported: &[&str]) -> Self {
         Self::failure(&unsupported_payload(tool, supported))
-    }
-
-    /// The generic response for adapters without tools (Memory): **compact** JSON, `supportedTools: []`.
-    pub fn unsupported_generic(tool: Option<&str>) -> Self {
-        Self::new(false, unsupported_payload(tool, &[]).to_string())
     }
 
     /// The response as a JSON object.
@@ -98,10 +94,14 @@ pub fn inspect_tool_name(tool: Option<&str>) -> String {
     tool.map_or_else(|| "nil".to_owned(), inspect_string)
 }
 
-/// `Jason.encode!(payload, pretty: true)`: 2-space indentation, `"key": value`, keys sorted (serde_json
-/// maps are ordered by key because `preserve_order` is not enabled).
-pub fn pretty_json(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+/// The text of a JSON tool result: compact JSON with keys sorted (serde_json maps are ordered by key
+/// because `preserve_order` is not enabled).
+///
+/// Elixir sent `Jason.encode!(payload, pretty: true)`. A tool result stays in the thread, so every later
+/// model request of the run re-sends it; dropping the indentation removes about a third of the bytes of
+/// a typical tracker payload without changing its data (SPEC §10.5 leaves payloads adapter-owned).
+pub fn tool_json(value: &Value) -> String {
+    value.to_string()
 }
 
 /// Per-call context for tool execution.
@@ -203,17 +203,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pretty_json_matches_jason_layout() {
-        let payload = json!({"status": 201, "body": {"id": 9}});
+    fn tool_json_is_compact_with_sorted_keys() {
+        let payload = json!({"status": 201, "body": {"id": 9, "tags": ["a", "b"]}});
         assert_eq!(
-            pretty_json(&payload),
-            "{\n  \"body\": {\n    \"id\": 9\n  },\n  \"status\": 201\n}"
+            tool_json(&payload),
+            r#"{"body":{"id":9,"tags":["a","b"]},"status":201}"#
+        );
+        assert_eq!(
+            ToolResult::from_payload(true, &payload).output,
+            tool_json(&payload)
         );
     }
 
     #[test]
-    fn generic_unsupported_is_compact() {
-        let result = ToolResult::unsupported_generic(Some("x"));
+    fn unsupported_without_tools_lists_none() {
+        let result = ToolResult::unsupported(Some("x"), &[]);
         assert!(!result.success);
         assert_eq!(
             result.output,
@@ -221,7 +225,7 @@ mod tests {
         );
         assert_eq!(result.content_items[0].text, result.output);
         assert_eq!(
-            ToolResult::unsupported_generic(None).output,
+            ToolResult::unsupported(None, &[]).output,
             r#"{"error":{"message":"Unsupported dynamic tool: nil.","supportedTools":[]}}"#
         );
         let value = result.to_value();
