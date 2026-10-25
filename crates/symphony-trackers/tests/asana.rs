@@ -627,6 +627,27 @@ fn asana_api_scope_classifies_paths() {
             ScopeTarget::Task("9".into())
         ])
     );
+    // Numbers and single {gid} objects are references too; `null` clears the parent.
+    assert_eq!(
+        check(
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": 77, "insert_after": {"gid": "78"}}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Section("s-1".into()),
+            ScopeTarget::Task("77".into()),
+            ScopeTarget::Task("78".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/setParent",
+            Some(json!({"data": {"parent": null}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
     assert_eq!(
         check(
             Method::Post,
@@ -672,6 +693,19 @@ fn asana_api_scope_classifies_paths() {
             "body_out_of_scope",
         ),
         (Method::Get, "/tasks", None, "body_out_of_scope"),
+        // A reference of an unexpected shape is refused instead of skipped.
+        (
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": true}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addDependencies",
+            Some(json!({"data": {"dependencies": ["5", {"name": "x"}]}})),
+            "body_out_of_scope",
+        ),
         // Subtasks and new tasks may not be filed into other projects.
         (
             Method::Post,

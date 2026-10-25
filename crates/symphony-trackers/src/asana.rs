@@ -300,26 +300,52 @@ pub enum ScopeTarget {
     Section(String),
 }
 
-/// Task gids the body of `call` names at `pointers` (strings, or arrays of strings); each must be
-/// a task of the project as well.
-fn body_tasks(call: &RestCall, pointers: &[&str]) -> Vec<ScopeTarget> {
+/// One task reference: a gid string or number, or an object with such a `gid`.
+fn task_gid(value: &Value) -> Option<String> {
+    match value {
+        Value::String(gid) if !gid.is_empty() => Some(gid.clone()),
+        Value::Number(gid) => Some(gid.to_string()),
+        Value::Object(object) => object.get("gid").and_then(task_gid),
+        _ => None,
+    }
+}
+
+/// Task gids the body of `call` names at `pointers` (a reference or an array of them); each must
+/// be a task of the project as well. A reference that is present but not a gid is refused, so an
+/// unexpected shape cannot skip the check (`null` clears a field and names no task).
+fn body_tasks(call: &RestCall, pointers: &[&str]) -> Result<Vec<ScopeTarget>, Denied> {
     let Some(body) = call.body.as_ref() else {
-        return Vec::new();
+        return Ok(Vec::new());
+    };
+    let refused = |pointer: &str| {
+        Denied::new(
+            "body_out_of_scope",
+            format!(
+                "`{}`: {} must be task gids (strings or {{\"gid\": ...}}).",
+                TOOL.name,
+                pointer.trim_start_matches('/').replace('/', ".")
+            ),
+        )
     };
     let mut out = Vec::new();
     for pointer in pointers {
         match body.pointer(pointer) {
-            Some(Value::String(gid)) => out.push(ScopeTarget::Task(gid.clone())),
-            Some(Value::Array(items)) => out.extend(
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().or_else(|| item.pointer("/gid")?.as_str()))
-                    .map(|gid| ScopeTarget::Task(gid.to_owned())),
-            ),
-            _ => {}
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    out.push(ScopeTarget::Task(
+                        task_gid(item).ok_or_else(|| refused(pointer))?,
+                    ));
+                }
+            }
+            Some(value) => {
+                out.push(ScopeTarget::Task(
+                    task_gid(value).ok_or_else(|| refused(pointer))?,
+                ));
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// `data.projects` and `data.memberships[].project` must name only `project` (absent is fine
@@ -373,7 +399,7 @@ pub fn check_scope(
             "/data/dependencies",
             "/data/dependents",
         ],
-    ));
+    )?);
     Ok(targets)
 }
 
