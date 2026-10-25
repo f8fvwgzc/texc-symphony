@@ -1482,6 +1482,10 @@ Enablement (extension):
 - Positive `server.port` values bind that port.
 - Implementations SHOULD bind loopback by default (`127.0.0.1` or host equivalent) unless explicitly
   configured otherwise.
+- Implementations SHOULD require authentication before serving the API on a non-loopback address,
+  SHOULD refuse requests whose `Host` names neither loopback nor a configured name (DNS rebinding),
+  and SHOULD refuse cross-origin browser writes. The API exposes agent output, so it MUST NOT be
+  readable by arbitrary web pages.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 

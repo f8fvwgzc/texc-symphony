@@ -43,6 +43,10 @@ pub enum StoreError {
     /// The background database thread is gone (it was never started or it exited).
     #[error("store_unavailable: persistence thread is not running")]
     Unavailable,
+    /// The database thread's queue is full ([`crate::STORE_QUEUE_CAPACITY`] operations); the
+    /// operation was not queued.
+    #[error("store_busy: the store queue is full")]
+    Busy,
     /// An operation panicked inside the database thread; the thread survived.
     #[error("store_internal_error: {0}")]
     Internal(String),

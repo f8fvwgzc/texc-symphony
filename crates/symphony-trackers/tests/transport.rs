@@ -364,13 +364,14 @@ async fn transport_errors_are_scrubbed_before_reaching_tool_output() {
     let settings = tracker_settings(json!({
         "kind": "github",
         "provider": {"repo": "octo/repo", "token": "ghp_secret_value", "api_url": ORIGIN},
+        "required_labels": ["symphony"],
         "active_states": ["open"],
         "terminal_states": ["closed"],
     }));
     let result = symphony_trackers::Tracker::execute_agent_tool(
         &tracker,
         Some("github_api"),
-        &json!({"method": "POST", "path": "/user"}),
+        &json!({"method": "POST", "path": "/repos/octo/repo/issues"}),
         &ctx(&settings),
     )
     .await;

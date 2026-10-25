@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-pub use cast::{cast_boolean, cast_integer, cast_string_list};
+pub use cast::{cast_boolean, cast_integer, cast_number, cast_string_list};
 pub use schema::{
-    AgentSettings, CodexProvider, CodexSettings, HooksSettings, ObservabilitySettings,
-    PollingSettings, ServerSettings, Settings, StringOrMap, TrackerSettings, WorkerSettings,
-    WorkspaceSettings, default_approval_policy, normalize_state_limits, parse,
+    AgentSettings, BudgetSettings, CodexProvider, CodexSettings, HooksSettings,
+    ObservabilitySettings, PollingSettings, ServerSettings, Settings, StringOrMap, TrackerSettings,
+    WorkerSettings, WorkspaceSettings, default_approval_policy, normalize_state_limits, parse,
     validate_state_limits,
 };
 pub use tracker::{
@@ -167,9 +167,13 @@ impl Settings {
         })
     }
 
-    /// Env var names to strip from the Codex child for the configured tracker.
+    /// Env var names to strip from agent children: the tracker's secrets and the HTTP API token.
     pub fn secret_environment_names(&self) -> Vec<String> {
-        tracker::secret_environment_names(&self.tracker)
+        crate::env::uniq(
+            tracker::secret_environment_names(&self.tracker)
+                .into_iter()
+                .chain(self.server.secret_environment_names.iter().cloned()),
+        )
     }
 
     /// Active states, or an empty list when unset.

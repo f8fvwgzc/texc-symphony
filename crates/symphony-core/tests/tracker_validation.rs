@@ -110,11 +110,79 @@ fn github_states_must_be_open_and_closed() {
     );
     assert_eq!(
         validate(
-            json!({"kind": "github", "active_states": ["Open"], "terminal_states": ["CLOSED"]}),
+            json!({"kind": "github", "active_states": ["Open"], "terminal_states": ["CLOSED"], "required_labels": ["symphony"]}),
             &env
         ),
         Ok(())
     );
+}
+
+#[test]
+fn github_and_gitlab_need_a_routing_guard() {
+    let env = MapEnv::new()
+        .with("GITHUB_TOKEN", "t")
+        .with("GITHUB_REPO", "o/r")
+        .with("GITLAB_PAT", "t")
+        .with("GITLAB_PROJECT_PATH", "g/p");
+    let github = |extra: Value| {
+        let mut tracker = json!({"kind": "github", "active_states": ["open"], "terminal_states": ["closed"], "provider": {}});
+        for (k, v) in extra.as_object().unwrap() {
+            tracker[k] = v.clone();
+        }
+        validate(tracker, &env)
+    };
+    assert_eq!(github(json!({})), Err(E::MissingGithubRoutingGuard.into()));
+    assert_eq!(
+        github(json!({"required_labels": ["", "  "]})),
+        Err(E::MissingGithubRoutingGuard.into())
+    );
+    assert_eq!(github(json!({"required_labels": ["Symphony"]})), Ok(()));
+    assert_eq!(
+        github(json!({"provider": {"allowed_authors": ["octocat"]}})),
+        Ok(())
+    );
+    assert_eq!(
+        github(json!({"provider": {"allowed_authors": []}})),
+        Err(E::MissingGithubRoutingGuard.into())
+    );
+    assert_eq!(
+        github(json!({"provider": {"allowed_authors": "octocat"}})),
+        Err(E::InvalidGithubAllowedAuthors.into())
+    );
+    let s = settings(
+        json!({"kind": "github", "provider": {"allowed_authors": [" OctoCat ", "octocat", "bot"]}}),
+        &env,
+    );
+    assert_eq!(
+        resolve_github(&s.tracker, &env).unwrap().allowed_authors,
+        strings(&["octocat", "bot"])
+    );
+
+    let gitlab = |extra: Value| {
+        let mut tracker = json!({"kind": "gitlab", "active_states": ["opened"], "terminal_states": ["closed"], "provider": {}});
+        for (k, v) in extra.as_object().unwrap() {
+            tracker[k] = v.clone();
+        }
+        validate(tracker, &env)
+    };
+    assert_eq!(gitlab(json!({})), Err(E::MissingGitlabRoutingGuard.into()));
+    assert_eq!(gitlab(json!({"required_labels": ["agent"]})), Ok(()));
+    assert_eq!(
+        gitlab(json!({"provider": {"allowed_authors": ["maintainer"]}})),
+        Ok(())
+    );
+    assert_eq!(
+        gitlab(json!({"provider": {"allowed_authors": [1]}})),
+        Err(E::InvalidGitlabAllowedAuthors.into())
+    );
+
+    let message = ConfigError::from(E::MissingGithubRoutingGuard).user_message();
+    assert!(
+        message.starts_with("Invalid WORKFLOW.md config: :missing_github_routing_guard ("),
+        "{message}"
+    );
+    assert!(message.contains("tracker.required_labels"), "{message}");
+    assert!(message.contains("allowed_authors"), "{message}");
 }
 
 #[test]
@@ -173,10 +241,10 @@ fn github_settings_resolution() {
             "MY_TOKEN"
         ])
     );
-    assert_eq!(
-        s.secret_environment_names(),
-        secret_environment_names(&s.tracker)
-    );
+    // Settings add the HTTP API token variable to the tracker's names.
+    let mut expected = secret_environment_names(&s.tracker);
+    expected.push("SYMPHONY_API_TOKEN".into());
+    assert_eq!(s.secret_environment_names(), expected);
 
     // An empty env value does not fall back to GITHUB_TOKEN; an invalid reference resolves to nothing.
     let s = settings(base(json!({"repo": "o/r", "token": "$EMPTY_TOKEN"})), &env);

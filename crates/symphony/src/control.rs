@@ -1,18 +1,21 @@
 //! [`symphony_server::ControlPlane`] over the runtime's [`RuntimeHandle`] (the binary is the only
 //! crate that knows both; the server never depends on the runtime).
 
+// Modified 2026-10-25: redacted messages, spend view and the kill switch (audit A1/A4).
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use symphony_core::WorkflowStore;
+use symphony_runtime::redact::Redactor;
 use symphony_runtime::{
-    BlockedSnapshot, RefreshError, RetrySnapshot, RunningSnapshot, RuntimeHandle, Snapshot,
-    SnapshotError, humanize_codex_message,
+    BlockedSnapshot, CodexMessage, RefreshError, RetrySnapshot, RunningSnapshot, RuntimeHandle,
+    Snapshot, SnapshotError, humanize_codex_message,
 };
 use symphony_server::{
-    BlockedEntry, CodexTotals, ControlPlane, RefreshAccepted, RetryEntry, RunningEntry, StateError,
-    StateView, TokenCounts, Unavailable, presenter,
+    BlockedEntry, CodexTotals, ControlPlane, PauseState, RefreshAccepted, RetryEntry, RunningEntry,
+    SpendView, StateError, StateView, TokenCounts, Unavailable, presenter,
 };
 use tokio::sync::watch;
 
@@ -30,6 +33,17 @@ impl RuntimeControlPlane {
     }
 }
 
+/// The humanized last message, with credential-shaped text redacted (it reaches every client of
+/// `/api/v1/state` and the SSE stream).
+fn last_message(message: Option<&CodexMessage>) -> Option<String> {
+    let text = humanize_codex_message(Some(message?));
+    Some(Redactor::patterns_only().redact_str(&text).into_owned())
+}
+
+fn usd(micro: u64) -> f64 {
+    micro as f64 / 1_000_000.0
+}
+
 fn running_entry(row: &RunningSnapshot) -> RunningEntry {
     RunningEntry {
         issue_id: row.issue_id.clone(),
@@ -41,10 +55,7 @@ fn running_entry(row: &RunningSnapshot) -> RunningEntry {
         session_id: row.session_id.clone(),
         turn_count: row.turn_count,
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: row
-            .last_codex_message
-            .as_ref()
-            .map(|m| humanize_codex_message(Some(m))),
+        last_message: last_message(row.last_codex_message.as_ref()),
         started_at: Some(row.started_at),
         last_event_at: row.last_codex_timestamp,
         tokens: TokenCounts {
@@ -80,10 +91,7 @@ fn blocked_entry(row: &BlockedSnapshot) -> BlockedEntry {
         session_id: row.session_id.clone(),
         blocked_at: Some(row.blocked_at),
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: row
-            .last_codex_message
-            .as_ref()
-            .map(|m| humanize_codex_message(Some(m))),
+        last_message: last_message(row.last_codex_message.as_ref()),
         last_event_at: row.last_codex_timestamp,
     }
 }
@@ -106,6 +114,18 @@ pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
             seconds_running: snapshot.codex_totals.seconds_running as f64,
         },
         rate_limits: snapshot.rate_limits.clone(),
+        spend: Some(Box::new(SpendView {
+            paused: snapshot.spend.paused,
+            stopped_reason: snapshot.spend.stopped_reason.clone(),
+            day: snapshot.spend.day.clone(),
+            day_tokens: snapshot.spend.day_tokens,
+            day_cost_usd: usd(snapshot.spend.day_cost_micro_usd),
+            total_cost_usd: usd(snapshot.codex_totals.cost_micro_usd),
+            max_tokens_per_day: snapshot.spend.max_tokens_per_day,
+            max_cost_usd_per_day: snapshot.spend.max_cost_usd_per_day,
+            max_tokens_per_issue: snapshot.spend.max_tokens_per_issue,
+            max_cost_usd_per_issue: snapshot.spend.max_cost_usd_per_issue,
+        })),
     }
 }
 
@@ -133,6 +153,20 @@ impl ControlPlane for RuntimeControlPlane {
 
     fn workspace_root(&self) -> String {
         self.workflow.settings().workspace.root.clone()
+    }
+
+    async fn set_paused(
+        &self,
+        paused: bool,
+        reason: Option<String>,
+    ) -> Result<PauseState, Unavailable> {
+        match self.handle.set_paused(paused, reason).await {
+            Ok(ack) => Ok(PauseState {
+                paused: ack.paused,
+                reason: ack.reason,
+            }),
+            Err(RefreshError::Unavailable | RefreshError::Timeout) => Err(Unavailable),
+        }
     }
 
     fn changes(&self) -> watch::Receiver<u64> {
@@ -219,6 +253,7 @@ mod tests {
                 output_tokens: 8,
                 total_tokens: 12,
                 seconds_running: 42,
+                cost_micro_usd: 0,
             },
             rate_limits: Some(json!({"limit_id": "codex"})),
             polling: PollingStatus {
@@ -229,6 +264,7 @@ mod tests {
             max_concurrent_agents: 10,
             workspace_root: "/tmp/ws".into(),
             tracker: TrackerInfo::default(),
+            spend: Default::default(),
         }
     }
 

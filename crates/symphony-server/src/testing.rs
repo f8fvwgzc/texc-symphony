@@ -9,7 +9,7 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use crate::control::{ControlPlane, StateError, Unavailable};
-use crate::view::{IssueView, RefreshAccepted, StateView};
+use crate::view::{IssueView, PauseState, RefreshAccepted, StateView};
 
 /// A [`ControlPlane`] that serves whatever state it was last given (Elixir test
 /// `StaticOrchestrator`). Every [`set_state`](Self::set_state) bumps the generation.
@@ -32,6 +32,8 @@ struct Inner {
     changes: Option<watch::Sender<u64>>,
     /// Last generation (kept after the sender is dropped).
     generation: u64,
+    /// Kill switch reason while engaged.
+    paused: Option<String>,
 }
 
 impl StaticControlPlane {
@@ -46,6 +48,7 @@ impl StaticControlPlane {
                 workspace_root: "/tmp/symphony_workspaces".to_owned(),
                 changes: Some(watch::Sender::new(0)),
                 generation: 0,
+                paused: None,
             }),
             state_calls: AtomicUsize::new(0),
             issue_calls: AtomicUsize::new(0),
@@ -108,6 +111,11 @@ impl StaticControlPlane {
         self.lock().workspace_root = root.into();
     }
 
+    /// The kill switch reason, `None` while released.
+    pub fn paused(&self) -> Option<String> {
+        self.lock().paused.clone()
+    }
+
     /// Number of `state()` calls so far (including those made by `issue()`).
     pub fn state_calls(&self) -> usize {
         self.state_calls.load(Ordering::SeqCst)
@@ -159,6 +167,24 @@ impl ControlPlane for StaticControlPlane {
 
     fn workspace_root(&self) -> String {
         self.lock().workspace_root.clone()
+    }
+
+    /// Follows the refresh outcome: unavailable when refresh is.
+    async fn set_paused(
+        &self,
+        paused: bool,
+        reason: Option<String>,
+    ) -> Result<PauseState, Unavailable> {
+        let mut inner = self.lock();
+        inner.refresh?;
+        inner.paused = paused.then(|| reason.unwrap_or_else(|| "operator request".to_owned()));
+        let state = PauseState {
+            paused,
+            reason: inner.paused.clone(),
+        };
+        drop(inner);
+        self.notify();
+        Ok(state)
     }
 
     async fn issue(&self, identifier: &str) -> Option<IssueView> {

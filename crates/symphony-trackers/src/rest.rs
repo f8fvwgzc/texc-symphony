@@ -1,12 +1,15 @@
 //! Shared pieces of the four REST adapters (GitHub, GitLab, Jira, Asana): percent-encoding, query
 //! stringification, status mapping, page normalization and the raw-passthrough agent tool.
 
+// Modified 2026-10-25: tool specs advertise only the methods `tracker.agent_tools` allows (audit A2).
+
 use std::collections::HashSet;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 use symphony_core::Issue;
 use symphony_core::TrackerConfigError;
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::issue::normalize_state;
 
 use crate::error::{Provider, TrackerError};
@@ -237,14 +240,15 @@ pub enum RestArgError {
 }
 
 impl RestToolSpec {
-    /// `{"name", "description", "inputSchema"}`.
-    pub fn spec(&self) -> Value {
+    /// `{"name", "description", "inputSchema"}`; the method enum lists only the methods `policy`
+    /// allows.
+    pub fn spec(&self, policy: &AgentToolSettings) -> Value {
         let mut properties = Map::new();
         properties.insert(
             "method".into(),
             json!({
                 "type": "string",
-                "enum": self.methods,
+                "enum": crate::scope::allowed_methods(self, policy),
                 "description": self.method_description,
             }),
         );

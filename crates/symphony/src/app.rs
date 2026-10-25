@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use symphony_core::WorkflowStore;
 use symphony_runtime::{Runtime, RuntimeError, RuntimeOptions};
-use symphony_server::{BoundServer, ServerConfig};
+use symphony_server::{Auth, BoundServer, ServerConfig};
 use symphony_store::{
     DEFAULT_KEEP_MIN_RUNS, DEFAULT_PRUNE_INTERVAL, ENV_DB_PATH, Store, StoreConfig, StoreLocation,
 };
@@ -130,6 +130,7 @@ fn store_config(choice: &DbChoice) -> Result<StoreConfig, String> {
         DbChoice::Disabled => Ok(StoreConfig {
             location: StoreLocation::Disabled,
             retention: None,
+            payload_retention: None,
         }),
         DbChoice::Path(path) => StoreConfig::from_lookup(|name| {
             if name == ENV_DB_PATH {
@@ -165,8 +166,9 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
         }
         Err(err) => tracing::warn!("Failed to close interrupted runs: {err}"),
     }
-    if let Some(retention) = config.retention {
-        prune(&store, retention).await;
+    if config.retention.is_some() || config.payload_retention.is_some() {
+        let (retention, payloads) = (config.retention, config.payload_retention);
+        prune(&store, retention, payloads).await;
         let store = store.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -176,7 +178,7 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    _ = interval.tick() => prune(&store, retention).await,
+                    _ = interval.tick() => prune(&store, retention, payloads).await,
                 }
             }
         });
@@ -184,7 +186,17 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
     Ok(store)
 }
 
-async fn prune(store: &Store, retention: Duration) {
+async fn prune(store: &Store, retention: Option<Duration>, payloads: Option<Duration>) {
+    if let Some(payloads) = payloads {
+        match store.prune_payloads(payloads).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Cleared expired event payloads count={count}"),
+            Err(err) => tracing::warn!("Failed to clear expired event payloads: {err}"),
+        }
+    }
+    let Some(retention) = retention else {
+        return;
+    };
     match store.prune(retention, DEFAULT_KEEP_MIN_RUNS).await {
         Ok(stats) if stats.runs_deleted > 0 => tracing::info!(
             "Pruned run history runs_deleted={} events_deleted={}",
@@ -317,6 +329,13 @@ async fn serve_until_stopped(
     if let Some(port) = configured_port {
         let config = ServerConfig {
             version: version().to_owned(),
+            auth: settings
+                .server
+                .api_token
+                .as_deref()
+                .map_or_else(Auth::disabled, Auth::token),
+            allowed_hosts: settings.server.allowed_hosts.clone(),
+            cors_allowed_origins: settings.server.allowed_origins.clone(),
             ..ServerConfig::new(host.clone(), port)
         };
         let control = Arc::new(RuntimeControlPlane::new(
@@ -455,7 +474,8 @@ mod tests {
             store_config(&DbChoice::Disabled).unwrap(),
             StoreConfig {
                 location: StoreLocation::Disabled,
-                retention: None
+                retention: None,
+                payload_retention: None,
             }
         );
         assert_eq!(

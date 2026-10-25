@@ -12,7 +12,7 @@ PID 1, and, by default, Node.js 22 plus the Codex CLI (`@openai/codex`).
 | Port | `4000`: dashboard at `/`, API under `/api/v1`, health at `/api/v1/health` |
 | Volumes | `/data` (SQLite run history + logs), `/workspaces` (per-issue workspaces) |
 | Config | `/config/WORKFLOW.md` (mount read-only) |
-| Entrypoint | `tini -- symphony`; default command `--i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md` |
+| Entrypoint | `tini -- symphony`; default command `/config/WORKFLOW.md` (the guardrails acknowledgement is yours to add, see below) |
 
 Environment set by the image: `SYMPHONY_HOST=0.0.0.0`, `SYMPHONY_PORT=4000`,
 `SYMPHONY_DB_PATH=/data/symphony.db`, `SYMPHONY_LOGS_ROOT=/data/logs`. Everything else
@@ -20,8 +20,21 @@ Environment set by the image: `SYMPHONY_HOST=0.0.0.0`, `SYMPHONY_PORT=4000`,
 [`.env.example`](.env.example).
 
 > [!WARNING]
-> Symphony runs coding agents unattended, and its HTTP API has no authentication. Only publish
-> the port on loopback, or behind a firewall or an authenticating reverse proxy.
+> Symphony runs coding agents unattended. The image binds `0.0.0.0`, so Symphony refuses to start
+> unless `SYMPHONY_API_TOKEN` is set (every `/api/*` call then needs `Authorization: Bearer
+> <token>`; the dashboard asks for it). Keep the port published on loopback unless a firewall
+> sits in front, and list any extra host name in `server.allowed_hosts`.
+>
+> The image does **not** pass `--i-understand-that-this-will-be-running-without-the-usual-guardrails`.
+> Review the sandbox settings in your `WORKFLOW.md` first (the example ships Codex's safe
+> defaults: no network in the turn sandbox, escalations rejected, a token budget), then
+> acknowledge it in `compose.override.yaml`:
+>
+> ```yaml
+> services:
+>   symphony:
+>     command: ["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "/config/WORKFLOW.md"]
+> ```
 
 ## Quick start (Docker Compose)
 
@@ -29,8 +42,9 @@ Requirements: Docker Engine 24+ with the Compose v2 plugin, or Docker Desktop.
 
 ```sh
 cd docker
-cp .env.example .env                                     # add LINEAR_API_KEY (or another tracker)
+cp .env.example .env                                     # add LINEAR_API_KEY + SYMPHONY_API_TOKEN
 mkdir -p config && cp WORKFLOW.example.md config/WORKFLOW.md   # edit tracker + hooks
+$EDITOR compose.override.yaml                            # the acknowledgement (see the warning)
 docker compose up -d
 docker compose ps                                        # wait for "healthy"
 open http://127.0.0.1:4000                               # or xdg-open / your browser
@@ -151,7 +165,8 @@ docker run -d --name symphony --restart unless-stopped \
   -p 127.0.0.1:4000:4000 \
   -v symphony-data:/data -v symphony-workspaces:/workspaces \
   -v "$PWD/docker/config:/config:ro" \
-  ghcr.io/f8fvwgzc/texc-symphony:latest
+  ghcr.io/f8fvwgzc/texc-symphony:latest \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md
 ```
 
 Pass different arguments by replacing the command, for example
@@ -171,8 +186,8 @@ server {
     listen 443 ssl;
     server_name symphony.example.com;
     # ssl_certificate ...; ssl_certificate_key ...;
-    auth_basic "Symphony";                     # the API itself has no auth
-    auth_basic_user_file /etc/nginx/symphony.htpasswd;
+    # Symphony checks the bearer token itself; add `symphony.example.com` to
+    # server.allowed_hosts so its Host check accepts the forwarded Host header.
 
     location / {
         proxy_pass http://127.0.0.1:4000;
@@ -198,10 +213,11 @@ Caddy streams `text/event-stream` responses without buffering by default:
 
 ```caddyfile
 symphony.example.com {
-    basic_auth { admin <bcrypt-hash> }
     reverse_proxy 127.0.0.1:4000
 }
 ```
+
+Do not add HTTP basic auth in front: it uses the same `Authorization` header as the API token.
 
 Traefik and HAProxy need no special settings beyond an idle/read timeout above 15 s. For
 Cloudflare or other CDNs, disable response buffering/caching for `/api/v1/events`.

@@ -7,6 +7,8 @@
 //! - [`transport`]: the HTTP layer reproducing Req's timeout/retry/redirect/decoding defaults, with
 //!   credential scrubbing.
 //! - [`tool`]: dynamic tool responses and the session-bound [`ToolBinding`].
+//! - [`scope`]: the checks that keep agent tools inside the configured repository/project and the
+//!   `tracker.agent_tools` policy before any request is sent.
 //!
 //! Reads take the *current* [`TrackerSettings`] on every call (Elixir read live config per call);
 //! tool execution uses the settings snapshot captured by [`ToolBinding::bind`].
@@ -22,10 +24,12 @@ pub mod asana;
 pub mod error;
 pub mod github;
 pub mod gitlab;
+pub mod graphql;
 pub mod jira;
 pub mod linear;
 pub mod memory;
 pub mod rest;
+pub mod scope;
 pub mod tool;
 pub mod transport;
 
@@ -92,8 +96,9 @@ pub trait Tracker: Send + Sync {
     /// Env var names to strip from the Codex child process.
     fn secret_environment_names(&self, settings: &TrackerSettings) -> Vec<String>;
 
-    /// Provider-native agent tool specs (`{"name", "description", "inputSchema"}`). Default: none.
-    fn agent_tool_specs(&self) -> Vec<Value> {
+    /// Provider-native agent tool specs (`{"name", "description", "inputSchema"}`) under the
+    /// `tracker.agent_tools` scope of `settings`. Default: none.
+    fn agent_tool_specs(&self, _settings: &TrackerSettings) -> Vec<Value> {
         Vec::new()
     }
 

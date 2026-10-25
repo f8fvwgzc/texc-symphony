@@ -108,12 +108,16 @@ async fn adapter_validates_jira_config_delegates_reads_and_advertises_jira_rest(
         tracker.validate_config(&tracker_settings(t)),
         Err(C::InvalidJiraStates.into())
     );
-    let specs = tracker.agent_tool_specs();
+    let specs = tracker.agent_tool_specs(&settings(json!({})));
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0]["name"], "jira_rest");
     assert_eq!(
         specs[0]["description"],
-        "Execute a Jira Cloud REST v3 request using Symphony's configured auth.\n"
+        "Execute a Jira Cloud REST v3 request for the configured project (its issues, searches scoped with `project = KEY`) using Symphony's configured auth.\n"
+    );
+    assert_eq!(
+        specs[0]["inputSchema"]["properties"]["method"]["enum"],
+        json!(["GET", "POST", "PUT"])
     );
     assert_eq!(
         specs[0]["inputSchema"]["properties"]["path"]["description"],
@@ -122,14 +126,14 @@ async fn adapter_validates_jira_config_delegates_reads_and_advertises_jira_rest(
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/rest/api/3/myself"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"accountId": "user"})))
+        .and(path("/rest/api/3/project/SYM"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"key": "SYM"})))
         .mount(&server)
         .await;
     let (ok, _) = run_tool(
         &tracker_for(&server),
         "jira_rest",
-        json!({"method": "GET", "path": "/rest/api/3/myself"}),
+        json!({"method": "GET", "path": "/rest/api/3/project/SYM"}),
         &settings(json!({})),
     )
     .await;
@@ -545,7 +549,15 @@ async fn jira_rest_preserves_rest_status_and_body_while_rejecting_unsafe_argumen
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/rest/api/3/issue/404"))
+        .and(path("/rest/api/3/issue/10001"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"fields": {"project": {"key": "SYM"}}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/SYM-404"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({"errorMessages": ["nope"]})))
         .mount(&server)
         .await;
@@ -565,7 +577,17 @@ async fn jira_rest_preserves_rest_status_and_body_while_rejecting_unsafe_argumen
     .await;
     assert!(ok);
     assert_eq!(output, json!({"status": 201, "body": {"id": "comment-1"}}));
-    let request = &server.received_requests().await.unwrap()[0];
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "project lookup for the numeric id, then the call"
+    );
+    assert_eq!(
+        query_of(&requests[0]),
+        vec![("fields".into(), "project".into())]
+    );
+    let request = &requests[1];
     assert_eq!(request.method.as_str(), "POST");
     assert_eq!(
         query_of(request),
@@ -576,7 +598,7 @@ async fn jira_rest_preserves_rest_status_and_body_while_rejecting_unsafe_argumen
     let (ok, output) = run_tool(
         &tracker,
         "jira_rest",
-        json!({"method": "GET", "path": "/rest/api/3/issue/404"}),
+        json!({"method": "GET", "path": "/rest/api/3/issue/SYM-404"}),
         &s,
     )
     .await;
@@ -645,7 +667,7 @@ async fn jira_rest_reports_unsupported_tools_malformed_calls_and_client_failures
     let (ok, output) = run_tool(
         &tracker,
         "jira_rest",
-        json!({"method": "GET", "path": "/rest/api/3/myself"}),
+        json!({"method": "GET", "path": "/rest/api/3/project/SYM"}),
         &settings(json!({"api_token": 123})),
     )
     .await;
@@ -657,7 +679,7 @@ async fn jira_rest_reports_unsupported_tools_malformed_calls_and_client_failures
     let (ok, output) = run_tool(
         &tracker,
         "jira_rest",
-        json!({"method": "GET", "path": "/rest/api/3/myself"}),
+        json!({"method": "GET", "path": "/rest/api/3/project/SYM"}),
         &settings(json!({"base_url": "http://jira.test"})),
     )
     .await;
@@ -687,4 +709,216 @@ async fn tracker_binds_jira_tools_and_token_env_names_from_provider_config() {
         symphony_trackers::validate_config(&workflow.tracker, &deps),
         Ok(())
     );
+}
+
+// ---- agent tool scope (2026-10-25 audit A2) ----
+
+#[test]
+fn jira_rest_scope_classifies_paths_and_rewrites_searches() {
+    use symphony_core::config::schema::AgentToolSettings;
+    use symphony_trackers::jira::ScopeTarget;
+    use symphony_trackers::rest::RestCall;
+    use symphony_trackers::transport::Method;
+
+    let resolved = resolved(&settings(json!({})));
+    let policy = AgentToolSettings::default();
+    let check = |method, path: &str, query: Value, body: Option<Value>| {
+        let mut call = RestCall {
+            method,
+            path: path.into(),
+            query: query.as_object().cloned().unwrap_or_default(),
+            body,
+        };
+        jira::check_scope(&resolved, &mut call, &policy)
+            .map(|target| (target, call))
+            .map_err(|denied| denied.rule)
+    };
+    let ok = |method, path: &str| check(method, path, json!({}), None).map(|(t, _)| t);
+    assert_eq!(
+        ok(Method::Get, "/rest/api/3/issue/SYM-12"),
+        Ok(ScopeTarget::Project)
+    );
+    assert_eq!(
+        ok(Method::Post, "/rest/api/3/issue/sym-12/transitions"),
+        Ok(ScopeTarget::Project)
+    );
+    assert_eq!(
+        ok(Method::Put, "/rest/api/3/issue/10001"),
+        Ok(ScopeTarget::IssueId("10001".into()))
+    );
+    assert_eq!(
+        ok(Method::Get, "/rest/api/3/project/SYM/statuses"),
+        Ok(ScopeTarget::Project)
+    );
+    for (method, path, rule) in [
+        (Method::Get, "/rest/api/3/myself", "path_out_of_scope"),
+        (
+            Method::Get,
+            "/rest/api/3/issue/OTHER-1",
+            "path_out_of_scope",
+        ),
+        (Method::Get, "/rest/api/3/issue/SYMX-1", "path_out_of_scope"),
+        (
+            Method::Post,
+            "/rest/api/3/issue/bulkfetch",
+            "path_out_of_scope",
+        ),
+        (
+            Method::Get,
+            "/rest/api/3/project/OTHER",
+            "path_out_of_scope",
+        ),
+        (Method::Put, "/rest/api/3/project/SYM", "admin_path"),
+        (Method::Get, "/rest/api/3/user/search", "path_out_of_scope"),
+        (
+            Method::Get,
+            "/rest/api/3/issue/SYM-1/../../myself",
+            "unsafe_path",
+        ),
+        (Method::Get, "/rest/api/3/search", "jql_out_of_scope"),
+    ] {
+        assert_eq!(ok(method, path), Err(rule), "{method} {path}");
+    }
+
+    let created = check(
+        Method::Post,
+        "/rest/api/3/issue",
+        json!({}),
+        Some(json!({"fields": {"project": {"key": "sym"}, "summary": "x"}})),
+    );
+    assert!(created.is_ok());
+    let other = check(
+        Method::Post,
+        "/rest/api/3/issue",
+        json!({}),
+        Some(json!({"fields": {"project": {"key": "OTHER"}}})),
+    );
+    assert_eq!(other.err(), Some("body_out_of_scope"));
+
+    let (_, call) = check(
+        Method::Get,
+        "/rest/api/3/search/jql",
+        json!({"jql": "project = SYM OR project = OTHER ORDER BY created DESC"}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        call.query["jql"],
+        r#"project = "SYM" AND (project = SYM OR project = OTHER) ORDER BY created DESC"#
+    );
+    let (_, call) = check(
+        Method::Post,
+        "/rest/api/3/search/jql",
+        json!({}),
+        Some(json!({"jql": "Project IN (\"sym\", OTHER) AND status = Done", "maxResults": 5})),
+    )
+    .unwrap();
+    assert_eq!(
+        call.body.unwrap(),
+        json!({"jql": "project = \"SYM\" AND (Project IN (\"sym\", OTHER) AND status = Done)", "maxResults": 5})
+    );
+    for jql in [
+        "status = Done",
+        "project = OTHER",
+        "summary ~ \"project = SYM\"",
+        "project != SYM",
+    ] {
+        assert_eq!(
+            check(Method::Get, "/rest/api/3/search", json!({"jql": jql}), None).err(),
+            Some("jql_out_of_scope"),
+            "{jql}"
+        );
+    }
+    assert_eq!(
+        check(
+            Method::Get,
+            "/rest/api/3/search?jql=project=SYM",
+            json!({}),
+            None
+        )
+        .err(),
+        Some("jql_out_of_scope")
+    );
+}
+
+#[test]
+fn scoped_jql_keeps_order_by_outside_the_group() {
+    assert_eq!(
+        jira::scoped_jql("project = SYM ORDER BY rank", "SYM"),
+        r#"project = "SYM" AND (project = SYM) ORDER BY rank"#
+    );
+    assert_eq!(
+        jira::scoped_jql("summary ~ \"order by\" AND project = SYM", "SYM"),
+        r#"project = "SYM" AND (summary ~ "order by" AND project = SYM)"#
+    );
+    assert!(jira::jql_names_project("project=SYM", "SYM"));
+    assert!(jira::jql_names_project("project in ('SYM')", "sym"));
+    assert!(!jira::jql_names_project("projectx = SYM", "SYM"));
+}
+
+#[tokio::test]
+async fn jira_rest_refuses_out_of_scope_calls_without_sending_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/3/issue/20002"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"fields": {"project": {"key": "OTHER"}}})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(path("/rest/api/3/myself"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/rest/api/3/search/jql"))
+        .and(body_partial_json(
+            json!({"jql": "project = \"SYM\" AND (project = SYM)"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"issues": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+    let s = settings(json!({}));
+    for (args, rule) in [
+        (
+            json!({"method": "GET", "path": "/rest/api/3/myself"}),
+            "path_out_of_scope",
+        ),
+        (
+            json!({"method": "PUT", "path": "/rest/api/3/issue/20002", "body": {}}),
+            "path_out_of_scope",
+        ),
+        (
+            json!({"method": "DELETE", "path": "/rest/api/3/issue/SYM-1"}),
+            "method_not_allowed",
+        ),
+    ] {
+        let (ok, output) = run_tool(&tracker, "jira_rest", args.clone(), &s).await;
+        assert!(!ok, "{args}");
+        assert_eq!(output["error"]["rule"], rule, "{args}");
+    }
+    let (ok, _) = run_tool(
+        &tracker,
+        "jira_rest",
+        json!({"method": "POST", "path": "/rest/api/3/search/jql", "body": {"jql": "project = SYM"}}),
+        &s,
+    )
+    .await;
+    assert!(ok);
+    server.verify().await;
 }

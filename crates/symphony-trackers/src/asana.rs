@@ -7,13 +7,20 @@
 //!   every task of the project (`offset` paging, 100 per page) and filter sections client-side;
 //!   completed tasks are returned with `dispatchable: false`.
 //! - Id refresh: one `GET /tasks/{gid}` per id; 404 and out-of-project tasks are omitted.
-//! - One agent tool, `asana_api` (raw REST passthrough).
+//! - One agent tool, `asana_api`: a REST passthrough limited to the configured project — its
+//!   `/projects/{project_gid}` subtree, `/tasks/{gid}` and `/sections/{gid}` subtrees after one
+//!   `GET` confirms the task/section belongs to the project, and `POST /tasks` that files the new
+//!   task in the project — plus the `tracker.agent_tools` methods and no [`ADMIN_SUBPATHS`] unless
+//!   `allow_admin_paths` (see [`crate::scope`]).
+
+// Modified 2026-10-25: scoped `asana_api` (audit A2).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::config::tracker::validate_tracker;
 use symphony_core::config::{
     AsanaSettings, TrackerSettings, resolve_asana, secret_environment_names,
@@ -23,10 +30,11 @@ use symphony_core::{EnvSource, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError};
 use crate::rest::{
-    RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
+    RestCall, RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
     normalize_candidate_page, opt_string, present_str, query_pairs, state_set, trimmed_string,
     uniq,
 };
+use crate::scope::{self, Denied};
 use crate::tool::{ToolContext, ToolResult};
 use crate::transport::{HttpClient, HttpRequest, Method};
 use crate::{MAX_PAGES, Tracker};
@@ -37,11 +45,26 @@ pub const PAGE_SIZE: usize = 100;
 /// `opt_fields` sent with every task read.
 pub const TASK_FIELDS: &str = "gid,name,notes,completed,resource_subtype,assignee.gid,tags.name,memberships.project.gid,memberships.section.gid,memberships.section.name,permalink_url,created_at,modified_at";
 
+/// Project subresources (below `/projects/{project_gid}/`) that need
+/// `tracker.agent_tools.allow_admin_paths`: membership, followers, duplication/templates and
+/// custom field settings.
+pub const ADMIN_SUBPATHS: &[&str] = &[
+    "addMembers",
+    "removeMembers",
+    "addFollowers",
+    "removeFollowers",
+    "project_memberships",
+    "duplicate",
+    "saveAsTemplate",
+    "addCustomFieldSetting",
+    "removeCustomFieldSetting",
+];
+
 /// The `asana_api` tool.
 pub static TOOL: RestToolSpec = RestToolSpec {
     provider: Provider::Asana,
     name: "asana_api",
-    description: "Execute an Asana REST API request using Symphony's configured auth.\n",
+    description: "Execute an Asana REST API request for the configured project (its tasks and sections) using Symphony's configured auth.\n",
     methods: &["GET", "POST", "PUT", "DELETE"],
     method_description: "Asana REST method.",
     path_description: "Asana REST path such as /tasks/{task_gid}/stories.",
@@ -119,6 +142,56 @@ impl AsanaTracker {
         Ok(RestResponse {
             status: response.status,
             body: response.body,
+        })
+    }
+
+    /// Confirms that a task/section target belongs to the configured project (one `GET`).
+    async fn verify_target(
+        &self,
+        settings: &AsanaSettings,
+        target: &ScopeTarget,
+    ) -> Result<Result<(), Denied>, TrackerError> {
+        let (path, fields, kind, gid) = match target {
+            ScopeTarget::Project => return Ok(Ok(())),
+            ScopeTarget::Task(gid) => (
+                format!("/tasks/{}", encode_unreserved(gid)),
+                "memberships.project.gid",
+                "task",
+                gid,
+            ),
+            ScopeTarget::Section(gid) => (
+                format!("/sections/{}", encode_unreserved(gid)),
+                "project.gid",
+                "section",
+                gid,
+            ),
+        };
+        let mut query = Map::new();
+        query.insert("opt_fields".into(), json!(fields));
+        let data = self
+            .get(settings, &path, query, true)
+            .await?
+            .and_then(|payload| payload.get("data").cloned());
+        let member = match (target, &data) {
+            (ScopeTarget::Task(_), Some(task)) => {
+                project_membership(task, &settings.project_gid).is_some()
+            }
+            (ScopeTarget::Section(_), Some(section)) => {
+                section.pointer("/project/gid").and_then(Value::as_str)
+                    == Some(settings.project_gid.as_str())
+            }
+            _ => false,
+        };
+        Ok(if member {
+            Ok(())
+        } else {
+            Err(Denied::new(
+                "path_out_of_scope",
+                format!(
+                    "`{}` is limited to project {}: {kind} {gid} is not part of it.",
+                    TOOL.name, settings.project_gid
+                ),
+            ))
         })
     }
 
@@ -214,6 +287,63 @@ pub fn normalize_issue(task: &Value, settings: &AsanaSettings) -> Option<Issue> 
             .and_then(Value::as_str)
             .and_then(parse_datetime),
     })
+}
+
+/// What an `asana_api` call targets once its path passed the static checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeTarget {
+    /// Inside the project subtree (or a task created in the project): no lookup needed.
+    Project,
+    /// `/tasks/{gid}...`: allowed when the task is a member of the project.
+    Task(String),
+    /// `/sections/{gid}...`: allowed when the section belongs to the project.
+    Section(String),
+}
+
+/// The static part of the `asana_api` scope (see the module docs); task and section targets still
+/// need [`AsanaTracker`]'s membership lookup.
+pub fn check_scope(
+    settings: &AsanaSettings,
+    call: &RestCall,
+    policy: &AgentToolSettings,
+) -> Result<ScopeTarget, Denied> {
+    let segments = scope::split_path(TOOL.name, &call.path)?;
+    scope::refuse_encoded_slashes(TOOL.name, &segments)?;
+    let project = &settings.project_gid;
+    match segments.as_slice() {
+        [projects, gid, rest @ ..] if projects.is("projects") && gid.decoded == *project => {
+            scope::check_scope_root(TOOL.name, rest, call.method, policy, "the project")?;
+            if !policy.allow_admin_paths && scope::matches_admin(rest, ADMIN_SUBPATHS) {
+                return Err(scope::admin_path(TOOL.name, &call.path));
+            }
+            Ok(ScopeTarget::Project)
+        }
+        [tasks] if tasks.is("tasks") => {
+            let projects = scope::string_array(call.body.as_ref(), "/data/projects");
+            if call.method == Method::Post && projects.contains(&project.as_str()) {
+                Ok(ScopeTarget::Project)
+            } else {
+                Err(Denied::new(
+                    "body_out_of_scope",
+                    format!(
+                        "`{}` may only create tasks with POST /tasks whose data.projects includes {project}.",
+                        TOOL.name
+                    ),
+                ))
+            }
+        }
+        [tasks, gid, ..] if tasks.is("tasks") => Ok(ScopeTarget::Task(gid.decoded.clone())),
+        [sections, gid, rest @ ..] if sections.is("sections") => {
+            scope::check_scope_root(TOOL.name, rest, call.method, policy, "a section")?;
+            Ok(ScopeTarget::Section(gid.decoded.clone()))
+        }
+        _ => Err(scope::out_of_scope(
+            TOOL.name,
+            &format!(
+                "/projects/{project}, the tasks and sections of that project, and POST /tasks into it"
+            ),
+        )),
+    }
 }
 
 enum PageNext {
@@ -332,8 +462,8 @@ impl Tracker for AsanaTracker {
         secret_environment_names(settings)
     }
 
-    fn agent_tool_specs(&self) -> Vec<Value> {
-        vec![TOOL.spec()]
+    fn agent_tool_specs(&self, settings: &TrackerSettings) -> Vec<Value> {
+        vec![TOOL.spec(&settings.agent_tools)]
     }
 
     async fn execute_agent_tool(
@@ -349,14 +479,24 @@ impl Tracker for AsanaTracker {
             Ok(call) => call,
             Err(err) => return TOOL.argument_error(err),
         };
+        let resolved = match self.settings(&ctx.settings) {
+            Ok(resolved) => resolved,
+            Err(err) => return TOOL.client_error(&err),
+        };
+        let policy = &ctx.settings.agent_tools;
+        let target = match scope::check_method(&TOOL, call.method, policy)
+            .and_then(|()| check_scope(&resolved, &call, policy))
+        {
+            Ok(target) => target,
+            Err(denied) => return denied.tool_result(),
+        };
+        match self.verify_target(&resolved, &target).await {
+            Ok(Ok(())) => {}
+            Ok(Err(denied)) => return denied.tool_result(),
+            Err(err) => return TOOL.client_error(&err),
+        }
         match self
-            .request(
-                &ctx.settings,
-                call.method,
-                &call.path,
-                &call.query,
-                call.body,
-            )
+            .perform(&resolved, call.method, &call.path, &call.query, call.body)
             .await
         {
             Ok(response) => TOOL.response(&response),

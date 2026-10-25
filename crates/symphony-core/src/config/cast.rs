@@ -90,6 +90,11 @@ impl<'a> Section<'a> {
         self.cast(field, errors, |v| v.as_str().map(str::to_owned))
     }
 
+    /// A finite number (integer, float, or a string that parses as one).
+    pub(crate) fn number(&self, field: &str, errors: &mut Errors) -> Option<f64> {
+        self.cast(field, errors, cast_number)
+    }
+
     pub(crate) fn boolean(&self, field: &str, errors: &mut Errors) -> Option<bool> {
         self.cast(field, errors, cast_boolean)
     }
@@ -169,6 +174,16 @@ pub fn cast_integer(value: &Value) -> Option<i64> {
     }
 }
 
+/// Ecto `:float` cast (finite values only).
+pub fn cast_number(value: &Value) -> Option<f64> {
+    let number = match value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+    number.is_finite().then_some(number)
+}
+
 /// Ecto `:boolean` cast.
 pub fn cast_boolean(value: &Value) -> Option<bool> {
     match value {
@@ -208,6 +223,16 @@ mod tests {
         assert_eq!(cast_integer(&json!(1.5)), None);
         assert_eq!(cast_integer(&json!(true)), None);
         assert_eq!(cast_integer(&json!({"a": 1})), None);
+    }
+
+    #[test]
+    fn number_cast_accepts_finite_numbers() {
+        assert_eq!(cast_number(&json!(5)), Some(5.0));
+        assert_eq!(cast_number(&json!(2.5)), Some(2.5));
+        assert_eq!(cast_number(&json!("0.25")), Some(0.25));
+        assert_eq!(cast_number(&json!("NaN")), None);
+        assert_eq!(cast_number(&json!("inf")), None);
+        assert_eq!(cast_number(&json!(true)), None);
     }
 
     #[test]

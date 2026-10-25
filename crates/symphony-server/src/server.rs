@@ -1,5 +1,7 @@
 //! Binding and running the HTTP server.
 
+// Modified 2026-10-25: refuse non-loopback binds without auth (audit A1).
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -69,8 +71,9 @@ pub async fn resolve_host(host: &str) -> Result<IpAddr, ServerError> {
 
 /// Bind `config.host:config.port` and serve the API and dashboard until `shutdown` is cancelled.
 ///
-/// Returns once the listener is bound (so the caller can print the real URL). A bad host or a
-/// bind failure is an error, which should abort startup like in Elixir. On shutdown, SSE streams
+/// Returns once the listener is bound (so the caller can print the real URL). A bad host, a
+/// non-loopback address without [`ServerConfig::auth`] or a bind failure is an error, which
+/// should abort startup like in Elixir. On shutdown, SSE streams
 /// end immediately, in-flight requests may finish within `shutdown_grace`, and then
 /// [`BoundServer::wait`] resolves.
 pub async fn serve(
@@ -81,6 +84,9 @@ pub async fn serve(
 ) -> Result<BoundServer, ServerError> {
     let ip = resolve_host(&config.host).await?;
     let addr = SocketAddr::new(ip, config.port);
+    if !ip.is_loopback() && !config.auth.is_enabled() {
+        return Err(ServerError::AuthRequired { addr });
+    }
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|source| ServerError::Bind { addr, source })?;

@@ -1,28 +1,34 @@
 //! The `Store` handle: a cheap, cloneable front for one SQLite connection owned by a dedicated
 //! database thread.
 
+// Modified 2026-10-25: bounded job queue, usage/control/payload-retention operations (audit A1/A4).
+
 use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, StoreError};
 use crate::model::{
     NewRun, PruneStats, RetryRecord, RunEvent, RunId, RunPage, RunQuery, RunRecord, RunStatus,
-    TokenUsage, TotalsRecord,
+    TokenUsage, TotalsRecord, UsageTotals,
 };
 use crate::ops::{self, NewEvent};
 use crate::schema;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+
+/// Operations queued for the database thread at most; beyond this, submissions fail with
+/// [`StoreError::Busy`] instead of growing memory without bound.
+pub const STORE_QUEUE_CAPACITY: usize = 8192;
 
 /// Handle to the run history database.
 ///
@@ -32,7 +38,8 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 ///
 /// * **await it** to get the result (`store.start_run(run).await?`);
 /// * **drop it** for fire-and-forget writes — the write still happens and a failure is logged
-///   with `tracing::warn!`. Submitting never blocks the caller.
+///   with `tracing::warn!`. Submitting never blocks the caller; when [`STORE_QUEUE_CAPACITY`]
+///   operations are already queued the operation is refused with [`StoreError::Busy`] (logged).
 ///
 /// Errors are always returned, never raised as panics. A [`Store::disabled`] store accepts every
 /// call and persists nothing. The database thread exits once every clone has been dropped and the
@@ -106,11 +113,11 @@ impl Store {
     }
 
     fn spawn(mut conn: Connection, path: Option<PathBuf>) -> Result<Store> {
-        let (jobs, queue) = mpsc::channel::<Job>();
+        let (jobs, mut queue) = mpsc::channel::<Job>(STORE_QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("symphony-store".to_string())
             .spawn(move || {
-                while let Ok(job) = queue.recv() {
+                while let Some(job) = queue.blocking_recv() {
                     job(&mut conn);
                 }
                 if let Err((_, err)) = conn.close() {
@@ -146,9 +153,16 @@ impl Store {
                 tracing::warn!(op = name, error = %err, "symphony-store operation failed");
             }
         });
-        match inner.jobs.send(job) {
+        match inner.jobs.try_send(job) {
             Ok(()) => Pending::waiting(receiver),
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    op = name,
+                    "symphony-store queue is full; dropping the operation"
+                );
+                Pending::ready(Err(StoreError::Busy))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!(op = name, "symphony-store thread is not running");
                 Pending::ready(Err(StoreError::Unavailable))
             }
@@ -195,6 +209,63 @@ impl Store {
             "update_tokens",
             || (),
             move |conn| ops::update_tokens(conn, run_id, tokens),
+        )
+    }
+
+    /// Replace the run's cumulative token usage and its cost in micro-USD.
+    pub fn update_usage(
+        &self,
+        run_id: RunId,
+        tokens: TokenUsage,
+        cost_micro_usd: u64,
+    ) -> Pending<()> {
+        self.submit(
+            "update_usage",
+            || (),
+            move |conn| ops::update_usage(conn, run_id, tokens, cost_micro_usd),
+        )
+    }
+
+    /// Token and cost totals of the runs that started at or after `since` (budget accounting).
+    pub fn usage_since(&self, since: DateTime<Utc>) -> Pending<UsageTotals> {
+        self.submit("usage_since", UsageTotals::default, move |conn| {
+            ops::usage_since(conn, since)
+        })
+    }
+
+    /// Token and cost totals of every retained run of `issue_id`.
+    pub fn issue_usage(&self, issue_id: impl Into<String>) -> Pending<UsageTotals> {
+        let issue_id = issue_id.into();
+        self.submit("issue_usage", UsageTotals::default, move |conn| {
+            ops::issue_usage(conn, &issue_id)
+        })
+    }
+
+    /// An operator control value (e.g. the dispatch kill switch); `None` when unset or disabled.
+    pub fn control(&self, key: impl Into<String>) -> Pending<Option<String>> {
+        let key = key.into();
+        self.submit("control", || None, move |conn| ops::get_control(conn, &key))
+    }
+
+    /// Sets (`Some`) or clears (`None`) an operator control value.
+    pub fn set_control(&self, key: impl Into<String>, value: Option<String>) -> Pending<()> {
+        let key = key.into();
+        self.submit(
+            "set_control",
+            || (),
+            move |conn| ops::set_control(conn, &key, value.as_deref()),
+        )
+    }
+
+    /// Payload retention: clears the payloads (raw agent messages and command output) of events
+    /// recorded more than `older_than` ago, keeping their kinds and messages. Returns the number
+    /// of events changed.
+    pub fn prune_payloads(&self, older_than: Duration) -> Pending<u64> {
+        let cutoff = cutoff(Utc::now(), older_than);
+        self.submit(
+            "prune_payloads",
+            || 0,
+            move |conn| ops::prune_payloads(conn, cutoff),
         )
     }
 

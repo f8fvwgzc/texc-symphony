@@ -139,8 +139,10 @@ How the crates fit together: [`docs/architecture.md`](docs/architecture.md).
 
 The API is documented in [`docs/api/README.md`](docs/api/README.md), with the OpenAPI 3.1 contract
 in [`docs/api/openapi.yaml`](docs/api/openapi.yaml); a running server also serves it at
-`GET /api/openapi.json`. The HTTP API has no authentication: keep it on loopback or behind an
-authenticating proxy.
+`GET /api/openapi.json`. With `server.api_token` (or `SYMPHONY_API_TOKEN`) set, every API call
+needs `Authorization: Bearer <token>`; without one Symphony serves the API on loopback only. It
+also refuses foreign `Host` headers and cross-origin writes, redacts credentials in recorded
+events, and enforces the `budget:` limits and the `POST /api/v1/pause` kill switch.
 
 ## Development
 

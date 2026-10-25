@@ -8,7 +8,13 @@
 //! - Id refresh: `POST /rest/api/3/issue/bulkfetch` in batches of 100; out-of-project ids are omitted,
 //!   malformed requested records fail the call.
 //! - Blockers: inward `Blocks` links; Atlassian Document Format descriptions are flattened to text.
-//! - One agent tool, `jira_rest` (raw REST v3 passthrough limited to `/rest/api/3/`).
+//! - One agent tool, `jira_rest`: a REST v3 passthrough limited to the configured project — issue
+//!   paths for `{KEY}-n` keys (numeric ids after one `GET` confirms the project), `POST
+//!   /rest/api/3/issue` creating in the project, searches whose JQL names the project (and which are
+//!   then wrapped as `project = "KEY" AND (...)`), and `GET` of the project resource — plus the
+//!   `tracker.agent_tools` methods (see [`crate::scope`]).
+
+// Modified 2026-10-25: scoped `jira_rest` (audit A2).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,6 +23,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::config::tracker::validate_tracker;
 use symphony_core::config::{
     JiraSettings, TrackerSettings, resolve_jira, secret_environment_names,
@@ -26,9 +33,10 @@ use symphony_core::{BlockerRef, EnvSource, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError};
 use crate::rest::{
-    RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
+    RestCall, RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
     normalize_candidate_page, present_str, query_pairs, state_set, uniq,
 };
+use crate::scope::{self, Denied};
 use crate::tool::{ToolContext, ToolResult};
 use crate::transport::{HttpClient, HttpRequest, Method};
 use crate::{MAX_PAGES, Tracker};
@@ -56,7 +64,7 @@ const BULKFETCH_PATH: &str = "/rest/api/3/issue/bulkfetch";
 pub static TOOL: RestToolSpec = RestToolSpec {
     provider: Provider::Jira,
     name: "jira_rest",
-    description: "Execute a Jira Cloud REST v3 request using Symphony's configured auth.\n",
+    description: "Execute a Jira Cloud REST v3 request for the configured project (its issues, searches scoped with `project = KEY`) using Symphony's configured auth.\n",
     methods: &["GET", "POST", "PUT", "DELETE"],
     method_description: "Jira REST method.",
     path_description: "Jira REST v3 path beginning with /rest/api/3/.",
@@ -151,6 +159,25 @@ impl JiraTracker {
             .ok_or(TrackerError::UnknownPayload(Provider::Jira))
     }
 
+    /// `true` when issue `id` exists and belongs to the configured project (one `GET`).
+    async fn issue_in_project(
+        &self,
+        settings: &JiraSettings,
+        id: &str,
+    ) -> Result<bool, TrackerError> {
+        let path = format!("/rest/api/3/issue/{}", encode_unreserved(id));
+        let query = Map::from_iter([("fields".to_owned(), json!("project"))]);
+        let response = self
+            .perform(settings, Method::Get, &path, &query, None)
+            .await?;
+        let issue = map_status(Provider::Jira, Method::Get, &path, response, true)?;
+        let key = issue
+            .as_ref()
+            .and_then(|i| i.pointer("/fields/project/key"))
+            .and_then(Value::as_str);
+        Ok(same_project_key(key, &settings.project_key))
+    }
+
     async fn fetch_id_batch(
         &self,
         settings: &JiraSettings,
@@ -200,6 +227,232 @@ pub fn state_jql(project_key: &str, states: &[String]) -> String {
         jql_quote(project_key),
         quoted.join(", ")
     )
+}
+
+/// What a `jira_rest` call targets once its path passed the static checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeTarget {
+    /// Inside the project (a `{KEY}-n` issue, a scoped search, the project resource).
+    Project,
+    /// `/rest/api/3/issue/{numeric id}...`: allowed when the issue's project is the configured one.
+    IssueId(String),
+}
+
+/// `{KEY}-{digits}` for the configured project key (case-insensitive).
+fn is_project_issue_key(value: &str, project_key: &str) -> bool {
+    value.rsplit_once('-').is_some_and(|(key, number)| {
+        key.eq_ignore_ascii_case(project_key)
+            && !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// The static part of the `jira_rest` scope (see the module docs). A search's JQL is rewritten in
+/// `call` to `project = "KEY" AND (<jql>) [ORDER BY ...]`, so an `OR` cannot widen it.
+pub fn check_scope(
+    settings: &JiraSettings,
+    call: &mut RestCall,
+    _policy: &AgentToolSettings,
+) -> Result<ScopeTarget, Denied> {
+    let segments = scope::split_path(TOOL.name, &call.path)?;
+    scope::refuse_encoded_slashes(TOOL.name, &segments)?;
+    let key = settings.project_key.as_str();
+    let out_of_scope = || {
+        scope::out_of_scope(
+            TOOL.name,
+            &format!(
+                "project {key}: /rest/api/3/issue/{key}-<n>..., POST /rest/api/3/issue in {key}, /rest/api/3/search[/jql] with `project = {key}` and GET /rest/api/3/project/{key}..."
+            ),
+        )
+    };
+    let tail = match segments.as_slice() {
+        [rest, api, version, tail @ ..] if rest.is("rest") && api.is("api") && version.is("3") => {
+            tail
+        }
+        _ => return Err(out_of_scope()),
+    };
+    match tail {
+        [issue] if issue.is("issue") => {
+            let project = call
+                .body
+                .as_ref()
+                .and_then(|b| b.pointer("/fields/project/key"))
+                .and_then(Value::as_str);
+            if call.method == Method::Post && same_project_key(project, key) {
+                Ok(ScopeTarget::Project)
+            } else {
+                Err(Denied::new(
+                    "body_out_of_scope",
+                    format!(
+                        "`{}` may only create issues with POST /rest/api/3/issue whose fields.project.key is {key}.",
+                        TOOL.name
+                    ),
+                ))
+            }
+        }
+        [issue, id, ..] if issue.is("issue") => {
+            if is_project_issue_key(&id.decoded, key) {
+                Ok(ScopeTarget::Project)
+            } else if !id.decoded.is_empty() && id.decoded.bytes().all(|b| b.is_ascii_digit()) {
+                Ok(ScopeTarget::IssueId(id.decoded.clone()))
+            } else {
+                Err(out_of_scope())
+            }
+        }
+        [search] | [search, _]
+            if search.is("search") && tail.get(1).is_none_or(|s| s.is("jql")) =>
+        {
+            scope_search(call, key).map(|()| ScopeTarget::Project)
+        }
+        [project, project_key, ..] if project.is("project") && project_key.is(key) => {
+            if call.method == Method::Get {
+                Ok(ScopeTarget::Project)
+            } else {
+                Err(scope::admin_path(
+                    TOOL.name,
+                    &format!("{} {}", call.method, call.path),
+                ))
+            }
+        }
+        _ => Err(out_of_scope()),
+    }
+}
+
+/// Requires the search's JQL (`query.jql` for `GET`, `body.jql` for `POST`) to name the project,
+/// then wraps it so it cannot reach other projects.
+fn scope_search(call: &mut RestCall, key: &str) -> Result<(), Denied> {
+    let missing = || {
+        Denied::new(
+            "jql_out_of_scope",
+            format!(
+                "`{}` searches must pass JQL (query.jql for GET, body.jql for POST) that includes `project = {key}`.",
+                TOOL.name
+            ),
+        )
+    };
+    if call.path.contains('?') {
+        return Err(missing());
+    }
+    let slot = match call.method {
+        Method::Get => call.query.get_mut("jql"),
+        _ => call
+            .body
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .and_then(|body| body.get_mut("jql")),
+    };
+    let Some(slot) = slot else {
+        return Err(missing());
+    };
+    let Some(jql) = slot.as_str().filter(|jql| jql_names_project(jql, key)) else {
+        return Err(missing());
+    };
+    *slot = Value::String(scoped_jql(jql, key));
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JqlToken {
+    Word(String),
+    Text(String),
+    Punct(char),
+}
+
+/// Splits JQL into words, quoted strings and operator characters (with byte offsets).
+fn jql_tokens(jql: &str) -> Vec<(usize, JqlToken)> {
+    let mut tokens = Vec::new();
+    let mut chars = jql.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {}
+            '"' | '\'' => {
+                let mut text = String::new();
+                while let Some((_, next)) = chars.next() {
+                    match next {
+                        '\\' => {
+                            if let Some((_, escaped)) = chars.next() {
+                                text.push(escaped);
+                            }
+                        }
+                        q if q == c => break,
+                        other => text.push(other),
+                    }
+                }
+                tokens.push((start, JqlToken::Text(text)));
+            }
+            '=' | '!' | '<' | '>' | '~' | '(' | ')' | ',' => {
+                tokens.push((start, JqlToken::Punct(c)));
+            }
+            c => {
+                let mut word = String::from(c);
+                while let Some((_, next)) = chars.peek() {
+                    if next.is_whitespace() || "\"'=!<>~(),".contains(*next) {
+                        break;
+                    }
+                    word.push(*next);
+                    chars.next();
+                }
+                tokens.push((start, JqlToken::Word(word)));
+            }
+        }
+    }
+    tokens
+}
+
+fn jql_value_is(token: Option<&(usize, JqlToken)>, key: &str) -> bool {
+    matches!(token, Some((_, JqlToken::Word(v) | JqlToken::Text(v))) if v.eq_ignore_ascii_case(key))
+}
+
+fn jql_word_is(token: Option<&(usize, JqlToken)>, word: &str) -> bool {
+    matches!(token, Some((_, JqlToken::Word(w))) if w.eq_ignore_ascii_case(word))
+}
+
+/// `true` when the JQL contains `project = KEY` or `project in (KEY, ...)` (any case, quoted or
+/// not) outside string literals.
+pub fn jql_names_project(jql: &str, key: &str) -> bool {
+    let tokens = jql_tokens(jql);
+    (0..tokens.len()).any(|i| {
+        jql_word_is(tokens.get(i), "project")
+            && match tokens.get(i + 1) {
+                Some((_, JqlToken::Punct('='))) => jql_value_is(tokens.get(i + 2), key),
+                Some((_, JqlToken::Word(w))) if w.eq_ignore_ascii_case("in") => {
+                    matches!(tokens.get(i + 2), Some((_, JqlToken::Punct('('))))
+                        && jql_value_is(tokens.get(i + 3), key)
+                }
+                _ => false,
+            }
+    })
+}
+
+/// `project = "KEY" AND (<jql>)`, keeping a top-level `ORDER BY` clause at the end.
+pub fn scoped_jql(jql: &str, key: &str) -> String {
+    let tokens = jql_tokens(jql);
+    let mut depth = 0i32;
+    let mut order_at = None;
+    for (i, (offset, token)) in tokens.iter().enumerate() {
+        match token {
+            JqlToken::Punct('(') => depth += 1,
+            JqlToken::Punct(')') => depth -= 1,
+            JqlToken::Word(w)
+                if depth == 0
+                    && w.eq_ignore_ascii_case("order")
+                    && jql_word_is(tokens.get(i + 1), "by") =>
+            {
+                order_at = Some(*offset);
+            }
+            _ => {}
+        }
+    }
+    let (filter, order) = match order_at {
+        Some(at) => (&jql[..at], Some(jql[at..].trim())),
+        None => (jql, None),
+    };
+    let mut scoped = format!("project = {} AND ({})", jql_quote(key), filter.trim());
+    if let Some(order) = order {
+        scoped.push(' ');
+        scoped.push_str(order);
+    }
+    scoped
 }
 
 fn same_project_key(left: Option<&str>, right: &str) -> bool {
@@ -439,8 +692,8 @@ impl Tracker for JiraTracker {
         secret_environment_names(settings)
     }
 
-    fn agent_tool_specs(&self) -> Vec<Value> {
-        vec![TOOL.spec()]
+    fn agent_tool_specs(&self, settings: &TrackerSettings) -> Vec<Value> {
+        vec![TOOL.spec(&settings.agent_tools)]
     }
 
     async fn execute_agent_tool(
@@ -452,18 +705,39 @@ impl Tracker for JiraTracker {
         if tool != Some(TOOL.name) {
             return TOOL.unsupported(tool);
         }
-        let call = match TOOL.normalize(arguments) {
+        let mut call = match TOOL.normalize(arguments) {
             Ok(call) => call,
             Err(err) => return TOOL.argument_error(err),
         };
+        let resolved = match self.settings(&ctx.settings) {
+            Ok(resolved) => resolved,
+            Err(err) => return TOOL.client_error(&err),
+        };
+        let policy = &ctx.settings.agent_tools;
+        let target = match scope::check_method(&TOOL, call.method, policy)
+            .and_then(|()| check_scope(&resolved, &mut call, policy))
+        {
+            Ok(target) => target,
+            Err(denied) => return denied.tool_result(),
+        };
+        if let ScopeTarget::IssueId(id) = &target {
+            match self.issue_in_project(&resolved, id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Denied::new(
+                        "path_out_of_scope",
+                        format!(
+                            "`{}` is limited to project {}: issue {id} is not part of it.",
+                            TOOL.name, resolved.project_key
+                        ),
+                    )
+                    .tool_result();
+                }
+                Err(err) => return TOOL.client_error(&err),
+            }
+        }
         match self
-            .request(
-                &ctx.settings,
-                call.method,
-                &call.path,
-                &call.query,
-                call.body,
-            )
+            .perform(&resolved, call.method, &call.path, &call.query, call.body)
             .await
         {
             Ok(response) => TOOL.response(&response),

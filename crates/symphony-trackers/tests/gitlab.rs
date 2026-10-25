@@ -26,6 +26,7 @@ fn tracker_json(overrides: Value) -> Value {
     json!({
         "kind": "gitlab",
         "provider": provider,
+        "required_labels": ["symphony"],
         "active_states": ["opened"],
         "terminal_states": ["closed"],
     })
@@ -95,25 +96,25 @@ async fn adapter_validates_gitlab_config_delegates_reads_and_advertises_gitlab_a
             Err(C::InvalidGitlabStates.into())
         );
     }
-    let specs = tracker.agent_tool_specs();
+    let specs = tracker.agent_tool_specs(&settings(json!({})));
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0]["name"], "gitlab_api");
     assert_eq!(
         specs[0]["inputSchema"]["properties"]["method"]["enum"],
-        json!(["GET", "POST", "PUT", "DELETE"])
+        json!(["GET", "POST", "PUT"])
     );
     assert!(specs[0]["inputSchema"]["properties"]["query"].is_object());
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/user"))
+        .and(path("/projects/group%2Fproject"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
         .mount(&server)
         .await;
     let (ok, _) = run_tool(
         &tracker_for(&server),
         "gitlab_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/projects/group%2Fproject"}),
         &settings(json!({})),
     )
     .await;
@@ -395,7 +396,7 @@ async fn gitlab_api_preserves_rest_status_and_body_while_rejecting_unsafe_argume
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/missing"))
+        .and(path("/projects/group%2Fproject/missing"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "404 Not found"})))
         .mount(&server)
         .await;
@@ -429,7 +430,7 @@ async fn gitlab_api_preserves_rest_status_and_body_while_rejecting_unsafe_argume
     let (ok, output) = run_tool(
         &tracker,
         "gitlab_api",
-        json!({"method": "GET", "path": "/missing"}),
+        json!({"method": "GET", "path": "/projects/group%2Fproject/missing"}),
         &s,
     )
     .await;
@@ -446,15 +447,15 @@ async fn gitlab_api_preserves_rest_status_and_body_while_rejecting_unsafe_argume
             "gitlab_api.path must be a relative GitLab REST path.",
         ),
         (
-            json!({"method": "PATCH", "path": "/user"}),
+            json!({"method": "PATCH", "path": "/projects/group%2Fproject"}),
             "gitlab_api.method must be GET, POST, PUT, or DELETE.",
         ),
         (
-            json!({"method": "GET", "path": "/user", "query": false}),
+            json!({"method": "GET", "path": "/projects/group%2Fproject", "query": false}),
             "gitlab_api.query must be a JSON object when provided.",
         ),
         (
-            json!({"path": "/user"}),
+            json!({"path": "/projects/group%2Fproject"}),
             "gitlab_api.method must be GET, POST, PUT, or DELETE.",
         ),
     ] {
@@ -481,7 +482,7 @@ async fn gitlab_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &tracker,
         "gitlab_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/projects/group%2Fproject"}),
         &settings(json!({"api_key": 123})),
     )
     .await;
@@ -493,7 +494,7 @@ async fn gitlab_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &tracker,
         "gitlab_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/projects/group%2Fproject"}),
         &settings(json!({"project_path": 123})),
     )
     .await;
@@ -559,7 +560,7 @@ async fn redirect_request(location: Option<&str>) -> (bool, MockServer, MockServ
     );
     let settings = tracker_settings(json!({
         "kind": "gitlab",
-        "provider": {"api_url": ORIGIN, "api_key": TOKEN, "project_path": "test/repo"},
+        "provider": {"api_url": ORIGIN, "api_key": TOKEN, "project_path": "attacker/bait"},
     }));
     let (ok, _) = run_tool(
         &tracker,
@@ -616,4 +617,200 @@ async fn cross_origin_redirects_receive_neither_credential_header() {
     assert_eq!(requests[0].url.path(), "/sink");
     assert!(header_of(&requests[0], "authorization").is_none());
     assert!(header_of(&requests[0], "private-token").is_none());
+}
+
+// ---- agent tool scope (2026-10-25 audit A2) ----
+
+#[test]
+fn gitlab_api_scope_allows_only_the_configured_project() {
+    use symphony_core::config::GitLabSettings;
+    use symphony_core::config::schema::AgentToolSettings;
+    use symphony_trackers::rest::RestCall;
+    use symphony_trackers::transport::Method;
+
+    let resolved = GitLabSettings {
+        api_url: ORIGIN.into(),
+        api_key: "t".into(),
+        project_path: "Group/Project".into(),
+        allowed_authors: Vec::new(),
+    };
+    let policy = AgentToolSettings::default();
+    let rule = |method, path: &str, policy: &AgentToolSettings| {
+        gitlab::check_scope(
+            &resolved,
+            &RestCall {
+                method,
+                path: path.into(),
+                query: Default::default(),
+                body: None,
+            },
+            policy,
+        )
+        .err()
+        .map(|denied| denied.rule)
+    };
+    for (method, path) in [
+        (Method::Get, "/projects/group%2Fproject"),
+        (Method::Get, "/projects/group%2fproject/issues"),
+        (Method::Post, "/projects/Group%2FProject/issues/1/notes"),
+        (Method::Put, "/projects/group%2Fproject/issues/1"),
+        (Method::Post, "/projects/group%2Fproject/merge_requests"),
+    ] {
+        assert_eq!(rule(method, path, &policy), None, "{path}");
+    }
+    for (method, path, expected) in [
+        (Method::Get, "/user", "path_out_of_scope"),
+        (Method::Get, "/projects", "path_out_of_scope"),
+        (
+            Method::Get,
+            "/projects/group%2Fother/issues",
+            "path_out_of_scope",
+        ),
+        (
+            Method::Get,
+            "/projects/group/project/issues",
+            "path_out_of_scope",
+        ),
+        (Method::Get, "/groups/group/members", "path_out_of_scope"),
+        (
+            Method::Get,
+            "/projects/group%2Fproject/issues%2F..%2F..",
+            "unsafe_path",
+        ),
+        (
+            Method::Get,
+            "/projects/group%2Fproject/x%2Fy",
+            "unsafe_path",
+        ),
+        (Method::Put, "/projects/group%2Fproject", "admin_path"),
+        (
+            Method::Post,
+            "/projects/group%2Fproject/hooks",
+            "admin_path",
+        ),
+        (
+            Method::Get,
+            "/projects/group%2Fproject/variables",
+            "admin_path",
+        ),
+        (
+            Method::Post,
+            "/projects/group%2Fproject/members",
+            "admin_path",
+        ),
+        (
+            Method::Post,
+            "/projects/group%2Fproject/deploy_keys",
+            "admin_path",
+        ),
+        (
+            Method::Put,
+            "/projects/group%2Fproject/transfer",
+            "admin_path",
+        ),
+        (
+            Method::Post,
+            "/projects/group%2Fproject/protected_branches",
+            "admin_path",
+        ),
+    ] {
+        assert_eq!(
+            rule(method, path, &policy),
+            Some(expected),
+            "{method} {path}"
+        );
+    }
+    let admin = AgentToolSettings {
+        allow_admin_paths: true,
+        ..AgentToolSettings::default()
+    };
+    assert_eq!(
+        rule(Method::Post, "/projects/group%2Fproject/hooks", &admin),
+        None
+    );
+    assert_eq!(rule(Method::Put, "/projects/group%2Fproject", &admin), None);
+}
+
+#[tokio::test]
+async fn gitlab_api_refuses_out_of_scope_calls_without_sending_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+    let s = settings(json!({}));
+    for (args, rule) in [
+        (
+            json!({"method": "GET", "path": "/user"}),
+            "path_out_of_scope",
+        ),
+        (
+            json!({"method": "DELETE", "path": "/projects/group%2Fproject/issues/1"}),
+            "method_not_allowed",
+        ),
+        (
+            json!({"method": "POST", "path": "/projects/group%2Fproject/variables", "body": {}}),
+            "admin_path",
+        ),
+    ] {
+        let (ok, output) = run_tool(&tracker, "gitlab_api", args.clone(), &s).await;
+        assert!(!ok, "{args}");
+        assert_eq!(output["error"]["rule"], rule, "{args}");
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn gitlab_allowed_authors_make_other_authors_issues_undispatchable() {
+    let server = MockServer::start().await;
+    let mut mine = raw_issue(1);
+    mine["author"] = json!({"username": "Maintainer"});
+    let mut theirs = raw_issue(2);
+    theirs["author"] = json!({"username": "stranger"});
+    Mock::given(method("GET"))
+        .and(path("/projects/group%2Fproject/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([mine, theirs])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/projects/group%2Fproject/issues/2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(theirs.clone()))
+        .mount(&server)
+        .await;
+    let mut t = tracker_json(json!({"allowed_authors": ["maintainer"]}));
+    t["required_labels"] = json!([]);
+    let s = tracker_settings(t);
+    let tracker = tracker_for(&server);
+    assert_eq!(tracker.validate_config(&s), Ok(()));
+    let issues = tracker
+        .fetch_issues_by_states(&s, &strings(&["opened"]))
+        .await
+        .unwrap();
+    let dispatchable: Vec<bool> = issues.iter().map(|i| i.dispatchable).collect();
+    assert_eq!(dispatchable, [true, false]);
+    let refreshed = tracker
+        .fetch_issues_by_ids(&s, &strings(&["2"]))
+        .await
+        .unwrap();
+    assert!(!refreshed[0].dispatchable);
+}
+
+#[test]
+fn gitlab_requires_a_routing_guard() {
+    let tracker = offline();
+    let mut t = tracker_json(json!({}));
+    t["required_labels"] = json!([]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::MissingGitlabRoutingGuard.into())
+    );
+    t["provider"]["allowed_authors"] = json!([42]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::InvalidGitlabAllowedAuthors.into())
+    );
+    t["provider"]["allowed_authors"] = json!(["maintainer"]);
+    assert_eq!(tracker.validate_config(&tracker_settings(t)), Ok(()));
 }

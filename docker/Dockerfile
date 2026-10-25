@@ -10,6 +10,8 @@
 # Build from the repository root (see docker/README.md):
 #   docker buildx build -f docker/Dockerfile -t symphony:dev --load .
 #   docker buildx build -f docker/Dockerfile --platform linux/amd64,linux/arm64 -t <image> --push .
+#
+# Modified 2026-10-25: the default command no longer acknowledges the guardrails banner (audit A3).
 
 ARG RUST_VERSION=1.99.0
 ARG NODE_VERSION=22
@@ -165,4 +167,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -q -T 4 -O /dev/null "http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health" || exit 1
 
 ENTRYPOINT ["tini", "--", "symphony"]
-CMD ["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "/config/WORKFLOW.md"]
+# Deliberately not pre-acknowledged: an operator who has reviewed the sandbox settings in
+# WORKFLOW.md passes --i-understand-that-this-will-be-running-without-the-usual-guardrails
+# (see docker/README.md). The API also needs SYMPHONY_API_TOKEN, because the image binds 0.0.0.0.
+CMD ["/config/WORKFLOW.md"]

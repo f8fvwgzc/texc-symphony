@@ -9,6 +9,11 @@
 //! * **Embedded dashboard**: the Vite bundle in `web/dist`, embedded at compile time (a
 //!   placeholder page when it was not built; see [`WEB_UI_EMBEDDED`]).
 //!
+//! * **Security**: bearer-token auth on `/api/*` (health and the contract excepted), a `Host`
+//!   allow-list against DNS rebinding, an `Origin` check on writes, and single-use SSE tickets
+//!   (`POST /api/v1/events/tickets`) because `EventSource` cannot send headers. A non-loopback
+//!   bind without auth is refused. See [`Auth`].
+//!
 //! The contract is `docs/api/openapi.yaml`; `docs/api/README.md` is the human guide.
 //!
 //! The server does not depend on the runtime. The binary implements [`ControlPlane`] for its
@@ -45,6 +50,7 @@ mod control;
 mod error;
 mod history;
 pub mod presenter;
+mod security;
 mod server;
 mod sse;
 pub mod testing;
@@ -60,8 +66,9 @@ pub use config::{
 };
 pub use control::{ControlPlane, StateError, Unavailable};
 pub use error::ServerError;
+pub use security::{Auth, Authenticator, MAX_TICKETS, StaticToken, TICKET_TTL};
 pub use server::{BoundServer, resolve_host, serve};
 pub use view::{
-    BlockedEntry, CodexTotals, IssueView, RefreshAccepted, RetryEntry, RunningEntry, StatePayload,
-    StateView, TokenCounts,
+    BlockedEntry, CodexTotals, IssueView, PauseState, RefreshAccepted, RetryEntry, RunningEntry,
+    SpendView, StatePayload, StateView, TokenCounts,
 };

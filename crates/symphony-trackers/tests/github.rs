@@ -28,6 +28,7 @@ fn tracker_json(overrides: Value) -> Value {
     json!({
         "kind": "github",
         "provider": provider,
+        "required_labels": ["symphony"],
         "active_states": ["open"],
         "terminal_states": ["closed"],
     })
@@ -97,12 +98,12 @@ async fn adapter_validates_github_config_delegates_reads_and_advertises_github_a
         );
     }
 
-    let specs = tracker.agent_tool_specs();
+    let specs = tracker.agent_tool_specs(&settings(json!({})));
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0]["name"], "github_api");
     assert_eq!(
         specs[0]["description"],
-        "Execute a GitHub REST API request using Symphony's configured auth.\n"
+        "Execute a GitHub REST API request for the configured repository (paths under /repos/{owner}/{repo}) using Symphony's configured auth.\n"
     );
     assert_eq!(
         specs[0]["inputSchema"]["required"],
@@ -110,13 +111,20 @@ async fn adapter_validates_github_config_delegates_reads_and_advertises_github_a
     );
     assert_eq!(
         specs[0]["inputSchema"]["properties"]["method"]["enum"],
-        json!(["GET", "POST", "PATCH", "PUT", "DELETE"])
+        json!(["GET", "POST", "PATCH", "PUT"])
+    );
+    let mut with_delete = tracker_json(json!({}));
+    with_delete["agent_tools"] = json!({"methods": ["get", "delete"]});
+    assert_eq!(
+        tracker.agent_tool_specs(&tracker_settings(with_delete))[0]["inputSchema"]["properties"]["method"]
+            ["enum"],
+        json!(["GET", "DELETE"])
     );
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/user"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"login": "octocat"})))
+        .and(path("/repos/octo/repo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_name": "octo/repo"})))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -133,7 +141,7 @@ async fn adapter_validates_github_config_delegates_reads_and_advertises_github_a
     let (ok, _) = run_tool(
         &tracker,
         "github_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/repos/octo/repo"}),
         &settings(json!({})),
     )
     .await;
@@ -482,15 +490,15 @@ async fn github_api_preserves_rest_status_and_body_while_rejecting_unsafe_argume
             "`github_api.path` must be a relative GitHub REST path.",
         ),
         (
-            json!({"method": "GET", "path": "/user", "params": false}),
+            json!({"method": "GET", "path": "/repos/octo/repo", "params": false}),
             "`github_api.params` must be a JSON object when provided.",
         ),
         (
-            json!({"method": "GET", "path": "/user", "params": {"ids": [1, 2]}}),
+            json!({"method": "GET", "path": "/repos/octo/repo", "params": {"ids": [1, 2]}}),
             "`github_api.params` must be a JSON object when provided.",
         ),
         (
-            json!({"path": "/user"}),
+            json!({"path": "/repos/octo/repo"}),
             "`github_api.method` must be GET, POST, PATCH, PUT, or DELETE.",
         ),
     ] {
@@ -532,7 +540,7 @@ async fn github_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &tracker,
         "github_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/repos/octo/repo"}),
         &settings(json!({"token": 123})),
     )
     .await;
@@ -544,7 +552,7 @@ async fn github_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &tracker,
         "github_api",
-        json!({"method": "GET", "path": "/user"}),
+        json!({"method": "GET", "path": "/repos/octo/repo"}),
         &settings(json!({"repo": 123})),
     )
     .await;
@@ -557,12 +565,12 @@ async fn github_api_reports_unsupported_tools_malformed_calls_and_client_failure
     // Transport timeout (POST: not retried) and a non-JSON body.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/slow"))
+        .and(path("/repos/octo/repo/slow"))
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/text"))
+        .and(path("/repos/octo/repo/text"))
         .respond_with(ResponseTemplate::new(200).set_body_string("plain text"))
         .mount(&server)
         .await;
@@ -578,7 +586,7 @@ async fn github_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &slow,
         "github_api",
-        json!({"method": "POST", "path": "/slow"}),
+        json!({"method": "POST", "path": "/repos/octo/repo/slow"}),
         &s,
     )
     .await;
@@ -593,7 +601,7 @@ async fn github_api_reports_unsupported_tools_malformed_calls_and_client_failure
     let (ok, output) = run_tool(
         &slow,
         "github_api",
-        json!({"method": "GET", "path": "/text"}),
+        json!({"method": "GET", "path": "/repos/octo/repo/text"}),
         &s,
     )
     .await;
@@ -626,4 +634,237 @@ async fn tracker_binds_github_tools_and_token_env_names_from_provider_config() {
         symphony_trackers::validate_config(&workflow.tracker, &deps),
         Ok(())
     );
+}
+
+// ---- agent tool scope (2026-10-25 audit A2) ----
+
+#[test]
+fn github_api_scope_allows_only_the_configured_repository() {
+    use symphony_core::config::GitHubSettings;
+    use symphony_core::config::schema::AgentToolSettings;
+    use symphony_trackers::rest::RestCall;
+    use symphony_trackers::transport::Method;
+
+    let resolved = GitHubSettings {
+        api_url: ORIGIN.into(),
+        repo: "Octo/Repo".into(),
+        token: "t".into(),
+        allowed_authors: Vec::new(),
+    };
+    let call = |method: Method, path: &str| RestCall {
+        method,
+        path: path.into(),
+        query: Default::default(),
+        body: None,
+    };
+    let policy = AgentToolSettings::default();
+    let rule = |method, path: &str, policy: &AgentToolSettings| {
+        github::check_scope(&resolved, &call(method, path), policy)
+            .err()
+            .map(|denied| denied.rule)
+    };
+    for path in [
+        "/repos/octo/repo",
+        "/repos/OCTO/repo/issues/1/comments",
+        "/repos/octo/repo/pulls?state=open",
+        "/repos/octo/repo/issues/",
+        "/repos/octo/repo/actions/runs",
+        "/repos/octo/repo/branches/main",
+    ] {
+        assert_eq!(rule(Method::Get, path, &policy), None, "{path}");
+    }
+    assert_eq!(
+        rule(Method::Post, "/repos/octo/repo/issues/1/comments", &policy),
+        None
+    );
+    for (method, path, expected) in [
+        (Method::Get, "/user", "path_out_of_scope"),
+        (Method::Get, "/repos/octo/other/issues", "path_out_of_scope"),
+        (
+            Method::Get,
+            "/repos/octo/repo-fork/issues",
+            "path_out_of_scope",
+        ),
+        (Method::Get, "/orgs/octo/members", "path_out_of_scope"),
+        (Method::Post, "/graphql", "path_out_of_scope"),
+        (Method::Get, "/repos/octo/repo/../other", "unsafe_path"),
+        (
+            Method::Get,
+            "/repos/octo/repo/%2e%2e/other/issues",
+            "unsafe_path",
+        ),
+        (Method::Get, "/repos/octo%2Frepo/issues", "unsafe_path"),
+        (Method::Get, "/repos/octo/repo//issues", "unsafe_path"),
+        (Method::Patch, "/repos/octo/repo", "admin_path"),
+        (Method::Put, "/repos/octo/repo/hooks/1", "admin_path"),
+        (Method::Get, "/repos/octo/repo/keys", "admin_path"),
+        (
+            Method::Put,
+            "/repos/octo/repo/collaborators/eve",
+            "admin_path",
+        ),
+        (
+            Method::Get,
+            "/repos/octo/repo/actions/secrets",
+            "admin_path",
+        ),
+        (
+            Method::Put,
+            "/repos/octo/repo/actions/variables/X",
+            "admin_path",
+        ),
+        (
+            Method::Put,
+            "/repos/octo/repo/branches/release/v1/protection",
+            "admin_path",
+        ),
+        (Method::Post, "/repos/octo/repo/transfer", "admin_path"),
+        (Method::Post, "/repos/octo/repo/rulesets", "admin_path"),
+    ] {
+        assert_eq!(
+            rule(method, path, &policy),
+            Some(expected),
+            "{method} {path}"
+        );
+    }
+    let admin = AgentToolSettings {
+        allow_admin_paths: true,
+        ..AgentToolSettings::default()
+    };
+    assert_eq!(rule(Method::Patch, "/repos/octo/repo", &admin), None);
+    assert_eq!(rule(Method::Get, "/repos/octo/repo/hooks", &admin), None);
+    assert_eq!(
+        rule(Method::Get, "/user", &admin),
+        Some("path_out_of_scope")
+    );
+}
+
+#[tokio::test]
+async fn github_api_refuses_out_of_scope_calls_without_sending_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+    let s = settings(json!({}));
+    for (args, rule) in [
+        (
+            json!({"method": "GET", "path": "/user"}),
+            "path_out_of_scope",
+        ),
+        (
+            json!({"method": "DELETE", "path": "/repos/octo/repo/issues/1/comments/2"}),
+            "method_not_allowed",
+        ),
+        (
+            json!({"method": "POST", "path": "/repos/octo/repo/hooks", "body": {}}),
+            "admin_path",
+        ),
+        (
+            json!({"method": "GET", "path": "/repos/octo/repo/../../user"}),
+            "unsafe_path",
+        ),
+    ] {
+        let (ok, output) = run_tool(&tracker, "github_api", args.clone(), &s).await;
+        assert!(!ok, "{args}");
+        assert_eq!(output["error"]["rule"], rule, "{args}");
+        assert!(
+            output["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("github_api")
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn github_api_runs_delete_only_when_the_policy_lists_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/octo/repo/issues/comments/2"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+    let mut t = tracker_json(json!({}));
+    t["agent_tools"] = json!({"methods": ["GET", "DELETE"]});
+    let (ok, output) = run_tool(
+        &tracker,
+        "github_api",
+        json!({"method": "DELETE", "path": "/repos/octo/repo/issues/comments/2"}),
+        &tracker_settings(t),
+    )
+    .await;
+    assert!(ok, "{output}");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn allowed_authors_make_other_authors_issues_undispatchable() {
+    let server = MockServer::start().await;
+    let mut mine = raw_issue(1);
+    mine["user"] = json!({"login": "Maintainer"});
+    let mut theirs = raw_issue(2);
+    theirs["user"] = json!({"login": "stranger"});
+    let anonymous = raw_issue(3);
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/repo/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([mine, theirs, anonymous])))
+        .mount(&server)
+        .await;
+    let mut t = tracker_json(json!({"allowed_authors": ["maintainer"]}));
+    t["required_labels"] = json!([]);
+    let s = tracker_settings(t);
+    let tracker = tracker_for(&server);
+    assert_eq!(tracker.validate_config(&s), Ok(()));
+    let issues = tracker
+        .fetch_issues_by_states(&s, &strings(&["open"]))
+        .await
+        .unwrap();
+    let dispatchable: Vec<bool> = issues.iter().map(|i| i.dispatchable).collect();
+    assert_eq!(dispatchable, [true, false, false]);
+
+    // Without the list every author is dispatchable (the label guard applies instead).
+    let issues = tracker
+        .fetch_issues_by_states(&settings(json!({})), &strings(&["open"]))
+        .await
+        .unwrap();
+    assert!(issues.iter().all(|i| i.dispatchable));
+}
+
+#[test]
+fn github_requires_a_routing_guard() {
+    let tracker = offline();
+    let mut t = tracker_json(json!({}));
+    t["required_labels"] = json!([]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::MissingGithubRoutingGuard.into())
+    );
+    t["required_labels"] = json!([" "]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::MissingGithubRoutingGuard.into())
+    );
+    t["provider"]["allowed_authors"] = json!([]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::MissingGithubRoutingGuard.into())
+    );
+    t["provider"]["allowed_authors"] = json!(["octocat", " "]);
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::InvalidGithubAllowedAuthors.into())
+    );
+    t["provider"]["allowed_authors"] = json!("octocat");
+    assert_eq!(
+        tracker.validate_config(&tracker_settings(t.clone())),
+        Err(C::InvalidGithubAllowedAuthors.into())
+    );
+    t["provider"]["allowed_authors"] = json!(["octocat"]);
+    assert_eq!(tracker.validate_config(&tracker_settings(t)), Ok(()));
 }

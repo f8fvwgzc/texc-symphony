@@ -6,18 +6,26 @@
 //!   (`SymphonyLinearIssuesById`) and fail on any malformed node.
 //! - `assignee` routing: `me` resolves through `SymphonyLinearViewer` on every read; any other value
 //!   is compared to the assignee id.
-//! - One agent tool, `linear_graphql` (raw GraphQL passthrough with the bound credential).
+//! - One agent tool, `linear_graphql` (GraphQL passthrough with the bound credential). Queries are
+//!   passed through; every root field of a mutation must be in
+//!   `tracker.agent_tools.linear_mutations`, subscriptions and unreadable documents are refused
+//!   (see [`crate::graphql`]).
+
+// Modified 2026-10-25: `linear_graphql` mutation allow-list (audit A2).
 
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::config::{TrackerSettings, resolve_linear, secret_environment_names};
 use symphony_core::issue::{normalize_labels, normalize_state, parse_datetime};
 use symphony_core::{BlockerRef, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError, inspect_string};
+use crate::graphql;
 use crate::rest::{opt_string, present_str, uniq};
+use crate::scope::Denied;
 use crate::tool::{ToolContext, ToolResult, pretty_json};
 use crate::transport::{HttpClient, HttpRequest, Method, scrub_secrets};
 use crate::{MAX_PAGES, Tracker};
@@ -477,11 +485,19 @@ fn truncate(text: &str) -> String {
     format!("{}...<truncated>", &text[..cut])
 }
 
-/// The `linear_graphql` tool spec.
-pub fn tool_spec() -> Value {
+/// The `linear_graphql` tool spec; the description lists the mutations `policy` allows.
+pub fn tool_spec(policy: &AgentToolSettings) -> Value {
+    let description = format!(
+        "{LINEAR_GRAPHQL_DESCRIPTION}Allowed mutations: {}.\n",
+        if policy.linear_mutations.is_empty() {
+            "none".to_owned()
+        } else {
+            policy.linear_mutations.join(", ")
+        }
+    );
     json!({
         "name": LINEAR_GRAPHQL_TOOL,
-        "description": LINEAR_GRAPHQL_DESCRIPTION,
+        "description": description,
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -530,6 +546,46 @@ fn normalize_arguments(arguments: &Value) -> Result<(String, Value), ArgError> {
         }
         _ => Err(ArgError::InvalidArguments),
     }
+}
+
+/// Refuses subscriptions, documents that cannot be read, and mutations whose root fields are not
+/// all in `tracker.agent_tools.linear_mutations` (`__typename` is always allowed).
+pub fn check_document(document: &str, policy: &AgentToolSettings) -> Result<(), Denied> {
+    let summary = graphql::summarize(document).map_err(|err| {
+        Denied::new(
+            "unparseable_document",
+            format!(
+                "`{LINEAR_GRAPHQL_TOOL}` could not read the GraphQL document ({err}), so its mutations cannot be checked."
+            ),
+        )
+    })?;
+    if summary.has_subscription {
+        return Err(Denied::new(
+            "subscription_not_allowed",
+            format!("`{LINEAR_GRAPHQL_TOOL}` does not run subscriptions."),
+        ));
+    }
+    let denied: Vec<&str> = summary
+        .mutation_fields
+        .iter()
+        .map(String::as_str)
+        .filter(|field| *field != "__typename" && !policy.allows_linear_mutation(field))
+        .collect();
+    if denied.is_empty() {
+        return Ok(());
+    }
+    Err(Denied::new(
+        "mutation_not_allowed",
+        format!(
+            "`{LINEAR_GRAPHQL_TOOL}` may not run {}: allowed mutations are {} (tracker.agent_tools.linear_mutations).",
+            denied.join(", "),
+            if policy.linear_mutations.is_empty() {
+                "none".to_owned()
+            } else {
+                policy.linear_mutations.join(", ")
+            }
+        ),
+    ))
 }
 
 fn argument_error(err: ArgError) -> ToolResult {
@@ -640,8 +696,8 @@ impl Tracker for LinearTracker {
         secret_environment_names(settings)
     }
 
-    fn agent_tool_specs(&self) -> Vec<Value> {
-        vec![tool_spec()]
+    fn agent_tool_specs(&self, settings: &TrackerSettings) -> Vec<Value> {
+        vec![tool_spec(&settings.agent_tools)]
     }
 
     async fn execute_agent_tool(
@@ -657,6 +713,9 @@ impl Tracker for LinearTracker {
             Ok(parsed) => parsed,
             Err(err) => return argument_error(err),
         };
+        if let Err(denied) = check_document(&query, &ctx.settings.agent_tools) {
+            return denied.tool_result();
+        }
         match self.graphql(&ctx.settings, &query, variables).await {
             Ok(body) => graphql_response(&body),
             Err(err) => client_error(&err),

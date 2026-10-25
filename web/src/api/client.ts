@@ -8,12 +8,16 @@ import type {
   RunEventList,
   RunList,
   RunRecord,
+  SseTicket,
   StatePayload,
   Totals,
 } from './types';
+import { createTokenStore, type TokenStore } from './token';
 
 /** Path of the SSE stream (see `streamEvents` in the OpenAPI document). */
 export const EVENTS_PATH = '/api/v1/events';
+/** Issues single-use SSE tickets (see `createStreamTicket`). */
+export const TICKETS_PATH = '/api/v1/events/tickets';
 
 /** A non-2xx response (with the server's `{error: {code, message}}` envelope when present). */
 export class ApiError extends Error {
@@ -41,6 +45,8 @@ export interface ApiClientOptions {
   baseUrl?: string;
   /** Injected for tests; defaults to the global `fetch`. */
   fetch?: typeof fetch;
+  /** Where the API token lives; defaults to browser session/local storage. */
+  auth?: TokenStore;
 }
 
 export interface RequestOptions {
@@ -61,8 +67,12 @@ export interface ApiClient {
     options?: RequestOptions,
   ): Promise<RunEventList>;
   getTotals(options?: RequestOptions): Promise<Totals>;
-  /** Absolute or same-origin URL for an `EventSource`. */
-  eventsUrl(): string;
+  /** `POST /api/v1/events/tickets`: a single-use ticket for opening the SSE stream. */
+  createStreamTicket(options?: RequestOptions): Promise<SseTicket>;
+  /** Absolute or same-origin URL for an `EventSource`, with `?ticket=` when given. */
+  eventsUrl(ticket?: string): string;
+  /** The API token sent with every request (a 401 marks it rejected). */
+  auth: TokenStore;
 }
 
 type QueryValue = string | number | undefined;
@@ -100,9 +110,15 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
+/** True for the 401 the server answers when the API token is missing or wrong. */
+export function isUnauthorized(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 401;
+}
+
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   const baseUrl = (options.baseUrl ?? '').replace(/\/+$/, '');
   const doFetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
+  const auth = options.auth ?? createTokenStore();
 
   async function request<T>(
     method: 'GET' | 'POST',
@@ -111,7 +127,10 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   ): Promise<T> {
     let response: Response;
     try {
-      const init: RequestInit = { method, headers: { accept: 'application/json' } };
+      const headers: Record<string, string> = { accept: 'application/json' };
+      const token = auth.get();
+      if (token !== null) headers['authorization'] = `Bearer ${token}`;
+      const init: RequestInit = { method, headers };
       if (opts?.signal) init.signal = opts.signal;
       response = await doFetch(`${baseUrl}${path}`, init);
     } catch (cause) {
@@ -120,6 +139,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     }
 
     const body = await readJson(response);
+    if (response.status === 401) auth.reject();
     if (!response.ok) {
       if (isErrorBody(body))
         throw new ApiError(response.status, body.error.code, body.error.message);
@@ -162,7 +182,9 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         opts,
       ),
     getTotals: (opts) => request<Totals>('GET', '/api/v1/totals', opts),
-    eventsUrl: () => `${baseUrl}${EVENTS_PATH}`,
+    createStreamTicket: (opts) => request<SseTicket>('POST', TICKETS_PATH, opts),
+    eventsUrl: (ticket) => `${baseUrl}${EVENTS_PATH}${buildQuery({ ticket })}`,
+    auth,
   };
 }
 

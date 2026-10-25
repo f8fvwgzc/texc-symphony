@@ -122,6 +122,10 @@ pub enum TrackerConfigError {
     InvalidGithubRepo,
     #[error("missing_github_token")]
     MissingGithubToken,
+    #[error("missing_github_routing_guard")]
+    MissingGithubRoutingGuard,
+    #[error("invalid_github_allowed_authors")]
+    InvalidGithubAllowedAuthors,
     #[error("missing_gitlab_active_states")]
     MissingGitlabActiveStates,
     #[error("missing_gitlab_terminal_states")]
@@ -136,6 +140,10 @@ pub enum TrackerConfigError {
     InvalidGitlabProjectPath,
     #[error("missing_gitlab_api_key")]
     MissingGitlabApiKey,
+    #[error("missing_gitlab_routing_guard")]
+    MissingGitlabRoutingGuard,
+    #[error("invalid_gitlab_allowed_authors")]
+    InvalidGitlabAllowedAuthors,
     #[error("missing_jira_active_states")]
     MissingJiraActiveStates,
     #[error("missing_jira_terminal_states")]
@@ -168,6 +176,21 @@ impl TrackerConfigError {
     /// The stable snake_case tag (identical to `Display`).
     pub fn tag(&self) -> String {
         self.to_string()
+    }
+
+    /// Operator guidance appended to [`ConfigError::user_message`] for errors whose tag alone does
+    /// not say what to change.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::MissingGithubRoutingGuard | Self::MissingGitlabRoutingGuard => Some(
+                "set tracker.required_labels or tracker.provider.allowed_authors; otherwise anyone \
+                 who can open an issue can steer an agent that holds your tracker token",
+            ),
+            Self::InvalidGithubAllowedAuthors | Self::InvalidGitlabAllowedAuthors => {
+                Some("tracker.provider.allowed_authors must be a list of non-blank user names")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -248,7 +271,10 @@ impl ConfigError {
             Self::UnsupportedTrackerKind(kind) => {
                 format!("Invalid WORKFLOW.md config: {{:unsupported_tracker_kind, {kind:?}}}")
             }
-            Self::Tracker(err) => format!("Invalid WORKFLOW.md config: :{err}"),
+            Self::Tracker(err) => match err.hint() {
+                Some(hint) => format!("Invalid WORKFLOW.md config: :{err} ({hint})"),
+                None => format!("Invalid WORKFLOW.md config: :{err}"),
+            },
         }
     }
 }

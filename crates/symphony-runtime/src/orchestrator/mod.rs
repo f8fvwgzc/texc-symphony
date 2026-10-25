@@ -9,9 +9,12 @@
 //! Time: durations (backoff, poll countdown, stall detection, runtime seconds) use tokio's monotonic
 //! clock — pausable in tests — while displayed timestamps use `Utc::now()`.
 
+// Modified 2026-10-25: spend controls and the kill switch (audit A4).
+
 mod dispatch;
 mod reconcile;
 mod retry;
+mod spend;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -24,7 +27,7 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
-use symphony_core::{ConfigError, Issue, Settings, TrackerConfigError};
+use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
 use symphony_store::{NewRun, RetryRecord, RunStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +38,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+pub use spend::PAUSED_CONTROL_KEY;
+pub(crate) use spend::{Pricing, SpendStop, Usage};
 pub(crate) use state::{
     BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, WorkerHandle,
     blocker_error, candidate_issue, next_retry_attempt_from_running,
@@ -46,11 +51,12 @@ pub use state::{
 
 use crate::handle::RuntimeCommand;
 use crate::recorder::RunRecorder;
+use crate::redact::Redactor;
 use crate::runner::hook_env_policy;
 use crate::runtime::{RuntimeContext, WorkerSet};
 use crate::snapshot::{
-    BlockedSnapshot, PollingStatus, RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot,
-    TrackerInfo,
+    BlockedSnapshot, PauseAck, PollingStatus, RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot,
+    SpendSnapshot, TrackerInfo,
 };
 use crate::tracker::FetchError;
 use crate::worker::{RunError, WorkerContext, WorkerMessage, WorkerResult};
@@ -161,6 +167,7 @@ impl<'w> Orchestrator<'w> {
             .settings()
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
+        self.restore_spend().await;
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -173,6 +180,7 @@ impl<'w> Orchestrator<'w> {
             () = self.shutdown.cancelled() => false,
             Some(command) = self.cmd_rx.recv() => {
                 self.handle_command(command);
+                self.enforce_spend().await;
                 true
             }
             Some(timer) = self.timer_rx.recv() => {
@@ -185,6 +193,7 @@ impl<'w> Orchestrator<'w> {
             }
             Some((run_id, event)) = self.codex_streams.next(), if !self.codex_streams.is_empty() => {
                 self.handle_codex_event(run_id, event);
+                self.enforce_spend().await;
                 true
             }
             Some(joined) = self.workers.set.join_next_with_id(), if !self.workers.set.is_empty() => {
@@ -202,6 +211,14 @@ impl<'w> Orchestrator<'w> {
             }
             RuntimeCommand::RequestRefresh(reply) => {
                 let ack = self.request_refresh();
+                let _ = reply.send(ack);
+            }
+            RuntimeCommand::SetPaused {
+                paused,
+                reason,
+                reply,
+            } => {
+                let ack = self.set_paused(paused, reason);
                 let _ = reply.send(ack);
             }
             #[cfg(test)]
@@ -287,6 +304,140 @@ impl<'w> Orchestrator<'w> {
             coalesced,
             requested_at: Utc::now(),
             operations: vec!["poll".into(), "reconcile".into()],
+        }
+    }
+
+    // ----- spend controls ------------------------------------------------------------------------
+
+    /// Startup: the kill switch and today's usage come back from the store.
+    pub(crate) async fn restore_spend(&mut self) {
+        match self.ctx.store.control(PAUSED_CONTROL_KEY).await {
+            Ok(Some(reason)) => {
+                tracing::warn!("Dispatch is paused (kill switch engaged before restart): {reason}");
+                self.state.spend.paused = Some(reason);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("Failed to read the kill switch: {err}"),
+        }
+        let now = Utc::now();
+        let midnight = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|t| t.and_utc())
+            .unwrap_or(now);
+        let usage = match self.ctx.store.usage_since(midnight).await {
+            Ok(usage) => Usage {
+                tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                cost_micro_usd: usage.cost_micro_usd,
+            },
+            Err(err) => {
+                tracing::warn!("Failed to load today's usage: {err}");
+                Usage::default()
+            }
+        };
+        self.state.spend.seed_day(now, usage);
+    }
+
+    /// Engages (`paused`) or releases the kill switch; persisted in the store. Running agents
+    /// are stopped by the next [`Self::enforce_spend`].
+    pub(crate) fn set_paused(&mut self, paused: bool, reason: Option<String>) -> PauseAck {
+        let reason = paused.then(|| {
+            reason
+                .map(|r| r.trim().to_owned())
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "operator request".to_owned())
+        });
+        if reason != self.state.spend.paused {
+            match &reason {
+                Some(reason) => tracing::warn!("Kill switch engaged: {reason}"),
+                None => tracing::info!("Kill switch released; dispatch resumes"),
+            }
+            self.ctx
+                .store
+                .set_control(PAUSED_CONTROL_KEY, reason.clone())
+                .detach();
+            self.state.spend.paused = reason.clone();
+            if reason.is_none() {
+                self.schedule_tick(Duration::ZERO);
+            }
+            self.notify();
+        }
+        PauseAck {
+            paused: reason.is_some(),
+            reason,
+        }
+    }
+
+    /// Stops what spending rules no longer allow: everything while paused or when today's
+    /// budget is used up (claims released, so they run again later), and each run whose issue
+    /// used up its budget (blocked).
+    pub(crate) async fn enforce_spend(&mut self) {
+        if self.state.running.is_empty() {
+            return;
+        }
+        let settings = self.settings();
+        let now = Utc::now();
+        if let Some(stop) = self.state.spend.global_stop(&settings.budget, now) {
+            let ids: Vec<String> = self.state.running.keys().cloned().collect();
+            tracing::warn!("Stopping {} running agents: {}", ids.len(), stop.reason());
+            for issue_id in ids {
+                self.terminate_running_issue(&issue_id, false, stop.reason())
+                    .await;
+            }
+            self.notify();
+            return;
+        }
+        let over: Vec<(String, String)> = self
+            .state
+            .running
+            .keys()
+            .filter_map(|issue_id| {
+                self.state
+                    .spend
+                    .issue_stop(issue_id, &settings.budget)
+                    .map(|stop| (issue_id.clone(), stop.reason().to_owned()))
+            })
+            .collect();
+        for (issue_id, reason) in over {
+            self.stop_and_block(&issue_id, reason).await;
+        }
+    }
+
+    /// Stops a running agent and blocks its issue with `error`.
+    pub(crate) async fn stop_and_block(&mut self, issue_id: &str, error: String) {
+        let Some(mut entry) = self.state.running.remove(issue_id) else {
+            return;
+        };
+        tracing::warn!(
+            "Stopping and blocking issue_id={issue_id} issue_identifier={}: {error}",
+            entry.identifier
+        );
+        self.record_session_completion_totals(&entry);
+        self.codex_streams.remove(&entry.run_id);
+        self.stop_worker(entry.worker.take()).await;
+        entry
+            .recorder
+            .finish(RunStatus::Blocked, Some(error.clone()));
+        self.block_issue_from_entry(issue_id, entry, error);
+        self.notify();
+    }
+
+    fn spend_snapshot(&mut self, settings: &Settings, now: chrono::DateTime<Utc>) -> SpendSnapshot {
+        let today = self.state.spend.today(now);
+        SpendSnapshot {
+            paused: self.state.spend.paused.is_some(),
+            stopped_reason: self
+                .state
+                .spend
+                .global_stop(&settings.budget, now)
+                .map(|stop| stop.reason().to_owned()),
+            day: now.date_naive().to_string(),
+            day_tokens: today.tokens,
+            day_cost_micro_usd: today.cost_micro_usd,
+            max_tokens_per_day: settings.budget.max_tokens_per_day,
+            max_cost_usd_per_day: settings.budget.max_cost_usd_per_day,
+            max_tokens_per_issue: settings.budget.max_tokens_per_issue,
+            max_cost_usd_per_issue: settings.budget.max_cost_usd_per_issue,
         }
     }
 
@@ -380,6 +531,7 @@ impl<'w> Orchestrator<'w> {
                 .then(a.issue_id.cmp(&b.issue_id))
         });
 
+        let spend = self.spend_snapshot(&settings, now_utc);
         Snapshot {
             generated_at: now_utc,
             generation: *self.ctx.generation.borrow(),
@@ -402,6 +554,7 @@ impl<'w> Orchestrator<'w> {
                 kind: settings.tracker.kind.clone(),
                 project_slug: settings.tracker.project_slug.clone(),
             },
+            spend,
         }
     }
 }
