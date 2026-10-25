@@ -142,10 +142,7 @@ impl Orchestrator<'_> {
                 );
                 let error = format!("stalled for {elapsed_ms}ms without codex activity");
                 if let Some(task) = task_id(&id) {
-                    self.ctx
-                        .store
-                        .finish_task(task, TaskStatus::Failed, None, Some(error.clone()))
-                        .detach();
+                    self.task_finish(task, TaskStatus::Failed, None, Some(error.clone()));
                     self.terminate_running_issue(&id, false, &error).await;
                     continue;
                 }

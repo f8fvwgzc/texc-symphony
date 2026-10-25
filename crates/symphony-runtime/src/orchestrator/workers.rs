@@ -175,10 +175,7 @@ impl Orchestrator<'_> {
                 "Task run finished for issue_id={issue_id} session_id={session_id} status={task_status}"
             );
             entry.recorder.finish(run_status, error.clone());
-            self.ctx
-                .store
-                .finish_task(task.id, task_status, task.result, error)
-                .detach();
+            self.task_finish(task.id, task_status, task.result, error);
             self.release_issue_claim(issue_id);
             return;
         }
@@ -258,10 +255,7 @@ impl Orchestrator<'_> {
     ) {
         self.remove_retry_entry(issue_id);
         if let Some(task) = task_id(issue_id) {
-            self.ctx
-                .store
-                .finish_task(task, TaskStatus::Blocked, None, Some(error.clone()))
-                .detach();
+            self.task_finish(task, TaskStatus::Blocked, None, Some(error.clone()));
         }
         self.state.claimed.insert(issue_id.to_owned());
         self.state.blocked.insert(
@@ -327,7 +321,7 @@ impl Orchestrator<'_> {
         if let Some(task) = &entry.task {
             // Stopped from outside (kill switch, daily budget): queued again. A task that was
             // finished first (cancel, failure) is not running any more and stays as it is.
-            self.ctx.store.release_task(task.id, reason).detach();
+            self.task_release(task.id, reason);
         }
         if cleanup {
             self.cleanup_issue_workspace(

@@ -226,10 +226,7 @@ impl Orchestrator<'_> {
             };
             if let Some(error) = refusal {
                 tracing::warn!("Not running {}: {error}", issue_context(&issue));
-                self.ctx
-                    .store
-                    .finish_task(task.id, TaskStatus::Failed, None, Some(error))
-                    .detach();
+                self.task_finish(task.id, TaskStatus::Failed, None, Some(error));
                 continue;
             }
             let plan = RunPlan {

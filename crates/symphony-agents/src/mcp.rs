@@ -166,6 +166,31 @@ async fn accept(
     }
 }
 
+/// Longest relay request accepted, in bytes (tool arguments are small JSON documents).
+pub const MAX_RELAY_LINE: usize = 4 * 1024 * 1024;
+
+/// The next `\n`-terminated line of at most `max` bytes; `Ok(None)` at EOF or when a line is
+/// longer (the connection is then dropped instead of buffering it).
+async fn next_capped_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    let read = (&mut *reader)
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await?;
+    if read == 0 || (buf.len() > max && buf.last() != Some(&b'\n')) {
+        return Ok(None);
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
+
 async fn serve_relay(
     stream: UnixStream,
     handler: Arc<dyn DynamicToolHandler>,
@@ -173,8 +198,8 @@ async fn serve_relay(
     call_timeout: Duration,
 ) {
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(read);
+    while let Ok(Some(line)) = next_capped_line(&mut reader, MAX_RELAY_LINE).await {
         let request: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         let reply = match request.get("op").and_then(Value::as_str) {
             Some("list") => json!({"tools": handler.tool_specs()}),
@@ -349,6 +374,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_lines_are_capped() {
+        let input: &[u8] = b"short\r\nanother line that is far too long\nnext\n";
+        let mut reader = BufReader::new(input);
+        assert_eq!(
+            next_capped_line(&mut reader, 16).await.unwrap().as_deref(),
+            Some("short")
+        );
+        assert_eq!(next_capped_line(&mut reader, 16).await.unwrap(), None);
+        let mut empty = BufReader::new(&b""[..]);
+        assert_eq!(next_capped_line(&mut empty, 16).await.unwrap(), None);
+    }
     use async_trait::async_trait;
     use tokio::io::AsyncBufReadExt;
 

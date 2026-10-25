@@ -1,9 +1,13 @@
 //! Confinement of the API agent loop's `shell` tool (`sandbox` / `network` of an `api` backend).
 //!
 //! * **bubblewrap** (Linux): the root file system read-only, the workspace and a private `/tmp`
-//!   writable, a fresh `/dev` and `/proc`, no network (`--unshare-net`) unless allowed.
-//! * **seatbelt** (macOS `sandbox-exec`): everything allowed except file writes outside the
-//!   workspace, `/private/tmp`, `$TMPDIR` and a few device files; network denied unless allowed.
+//!   writable, a fresh `/dev`, a private PID namespace with its own `/proc` (host processes and
+//!   their environments are invisible; everything dies with the command), a new session, and no
+//!   network (`--unshare-net`) unless allowed.
+//! * **seatbelt** (macOS `sandbox-exec`): file writes only to the workspace, `/private/tmp`, a
+//!   private per-command temp directory (`$TMPDIR` for the command) and a few device files; no
+//!   LaunchServices, AppleEvents, `open`, `osascript` or `launchctl` (which would start programs
+//!   outside the sandbox); network denied unless allowed.
 //! * **none**: no confinement beyond the workspace cwd and the filtered environment.
 //!
 //! `auto` picks bubblewrap or seatbelt when installed and refuses otherwise: running commands of
@@ -80,6 +84,15 @@ pub fn seatbelt_profile(workspace: &Path, writable: &[PathBuf], network: bool) -
         .map(|root| format!("(subpath {})", sb_string(root)))
         .collect();
     let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+    // Programs started through launchd/LaunchServices or AppleEvents run outside the sandbox.
+    profile.push_str(
+        "(deny mach-lookup (global-name-regex #\"^com\\.apple\\.coreservices\\.\") \
+         (global-name \"com.apple.lsd.mapdb\") (global-name \"com.apple.lsd.modifydb\") \
+         (global-name \"com.apple.coreservices.launchservicesd\"))\n\
+         (deny appleevent-send)\n\
+         (deny process-exec (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") \
+         (literal \"/bin/launchctl\") (literal \"/usr/bin/automator\"))\n",
+    );
     profile.push_str(&format!(
         "(allow file-write* {} (literal \"/dev/null\") (literal \"/dev/tty\") \
          (literal \"/dev/stdout\") (literal \"/dev/stderr\") (regex #\"^/dev/fd/\"))\n",
@@ -91,19 +104,16 @@ pub fn seatbelt_profile(workspace: &Path, writable: &[PathBuf], network: bool) -
     profile
 }
 
-/// The temp directory commands may write to besides `/private/tmp` (`$TMPDIR`, canonical).
-fn temp_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("TMPDIR")?;
-    std::fs::canonicalize(dir).ok()
-}
-
 /// `bash -lc <script>` in `workspace` under `confinement`. stderr of bash goes to stdout (so
-/// the model sees one stream in order); the wrapper's own stderr stays separate.
+/// the model sees one stream in order); the wrapper's own stderr stays separate. `tmp` is the
+/// command's private temp directory (seatbelt: the only writable temp dir besides
+/// `/private/tmp`, so the shared `$TMPDIR` of Symphony stays out of reach).
 pub fn command(
     confinement: &Confinement,
     workspace: &Path,
     script: &str,
     network: bool,
+    tmp: Option<&Path>,
 ) -> Command {
     let script = format!("exec 2>&1\n{script}");
     let mut command = match confinement {
@@ -115,8 +125,11 @@ pub fn command(
         Confinement::Bubblewrap(bwrap) => {
             let mut command = Command::new(bwrap);
             command
-                .args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"])
-                .args(["--tmpfs", "/tmp"])
+                .args(["--ro-bind", "/", "/", "--dev", "/dev"])
+                // A PID namespace (needed for `--proc` without setuid, and it hides host
+                // processes) and a new session; everything inside dies with the command.
+                .args(["--unshare-pid", "--new-session", "--proc", "/proc"])
+                .args(["--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp"])
                 .arg("--bind")
                 .arg(workspace)
                 .arg(workspace);
@@ -132,7 +145,7 @@ pub fn command(
             command
         }
         Confinement::Seatbelt(sandbox_exec) => {
-            let writable: Vec<PathBuf> = temp_dir().into_iter().collect();
+            let writable: Vec<PathBuf> = tmp.map(Path::to_path_buf).into_iter().collect();
             let mut command = Command::new(sandbox_exec);
             command
                 .arg("-p")
@@ -142,6 +155,9 @@ pub fn command(
             command
         }
     };
+    if let (Some(tmp), Confinement::Seatbelt(_) | Confinement::None) = (tmp, confinement) {
+        command.env("TMPDIR", tmp);
+    }
     command.current_dir(workspace);
     command
 }
@@ -162,7 +178,10 @@ mod tests {
         assert!(profile.contains("(subpath \"/w/MT-1\")"));
         assert!(profile.contains("(subpath \"/t\")"));
         assert!(profile.contains("(deny network*)"));
-        assert!(!seatbelt_profile(Path::new("/w"), &[], true).contains("network"));
+        assert!(profile.contains("(deny appleevent-send)"));
+        assert!(profile.contains("(literal \"/usr/bin/open\")"));
+        assert!(profile.contains("com.apple.lsd.mapdb"));
+        assert!(!seatbelt_profile(Path::new("/w"), &[], true).contains("network*"));
         assert_eq!(sb_string(Path::new("/a\"b")), "\"/a\\\"b\"");
     }
 
@@ -173,6 +192,7 @@ mod tests {
             Path::new("/w/MT-1"),
             "ls",
             false,
+            None,
         );
         let args: Vec<String> = command
             .as_std()
@@ -180,7 +200,9 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         let joined = args.join(" ");
-        assert!(joined.starts_with("--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp"));
+        assert!(joined.starts_with(
+            "--ro-bind / / --dev /dev --unshare-pid --new-session --proc /proc --tmpfs /tmp"
+        ));
         assert!(joined.contains("--bind /w/MT-1 /w/MT-1 --unshare-net"));
         assert!(joined.ends_with("-- bash -lc exec 2>&1\nls"));
     }

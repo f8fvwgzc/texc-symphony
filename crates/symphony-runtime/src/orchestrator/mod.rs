@@ -129,6 +129,63 @@ pub(crate) struct Orchestrator<'w> {
     codex_streams: StreamMap<u64, UnboundedReceiverStream<CodexEvent>>,
     shutdown: CancellationToken,
     tokens: Counter,
+    /// Task status writes, applied in order (and retried while the store is busy).
+    task_writes: mpsc::UnboundedSender<TaskWrite>,
+}
+
+/// A task status change for the store.
+#[derive(Debug)]
+pub(crate) enum TaskWrite {
+    Finish {
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    },
+    Release {
+        id: i64,
+        reason: String,
+    },
+}
+
+/// Applies task writes one after another, so a finish always lands before a later release of the
+/// same task, and retries a write the store refused as busy instead of dropping it (a dropped
+/// finish would leave the task `running` forever).
+fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<TaskWrite> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
+    tokio::spawn(async move {
+        while let Some(write) = rx.recv().await {
+            let mut delay = Duration::from_millis(20);
+            for _ in 0..12 {
+                let result = match &write {
+                    TaskWrite::Finish {
+                        id,
+                        status,
+                        result,
+                        error,
+                    } => store
+                        .finish_task(*id, *status, result.clone(), error.clone())
+                        .await
+                        .map(drop),
+                    TaskWrite::Release { id, reason } => {
+                        store.release_task(*id, reason.clone()).await.map(drop)
+                    }
+                };
+                match result {
+                    Err(symphony_store::StoreError::Busy) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to record a task status change: {err}");
+                        break;
+                    }
+                    Ok(()) => break,
+                }
+            }
+        }
+    });
+    tx
 }
 
 impl<'w> Orchestrator<'w> {
@@ -139,6 +196,7 @@ impl<'w> Orchestrator<'w> {
         shutdown: CancellationToken,
     ) -> Self {
         let settings = ctx.workflow.settings();
+        let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         Self {
@@ -153,11 +211,36 @@ impl<'w> Orchestrator<'w> {
             codex_streams: StreamMap::new(),
             shutdown,
             tokens: Counter::default(),
+            task_writes: spawn_task_writer(ctx_store),
         }
     }
 
     pub(crate) fn settings(&self) -> Arc<Settings> {
         self.ctx.workflow.settings()
+    }
+
+    /// Records the end of a task's run (`status` final or `blocked`).
+    pub(crate) fn task_finish(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    ) {
+        let _ = self.task_writes.send(TaskWrite::Finish {
+            id,
+            status,
+            result,
+            error,
+        });
+    }
+
+    /// Puts a running task back to `queued` (stopped from outside).
+    pub(crate) fn task_release(&self, id: i64, reason: &str) {
+        let _ = self.task_writes.send(TaskWrite::Release {
+            id,
+            reason: reason.to_owned(),
+        });
     }
 
     pub(crate) fn workspace_manager(&self, settings: &Arc<Settings>) -> WorkspaceManager {
@@ -246,15 +329,12 @@ impl<'w> Orchestrator<'w> {
                 let running = self.state.running.contains_key(&issue_id);
                 if running {
                     tracing::info!("Cancelling task run issue_id={issue_id}");
-                    self.ctx
-                        .store
-                        .finish_task(
-                            id,
-                            TaskStatus::Cancelled,
-                            None,
-                            Some("cancelled by client".into()),
-                        )
-                        .detach();
+                    self.task_finish(
+                        id,
+                        TaskStatus::Cancelled,
+                        None,
+                        Some("cancelled by client".into()),
+                    );
                     self.terminate_running_issue(&issue_id, false, "cancelled by client")
                         .await;
                 } else {
@@ -473,10 +553,7 @@ impl<'w> Orchestrator<'w> {
             .collect();
         for (issue_id, task, reason) in over_task_limit {
             tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
-            self.ctx
-                .store
-                .finish_task(task, TaskStatus::Failed, None, Some(reason.clone()))
-                .detach();
+            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()));
             self.terminate_running_issue(&issue_id, false, &reason)
                 .await;
         }

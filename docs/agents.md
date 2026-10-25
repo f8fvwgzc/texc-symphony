@@ -105,13 +105,21 @@ Tools:
 - `read_file` (`offset`/`limit` lines, 2000 lines and 256 KiB at most), `write_file`, `edit_file`
   (`old_string` must be unique unless `replace_all`), `list_files` (depth 3 by default, 1000
   entries, `.git` skipped). Paths are relative to the workspace; `..`, absolute paths outside it
-  and symlink escapes are refused.
-- `shell`: `bash -lc` in the workspace with stderr merged, the last 64 KiB of output kept, host
-  secrets removed from the environment, the whole process group killed on timeout or stop.
-  - `bubblewrap` (Linux): read-only root, writable workspace and `/tmp`, no network unless
-    `network: true`. Needs unprivileged user namespaces.
-  - `seatbelt` (macOS `sandbox-exec`): writes only to the workspace and temp directories, no
-    network unless allowed.
+  and symlink escapes are refused. Only regular files are opened (FIFOs and devices are refused
+  without blocking), the opened file is checked to be the one inside the workspace, and files
+  over 8 MiB are read only partly and not edited.
+- `shell`: `bash -lc` in the workspace with stderr merged, the last 64 KiB of output kept (only
+  the tail is ever buffered), host secrets removed from the environment and `unset` again after
+  the login profile, a private temp directory as `$TMPDIR`, the whole process group killed on
+  timeout or stop.
+  - `bubblewrap` (Linux): read-only root, writable workspace and a private `/tmp`, a private PID
+    namespace and `/proc` (host processes and their environments are invisible, and everything
+    dies with the command), a new session, no network unless `network: true`. Needs
+    unprivileged user namespaces.
+  - `seatbelt` (macOS `sandbox-exec`): writes only to the workspace, `/private/tmp` and the
+    command's private temp directory; LaunchServices, AppleEvents, `open`, `osascript`,
+    `automator` and `launchctl` are denied (they would start programs outside the sandbox); no
+    network unless allowed. Seatbelt allows reads everywhere and is weaker than bubblewrap.
   - `auto` uses whichever is installed and **refuses** to run commands when neither is; set
     `none` only where something else is the sandbox (a disposable container or VM).
 - `tracker`: the tracker's scoped tools (`linear_graphql`, `github_api`, ...), executed by
