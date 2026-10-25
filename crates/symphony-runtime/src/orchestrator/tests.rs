@@ -1856,10 +1856,143 @@ async fn the_kill_switch_puts_running_tasks_back_in_the_queue_and_restarts_reque
     let _ = orch.set_paused(false, None);
     orch.maybe_dispatch().await;
     assert!(orch.state.running.contains_key(&format!("task:{id}")));
-    // A process that dies mid-run leaves the task running; the next start queues it again.
+    // A process that dies mid-run leaves the task running under its lease: nothing recovers it
+    // while the lease lives. A restart drops the old process's leases and queues it again.
     drop(orch);
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 0);
+    store.release_owner_leases("local").await.unwrap();
     assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
     task_status(&store, id, TaskStatus::Queued).await;
+}
+
+// ----- dispatch leases (replicas sharing a store) -----------------------------------------
+
+/// A second orchestrator ("replica") on the same store.
+fn replica(store: &Store, id: &str, factory: Arc<dyn WorkerFactory>, config: Value) -> Harness {
+    let id = id.to_owned();
+    let store = store.clone();
+    Harness::build(config, factory, move |options| {
+        options.with_store(store).with_replica_id(id)
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn replicas_never_run_the_same_issue_or_task_at_once() {
+    let store = Store::open_in_memory().unwrap();
+    let started_a: Started = Arc::default();
+    let started_b: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started_a)),
+        json!({}),
+    );
+    let mut b = replica(
+        &store,
+        "b",
+        blocking_factory(Arc::clone(&started_b)),
+        json!({}),
+    );
+    for h in [&a, &b] {
+        h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    }
+    let mut workers_a = WorkerSet::default();
+    let mut workers_b = WorkerSet::default();
+    let mut orch_a = a.orchestrator(&mut workers_a);
+    let mut orch_b = b.orchestrator(&mut workers_b);
+
+    orch_a
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_a.state.running.contains_key("i-1"));
+    assert!(orch_b.state.running.is_empty(), "b sees a's lease");
+    assert!(!orch_b.state.claimed.contains("i-1"));
+    assert_eq!(
+        store.lease_holder("i-1").await.unwrap().as_deref(),
+        Some("a")
+    );
+
+    // A task queued once is started by one replica only.
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    orch_b.maybe_dispatch().await;
+    orch_a.maybe_dispatch().await;
+    let key = format!("task:{}", task.id);
+    assert!(orch_b.state.running.contains_key(&key));
+    assert!(!orch_a.state.running.contains_key(&key));
+    assert_eq!(
+        store.lease_holder(&key).await.unwrap().as_deref(),
+        Some("b")
+    );
+
+    // Released with the claim: the other replica may take the issue now.
+    orch_a.terminate_running_issue("i-1", false, "test").await;
+    assert!(!orch_a.state.leases.contains("i-1"));
+    let mut released = false;
+    for _ in 0..100 {
+        if store.lease_holder("i-1").await.unwrap().is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(released);
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_b.state.running.contains_key("i-1"));
+    assert_eq!(started_a.lock().unwrap().len(), 1);
+    assert_eq!(started_b.lock().unwrap().len(), 2);
+
+    // Renewal keeps held leases alive and reports none lost.
+    orch_b.renew_leases().await;
+    assert_eq!(
+        store.lease_holder("i-1").await.unwrap().as_deref(),
+        Some("b")
+    );
+    orch_b.terminate_running_issue("i-1", false, "test").await;
+    orch_b.terminate_running_issue(&key, false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_drops_a_restored_retry_that_another_replica_holds() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .acquire_lease("i-1", "other", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let mut h = replica(
+        &store,
+        "me",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.state.claimed.insert("i-1".into());
+    orch.schedule_issue_retry(
+        "i-1",
+        Some(1),
+        RetryMeta {
+            identifier: Some("MT-1".into()),
+            ..RetryMeta::default()
+        },
+        DelayType::Continuation,
+    );
+    run_until(&mut orch, |o| !o.state.claimed.contains("i-1")).await;
+    assert!(orch.state.running.is_empty());
+    assert!(orch.state.retry_attempts.is_empty());
+    assert!(started.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1936,4 +2069,56 @@ async fn raising_the_issue_budget_releases_budget_blocked_issues() {
         .await;
     assert!(orch.state.running.contains_key("i-1"));
     orch.terminate_running_issue("i-1", false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_of_one_replica_reaches_the_others() {
+    let store = Store::open_in_memory().unwrap();
+    let started: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    let mut b = replica(
+        &store,
+        "b",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    b.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers_a = WorkerSet::default();
+    let mut workers_b = WorkerSet::default();
+    let mut orch_a = a.orchestrator(&mut workers_a);
+    let mut orch_b = b.orchestrator(&mut workers_b);
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_b.state.running.contains_key("i-1"));
+
+    let _ = orch_a.set_paused(true, Some("incident".into()));
+    let mut persisted = false;
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_some() {
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(persisted);
+    orch_b.sync_kill_switch().await;
+    orch_b.enforce_spend().await;
+    assert_eq!(orch_b.state.spend.paused.as_deref(), Some("incident"));
+    assert!(orch_b.state.running.is_empty(), "b stopped its agents");
+
+    let _ = orch_a.set_paused(false, None);
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_none() {
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    orch_b.sync_kill_switch().await;
+    assert_eq!(orch_b.state.spend.paused, None);
 }

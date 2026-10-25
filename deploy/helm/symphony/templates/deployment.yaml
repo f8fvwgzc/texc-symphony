@@ -4,11 +4,16 @@ metadata:
   name: {{ include "symphony.fullname" . }}
   labels:
     {{- include "symphony.labels" . | nindent 4 }}
+{{- $shared := gt (int .Values.replicaCount) 1 }}
+{{- if and $shared (not .Values.database.existingSecret) }}
+{{- fail "replicaCount > 1 needs database.existingSecret (PostgreSQL); SQLite serves one replica" }}
+{{- end }}
 spec:
-  # SQLite run history and local workspaces: one replica (see docs/deployment.md).
-  replicas: 1
+  # SQLite: one replica on persistent volumes. PostgreSQL: replicas coordinated by dispatch leases
+  # (see docs/deployment.md#postgresql-and-replicas).
+  replicas: {{ .Values.replicaCount }}
   strategy:
-    type: Recreate
+    type: {{ if .Values.database.existingSecret }}RollingUpdate{{ else }}Recreate{{ end }}
   selector:
     matchLabels:
       {{- include "symphony.selector" . | nindent 6 }}
@@ -43,6 +48,18 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           env:
+            {{- with .Values.database.existingSecret }}
+            - name: SYMPHONY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.database.key }}
+            {{- end }}
+            # Names this pod in dispatch leases.
+            - name: SYMPHONY_REPLICA_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SYMPHONY_API_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -62,9 +79,7 @@ spec:
               port: http
             initialDelaySeconds: 20
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: [ALL]
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -80,16 +95,26 @@ spec:
               mountPath: /var/run/secrets/llm
               readOnly: true
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: workflow
           configMap:
             name: {{ include "symphony.fullname" . }}-workflow
+        {{- if $shared }}
+        - name: data
+          emptyDir: {}
+        - name: workspaces
+          emptyDir: {}
+        {{- else }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "symphony.fullname" . }}-data
         - name: workspaces
           persistentVolumeClaim:
             claimName: {{ include "symphony.fullname" . }}-workspaces
+        {{- end }}
         {{- with .Values.global.llm.secret }}
         - name: llm-credentials
           secret:
@@ -104,6 +129,9 @@ spec:
                 path: {{ . }}
               {{- end }}
               {{- end }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

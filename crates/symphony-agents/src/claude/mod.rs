@@ -36,8 +36,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::Value;
 use symphony_codex::launch::{
-    find_executable, local_launch_command, shell_escape, valid_secret_names,
-    validate_local_workspace,
+    find_executable, local_launch_command, shell_escape, validate_local_workspace,
 };
 use symphony_codex::{CodexError, EventSink, StartOptions, TurnOutcome};
 use symphony_core::config::{BackendKind, BackendSettings, ClaudeCodeSettings};
@@ -237,13 +236,7 @@ impl AgentBackend for ClaudeCodeBackend {
             .as_deref()
             .and_then(|name| self.env.var(name))
             .filter(|key| !key.is_empty());
-        let mut secret_names = valid_secret_names(
-            options
-                .settings
-                .secret_environment_names()
-                .into_iter()
-                .chain(options.tool_handler.secret_environment_names()),
-        );
+        let mut secret_names = options.secret_names();
         let llm_env = match (api_key, &options.settings.llm) {
             (Some(key), _) => vec![(ANTHROPIC_API_KEY.to_owned(), key)],
             (None, Some(llm)) if llm.serves_anthropic() => {
@@ -258,6 +251,12 @@ impl AgentBackend for ClaudeCodeBackend {
         // Set below rather than removed.
         secret_names.retain(|name| !llm_env.iter().any(|(set, _)| set == name));
         let relay = self.relay(&options).await;
+        // Advisory for Claude Code (it is not sandboxed by Symphony): the kernel-level boundary is
+        // the pod's NetworkPolicy.
+        let mut task_env = options.task_env.clone();
+        if let Some(route) = &options.egress {
+            task_env.extend(crate::egress::proxy_env(&route.proxy_url()));
+        }
         Ok(Box::new(ClaudeSession {
             backend: self.settings.clone(),
             claude,
@@ -265,6 +264,8 @@ impl AgentBackend for ClaudeCodeBackend {
             bash,
             secret_names,
             env: options.env,
+            task_env,
+            run_as: options.run_as,
             llm_env,
             thread_id: local_thread_id(),
             claude_session: None,
@@ -283,9 +284,13 @@ impl ClaudeCodeBackend {
             return None;
         }
         let timeout = Duration::from_millis(self.settings.turn_timeout_ms);
-        match crate::mcp::ToolRelay::start(Arc::clone(&options.tool_handler), program, timeout)
-            .await
-        {
+        let started =
+            crate::mcp::ToolRelay::start(Arc::clone(&options.tool_handler), program, timeout).await;
+        let granted = started.and_then(|relay| match options.run_as {
+            Some((uid, gid)) => relay.grant(uid, gid).map(|()| relay),
+            None => Ok(relay),
+        });
+        match granted {
             Ok(relay) => Some(relay),
             Err(err) => {
                 tracing::warn!("Claude Code runs without the tracker tools: {err}");
@@ -308,6 +313,10 @@ struct ClaudeSession {
     bash: PathBuf,
     secret_names: Vec<String>,
     env: Vec<(String, String)>,
+    /// Per-task variables (and the egress proxy's), set after the secrets are removed.
+    task_env: Vec<(String, String)>,
+    /// `(uid, gid)` the turns run as (task isolation).
+    run_as: Option<(u32, u32)>,
     /// Model access variables (configured key or LLM contract), set last.
     llm_env: Vec<(String, String)>,
     thread_id: String,
@@ -358,8 +367,12 @@ impl ClaudeSession {
         for name in &self.secret_names {
             command.env_remove(name);
         }
-        for (name, value) in &self.llm_env {
+        for (name, value) in self.task_env.iter().chain(&self.llm_env) {
             command.env(name, value);
+        }
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.run_as {
+            command.uid(uid).gid(gid);
         }
         command
     }

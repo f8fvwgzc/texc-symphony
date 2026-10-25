@@ -12,12 +12,38 @@
 //!
 //! `auto` picks bubblewrap or seatbelt when installed and refuses otherwise: running commands of
 //! a remote model unconfined has to be an explicit `sandbox: none`.
+//!
+//! A task under `isolation.network.mode: deny` gets [`NetworkAccess::Proxy`] whatever the
+//! backend's `network` says: bubblewrap keeps `--unshare-net` and runs the command under the
+//! egress shim (`symphony egress-shim`, see [`crate::egress`]) with the proxy's socket directory
+//! bound in; seatbelt denies the network except `localhost:<proxy port>`; `none` only sets the
+//! proxy variables (advisory).
 
 use std::path::{Path, PathBuf};
 
+use symphony_codex::EgressRoute;
 use symphony_codex::launch::find_executable;
 use symphony_core::config::SandboxMode;
 use tokio::process::Command;
+
+use crate::egress::{SHIM_PORT, SHIM_SUBCOMMAND, proxy_env};
+
+/// What network a command may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkAccess {
+    /// None.
+    Denied,
+    /// Unrestricted (`network: true` on the backend, no isolation).
+    Allowed,
+    /// Only the task's egress proxy.
+    Proxy {
+        /// Where the proxy listens.
+        route: EgressRoute,
+        /// The executable whose `egress-shim` subcommand relays inside bubblewrap (`None`:
+        /// bubblewrap commands get no network at all).
+        shim: Option<PathBuf>,
+    },
+}
 
 /// The confinement a command runs under.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,7 +105,7 @@ fn sb_string(path: &Path) -> String {
 pub fn seatbelt_profile(
     workspace: &Path,
     writable: &[PathBuf],
-    network: bool,
+    network: &NetworkAccess,
     masked: &[PathBuf],
 ) -> String {
     let mut roots = vec![workspace.to_path_buf(), PathBuf::from("/private/tmp")];
@@ -103,8 +129,16 @@ pub fn seatbelt_profile(
          (literal \"/dev/stdout\") (literal \"/dev/stderr\") (regex #\"^/dev/fd/\"))\n",
         subpaths.join(" ")
     ));
-    if !network {
-        profile.push_str("(deny network*)\n");
+    match network {
+        NetworkAccess::Allowed => {}
+        NetworkAccess::Denied => profile.push_str("(deny network*)\n"),
+        NetworkAccess::Proxy { route, .. } => {
+            // Later rules win: everything is denied except the proxy's loopback port.
+            profile.push_str(&format!(
+                "(deny network*)\n(allow network-outbound (remote ip \"localhost:{}\"))\n",
+                route.tcp.port()
+            ));
+        }
     }
     for file in masked {
         profile.push_str(&format!(
@@ -123,7 +157,7 @@ pub fn command(
     confinement: &Confinement,
     workspace: &Path,
     script: &str,
-    network: bool,
+    network: &NetworkAccess,
     tmp: Option<&Path>,
     masked: &[PathBuf],
 ) -> Command {
@@ -135,6 +169,14 @@ pub fn command(
             command
         }
         Confinement::Bubblewrap(bwrap) => {
+            // The shim needs the proxy's socket (bound in below) and itself.
+            let shim = match network {
+                NetworkAccess::Proxy {
+                    route,
+                    shim: Some(shim),
+                } => route.socket.as_ref().map(|socket| (socket, shim)),
+                _ => None,
+            };
             let mut command = Command::new(bwrap);
             command
                 .args(["--ro-bind", "/", "/", "--dev", "/dev"])
@@ -145,8 +187,12 @@ pub fn command(
                 .arg("--bind")
                 .arg(workspace)
                 .arg(workspace);
-            if !network {
+            if *network != NetworkAccess::Allowed {
                 command.arg("--unshare-net");
+            }
+            if let Some(dir) = shim.and_then(|(socket, _)| socket.parent()) {
+                // After `--tmpfs /tmp`, which would hide a socket directory under /tmp.
+                command.arg("--bind").arg(dir).arg(dir);
             }
             // Secret files (the LLM key, ...) read as empty inside the sandbox.
             for file in masked.iter().filter(|f| f.is_file()) {
@@ -156,8 +202,18 @@ pub fn command(
                 .arg("--die-with-parent")
                 .arg("--chdir")
                 .arg(workspace)
-                .args(["--", "bash", "-lc"])
-                .arg(&script);
+                .arg("--");
+            if let Some((socket, shim)) = shim {
+                command
+                    .arg(shim)
+                    .arg(SHIM_SUBCOMMAND)
+                    .arg("--socket")
+                    .arg(socket)
+                    .arg("--port")
+                    .arg(SHIM_PORT.to_string())
+                    .arg("--");
+            }
+            command.args(["bash", "-lc"]).arg(&script);
             command
         }
         Confinement::Seatbelt(sandbox_exec) => {
@@ -173,6 +229,13 @@ pub fn command(
     };
     if let (Some(tmp), Confinement::Seatbelt(_) | Confinement::None) = (tmp, confinement) {
         command.env("TMPDIR", tmp);
+    }
+    if let (NetworkAccess::Proxy { route, .. }, Confinement::Seatbelt(_) | Confinement::None) =
+        (network, confinement)
+    {
+        for (name, value) in proxy_env(&route.proxy_url()) {
+            command.env(name, value);
+        }
     }
     command.current_dir(workspace);
     command
@@ -192,7 +255,7 @@ mod tests {
         let profile = seatbelt_profile(
             Path::new("/w/MT-1"),
             &[PathBuf::from("/t")],
-            false,
+            &NetworkAccess::Denied,
             &[PathBuf::from("/run/secrets/llm/api-key")],
         );
         assert!(profile.contains("(deny file-read* (literal \"/run/secrets/llm/api-key\"))"));
@@ -203,7 +266,10 @@ mod tests {
         assert!(profile.contains("(deny appleevent-send)"));
         assert!(profile.contains("(literal \"/usr/bin/open\")"));
         assert!(profile.contains("com.apple.lsd.mapdb"));
-        assert!(!seatbelt_profile(Path::new("/w"), &[], true, &[]).contains("network*"));
+        assert!(
+            !seatbelt_profile(Path::new("/w"), &[], &NetworkAccess::Allowed, &[])
+                .contains("network*")
+        );
         assert_eq!(sb_string(Path::new("/a\"b")), "\"/a\\\"b\"");
     }
 
@@ -213,7 +279,7 @@ mod tests {
             &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
             Path::new("/w/MT-1"),
             "ls",
-            false,
+            &NetworkAccess::Denied,
             None,
             &[],
         );
@@ -228,5 +294,108 @@ mod tests {
         ));
         assert!(joined.contains("--bind /w/MT-1 /w/MT-1 --unshare-net"));
         assert!(joined.ends_with("-- bash -lc exec 2>&1\nls"));
+    }
+
+    fn route(socket: Option<&str>) -> EgressRoute {
+        EgressRoute {
+            socket: socket.map(PathBuf::from),
+            tcp: "127.0.0.1:41234".parse().unwrap(),
+        }
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_proxied_bubblewrap_command_runs_under_the_shim_without_a_network() {
+        let network = NetworkAccess::Proxy {
+            route: route(Some("/tmp/symphony-egress-1-0/proxy.sock")),
+            shim: Some(PathBuf::from("/usr/local/bin/symphony")),
+        };
+        let command = command(
+            &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+            Path::new("/w/MT-1"),
+            "git push",
+            &network,
+            None,
+            &[],
+        );
+        let joined = args(&command).join(" ");
+        assert!(joined.contains("--unshare-net"), "{joined}");
+        let tmpfs = joined.find("--tmpfs /tmp").unwrap();
+        let bind = joined
+            .find("--bind /tmp/symphony-egress-1-0 /tmp/symphony-egress-1-0")
+            .expect("the socket directory is bound in");
+        assert!(bind > tmpfs, "bound after the private /tmp: {joined}");
+        assert!(
+            joined.ends_with(
+                "-- /usr/local/bin/symphony egress-shim --socket \
+                 /tmp/symphony-egress-1-0/proxy.sock --port 3128 -- bash -lc exec 2>&1\ngit push"
+            ),
+            "{joined}"
+        );
+        // No proxy variables outside: the shim sets them inside the sandbox.
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(name, _)| name != "HTTPS_PROXY")
+        );
+        // Without a shim (or a socket) the command just has no network.
+        for network in [
+            NetworkAccess::Proxy {
+                route: route(Some("/tmp/x/proxy.sock")),
+                shim: None,
+            },
+            NetworkAccess::Proxy {
+                route: route(None),
+                shim: Some(PathBuf::from("/s")),
+            },
+        ] {
+            let joined = args(&super::command(
+                &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+                Path::new("/w"),
+                "ls",
+                &network,
+                None,
+                &[],
+            ))
+            .join(" ");
+            assert!(joined.contains("--unshare-net"), "{joined}");
+            assert!(!joined.contains("egress-shim"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn a_proxied_seatbelt_profile_allows_only_the_proxy_port() {
+        let network = NetworkAccess::Proxy {
+            route: route(None),
+            shim: None,
+        };
+        let profile = seatbelt_profile(Path::new("/w"), &[], &network, &[]);
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        assert!(
+            profile.contains("(allow network-outbound (remote ip \"localhost:41234\"))"),
+            "{profile}"
+        );
+        let command = command(
+            &Confinement::Seatbelt(PathBuf::from("/usr/bin/sandbox-exec")),
+            Path::new("/w"),
+            "ls",
+            &network,
+            None,
+            &[],
+        );
+        let envs: Vec<(String, String)> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+            .collect();
+        assert!(envs.contains(&("HTTPS_PROXY".into(), "http://127.0.0.1:41234".into())));
     }
 }

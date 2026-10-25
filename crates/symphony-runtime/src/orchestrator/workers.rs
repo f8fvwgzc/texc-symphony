@@ -331,6 +331,7 @@ impl Orchestrator<'_> {
             )
             .await;
         }
+        self.drop_lease(issue_id);
         self.state.claimed.remove(issue_id);
         self.state.blocked.remove(issue_id);
         self.remove_retry_entry(issue_id);
@@ -358,6 +359,11 @@ impl Orchestrator<'_> {
         futures::future::join_all(stops.into_iter().map(|w| self.stop_worker(Some(w)))).await;
         for mut recorder in recorders {
             recorder.finish(RunStatus::Cancelled, Some("shutdown".into()));
+        }
+        // Another replica may take the work over now instead of after the lease TTL.
+        let held: Vec<String> = self.state.leases.iter().cloned().collect();
+        for issue_id in held {
+            self.drop_lease(&issue_id);
         }
     }
 }

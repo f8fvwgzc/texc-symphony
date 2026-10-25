@@ -10,6 +10,7 @@
 //! without the acknowledgement flag. A flag always wins over its environment variable.
 
 // Modified 2026-10-25: hidden `agent-tools` subcommand (MCP bridge for Claude Code) (Part B).
+// Modified 2026-10-26: hidden `egress-shim` subcommand (task network isolation).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -115,6 +116,26 @@ struct AgentToolsArgs {
     socket: PathBuf,
 }
 
+/// `symphony egress-shim`: relays a bubblewrap sandbox's loopback port to a task's egress proxy
+/// and runs the sandboxed command (hidden; started by the `api` backend's shell, never by hand).
+#[derive(Debug, Parser)]
+#[command(
+    name = "symphony egress-shim",
+    about = "Run a command whose network goes through a task's egress proxy (internal).",
+    disable_help_subcommand = true
+)]
+struct EgressShimArgs {
+    /// Unix socket of the task's egress proxy.
+    #[arg(long, value_name = "path")]
+    socket: PathBuf,
+    /// Loopback port to listen on (`0`: any free port).
+    #[arg(long, value_name = "port")]
+    port: u16,
+    /// The command and its arguments.
+    #[arg(last = true, required = true, value_name = "command")]
+    command: Vec<OsString>,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "symphony workspace",
@@ -193,6 +214,16 @@ pub enum Command {
     AgentTools {
         /// The session's tool relay socket.
         socket: PathBuf,
+    },
+    /// `symphony egress-shim --socket <path> --port <n> -- <command...>` (internal network relay
+    /// of the `api` backend's sandboxed shell).
+    EgressShim {
+        /// The task's egress proxy socket.
+        socket: PathBuf,
+        /// Loopback port inside the sandbox.
+        port: u16,
+        /// The command to run.
+        command: Vec<OsString>,
     },
 }
 
@@ -285,6 +316,9 @@ pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliE
     }
     if args.get(1).is_some_and(|arg| arg == "agent-tools") {
         return evaluate_agent_tools(args);
+    }
+    if args.get(1).is_some_and(|arg| arg == "egress-shim") {
+        return evaluate_egress_shim(args);
     }
     let matches = RunArgs::command()
         .version(version())
@@ -390,6 +424,22 @@ fn evaluate_agent_tools(args: &[OsString]) -> Result<Command, CliExit> {
     })?;
     Ok(Command::AgentTools {
         socket: parsed.socket,
+    })
+}
+
+fn evaluate_egress_shim(args: &[OsString]) -> Result<Command, CliExit> {
+    let argv =
+        std::iter::once(OsString::from("symphony egress-shim")).chain(args.iter().skip(2).cloned());
+    let parsed = EgressShimArgs::try_parse_from(argv).map_err(|err| match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            CliExit::Help(err.render().to_string())
+        }
+        _ => CliExit::InvalidOption(invalid_option_message(&err)),
+    })?;
+    Ok(Command::EgressShim {
+        socket: parsed.socket,
+        port: parsed.port,
+        command: parsed.command,
     })
 }
 
@@ -692,6 +742,37 @@ mod tests {
         );
         let err = fx.eval(&["agent-tools"]).unwrap_err();
         assert_eq!(err.exit_code(), 1);
+        assert!(fx.checked.borrow().is_empty(), "no workflow lookup");
+    }
+
+    #[test]
+    fn egress_shim_takes_its_socket_port_and_command_without_the_ack_flag() {
+        let fx = Fixture::new();
+        assert_eq!(
+            fx.eval(&[
+                "egress-shim",
+                "--socket",
+                "/tmp/e/proxy.sock",
+                "--port",
+                "3128",
+                "--",
+                "bash",
+                "-lc",
+                "git push --force",
+            ]),
+            Ok(Command::EgressShim {
+                socket: PathBuf::from("/tmp/e/proxy.sock"),
+                port: 3128,
+                command: vec!["bash".into(), "-lc".into(), "git push --force".into()],
+            })
+        );
+        for bad in [
+            &["egress-shim", "--socket", "/s", "--port", "1"][..],
+            &["egress-shim", "--port", "1", "--", "true"],
+            &["egress-shim", "--socket", "/s", "--port", "x", "--", "true"],
+        ] {
+            assert_eq!(fx.eval(bad).unwrap_err().exit_code(), 1, "{bad:?}");
+        }
         assert!(fx.checked.borrow().is_empty(), "no workflow lookup");
     }
 }

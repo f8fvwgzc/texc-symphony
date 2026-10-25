@@ -31,11 +31,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde_json::Value;
-use symphony_codex::launch::{valid_secret_names, validate_local_workspace};
+use symphony_codex::launch::validate_local_workspace;
 use symphony_codex::{CodexError, EventSink, StartOptions, TurnOutcome};
 use symphony_core::config::{ApiBackendSettings, BackendKind, BackendSettings, SecretSource};
 use symphony_core::{EnvSource, Issue, ProcessEnv};
 
+use self::sandbox::NetworkAccess;
 use self::sse::SseParser;
 use self::tools::{ShellPolicy, Toolbox};
 use self::wire::{Message, Reply, Request, ToolDef, Wire};
@@ -61,6 +62,9 @@ pub struct ApiBackend {
     settings: BackendSettings,
     env: Arc<dyn EnvSource>,
     retry_base: Duration,
+    /// The `symphony` executable whose `egress-shim` subcommand relays a bubblewrap sandbox's
+    /// traffic to a task's egress proxy.
+    egress_shim: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ApiBackend {
@@ -80,7 +84,16 @@ impl ApiBackend {
             settings,
             env: Arc::new(ProcessEnv),
             retry_base: Duration::from_secs(1),
+            egress_shim: std::env::current_exe().ok(),
         }
+    }
+
+    /// The executable whose `egress-shim` subcommand runs sandboxed commands of a task with a
+    /// default-deny network (default: the running executable, `symphony` in production; `None`
+    /// leaves such commands without any network inside bubblewrap).
+    pub fn with_egress_shim(mut self, program: Option<PathBuf>) -> Self {
+        self.egress_shim = program;
+        self
     }
 
     /// Reads `api_key_env` from `env` instead of the process environment.
@@ -151,23 +164,32 @@ impl AgentBackend for ApiBackend {
             .timeout(Duration::from_millis(api.request_timeout_ms))
             .build()
             .map_err(|err| CodexError::Backend(format!("cannot build the HTTP client: {err}")))?;
-        let secret_names = valid_secret_names(
-            options
-                .settings
-                .secret_environment_names()
-                .into_iter()
-                .chain(options.tool_handler.secret_environment_names()),
-        );
+        // A task's default-deny network wins over the backend's `network: true`.
+        let network = match &options.egress {
+            Some(route) => NetworkAccess::Proxy {
+                route: route.clone(),
+                shim: self.egress_shim.clone(),
+            },
+            None if api.network => NetworkAccess::Allowed,
+            None => NetworkAccess::Denied,
+        };
+        let github_app_key = options
+            .settings
+            .isolation
+            .as_ref()
+            .and_then(|isolation| isolation.github_app.as_ref())
+            .map(|app| app.private_key_file.clone());
         let toolbox = Toolbox::new(
             workspace.clone(),
             api.tools.clone(),
             Arc::clone(&options.tool_handler),
             ShellPolicy {
                 sandbox: api.sandbox,
-                network: api.network,
+                network,
                 timeout: Duration::from_millis(api.shell_timeout_ms),
-                secret_names,
+                secret_names: options.secret_names(),
                 extra_env: options.env.clone(),
+                task_env: options.task_env.clone(),
                 masked_files: options
                     .settings
                     .llm
@@ -176,7 +198,9 @@ impl AgentBackend for ApiBackend {
                     .unwrap_or_default()
                     .into_iter()
                     .chain(api.api_key_file.clone())
+                    .chain(github_app_key)
                     .collect(),
+                run_as: options.run_as,
             },
         );
         let system = self

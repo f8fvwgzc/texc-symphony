@@ -30,12 +30,16 @@
 //! - [`process`]: hook processes in their own process groups, killed on timeout.
 //! - [`tracker`]: adapter selection and per-read timeouts.
 //! - [`redact`]: secret scrubbing for recorded and served run events.
+//! - [`credentials`]: per-task GitHub App repository tokens (`isolation.github_app`).
+//! - [`isolation`]: per-task uid, credentials and default-deny egress for task runs.
 
 #![warn(missing_docs)]
 
 mod agents;
+pub mod credentials;
 pub mod handle;
 pub mod humanize;
+pub mod isolation;
 pub mod orchestrator;
 pub mod process;
 mod recorder;

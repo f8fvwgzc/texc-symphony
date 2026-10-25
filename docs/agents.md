@@ -100,7 +100,7 @@ were made (`agent_limit_exceeded`). The conversation persists across the turns o
 | `stream` | `true` | `false` for servers with broken streaming. |
 | `request_timeout_ms` | `600000` | One model request. |
 | `sandbox` | `auto` | `shell` confinement: `auto`, `bubblewrap`, `seatbelt`, `none`. |
-| `network` | `false` | Network access for `shell` commands. |
+| `network` | `false` | Network access for `shell` commands (a task's `isolation.network.mode: deny` wins). |
 | `shell_timeout_ms` | `600000` | One command (a smaller per-call `timeout_ms` wins). |
 
 Tools:

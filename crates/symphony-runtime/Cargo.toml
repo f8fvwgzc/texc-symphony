@@ -25,13 +25,19 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+# Task credentials: GitHub App installation tokens (credentials.rs).
+aws-lc-rs = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 [target.'cfg(unix)'.dependencies]
-# Safe `killpg` wrapper (the workspace forbids `unsafe`); same version as symphony-codex.
-rustix = { version = "1.1.5", features = ["process"] }
+# Safe `killpg` wrapper (the workspace forbids `unsafe`) and `O_NOFOLLOW` (isolation); same
+# version as symphony-codex.
+rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wiremock = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 

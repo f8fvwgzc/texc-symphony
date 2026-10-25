@@ -6,6 +6,7 @@
 
 pub mod backend;
 mod cast;
+pub mod isolation;
 pub mod llm;
 pub mod schema;
 pub mod tracker;
@@ -20,6 +21,9 @@ pub use backend::{
     ClaudeCodeSettings, SandboxMode,
 };
 pub use cast::{cast_boolean, cast_integer, cast_number, cast_string_list};
+pub use isolation::{
+    GitHubAppSettings, HostPort, IsolationSettings, NetworkIsolation, NetworkMode, TaskUids,
+};
 pub use llm::{LlmConnection, LlmGateway, LlmProvider, SecretSource};
 pub use schema::{
     AgentSettings, BudgetSettings, CodexProvider, CodexSettings, HooksSettings,

@@ -515,3 +515,45 @@ async fn the_llm_contract_points_claude_code_at_the_gateway() {
     );
     session.stop().await;
 }
+
+#[tokio::test]
+async fn task_variables_and_the_egress_proxy_reach_claude_after_the_secrets_are_removed() {
+    let f = fixture();
+    f.write("turn.jsonl", TURN_ONE);
+    let backend = ClaudeCodeBackend::new(backend_settings(claude_settings(), 10_000))
+        .with_env(Arc::new(MapEnv::new()));
+    let task_home = f.dir.path().join("task-home");
+    std::fs::create_dir_all(&task_home).unwrap();
+    // The operator's tracker token (GITHUB_TOKEN) is stripped; the task's own GH_TOKEN is set.
+    let options = f
+        .options()
+        .with_env("GH_TOKEN", "operator-gh-token")
+        .with_task_env("GH_TOKEN", "task-token-value")
+        .with_task_env("HOME", task_home.display().to_string())
+        .with_egress(Some(symphony_codex::EgressRoute {
+            socket: None,
+            tcp: "127.0.0.1:41999".parse().unwrap(),
+        }));
+    let mut session = backend.start(options).await.unwrap();
+    let (sink, _rx) = events();
+    session.run_turn("hi", &issue(), &sink).await.unwrap();
+    let env = f.read("env.1");
+    let lines: Vec<&str> = env.lines().collect();
+    for expected in [
+        "GH_TOKEN=task-token-value",
+        "HTTPS_PROXY=http://127.0.0.1:41999",
+        "http_proxy=http://127.0.0.1:41999",
+        "NO_PROXY=",
+    ] {
+        assert!(lines.contains(&expected), "{expected}: {env}");
+    }
+    assert!(
+        lines.contains(&format!("HOME={}", task_home.display()).as_str()),
+        "{env}"
+    );
+    assert!(!env.contains("operator-gh-token"), "{env}");
+    assert!(
+        !lines.iter().any(|l| l.starts_with("GITHUB_TOKEN=")),
+        "{env}"
+    );
+}

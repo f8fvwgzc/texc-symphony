@@ -3,18 +3,18 @@
 //! Lifecycle: `queued` → `running` (the orchestrator dispatched it) → `succeeded` / `failed` /
 //! `cancelled` / `blocked`. `blocked` (the agent needs a human) and `failed` tasks can be
 //! re-queued with an operator message; queued and blocked tasks can be cancelled directly, running
-//! ones through the orchestrator. Tasks still `running` at startup were interrupted and go back to
-//! `queued`.
+//! ones through the orchestrator. A `running` task whose dispatch lease (`task:<id>`, see
+//! `leases`) is gone was interrupted (its process stopped) and goes back to `queued`.
 
 use std::fmt;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
-use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 
+use crate::db::{Db, Row, Val, vals};
 use crate::error::{Result, StoreError};
+use crate::ops::{clamp_u32, timestamp};
 
 /// Default page size of [`TaskQuery`].
 pub const DEFAULT_TASK_LIMIT: u32 = 50;
@@ -186,18 +186,6 @@ pub struct TaskPage {
 const COLUMNS: &str = "id, title, prompt, repo, branch, backend, max_tokens, timeout_ms, metadata, \
      status, result, error, attempts, created_at, updated_at, started_at, finished_at";
 
-fn ts(column: usize, ms: i64) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::from_timestamp_millis(ms).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            column,
-            Type::Integer,
-            Box::new(StoreError::CorruptRow(format!(
-                "timestamp out of range: {ms}"
-            ))),
-        )
-    })
-}
-
 fn opt_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
@@ -206,47 +194,37 @@ fn to_sql(value: Option<u64>) -> Option<i64> {
     value.map(|v| i64::try_from(v).unwrap_or(i64::MAX))
 }
 
-fn task_from_row(row: &Row<'_>) -> rusqlite::Result<TaskRecord> {
-    let status: String = row.get(9)?;
-    let status = status
-        .parse::<TaskStatus>()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(err)))?;
+fn task_from_row(row: &Row) -> Result<TaskRecord> {
+    let status = row.text(9)?.parse::<TaskStatus>()?;
     let metadata = row
-        .get::<_, Option<String>>(8)?
+        .opt_text(8)?
         .map(|text| {
-            serde_json::from_str(&text).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(err))
-            })
+            serde_json::from_str(&text)
+                .map_err(|err| StoreError::CorruptRow(format!("task metadata: {err}")))
         })
         .transpose()?;
-    let id: i64 = row.get(0)?;
+    let id = row.int(0)?;
     Ok(TaskRecord {
         id,
         identifier: task_identifier(id),
-        title: row.get(1)?,
-        prompt: row.get(2)?,
-        repo: row.get(3)?,
-        branch: row.get(4)?,
-        backend: row.get(5)?,
+        title: row.opt_text(1)?,
+        prompt: row.text(2)?,
+        repo: row.opt_text(3)?,
+        branch: row.opt_text(4)?,
+        backend: row.opt_text(5)?,
         limits: TaskLimits {
-            max_tokens: opt_u64(row.get(6)?),
-            timeout_ms: opt_u64(row.get(7)?),
+            max_tokens: opt_u64(row.opt_int(6)?),
+            timeout_ms: opt_u64(row.opt_int(7)?),
         },
         metadata,
         status,
-        result: row.get(10)?,
-        error: row.get(11)?,
-        attempts: u32::try_from(row.get::<_, i64>(12)?.max(0)).unwrap_or(u32::MAX),
-        created_at: ts(13, row.get(13)?)?,
-        updated_at: ts(14, row.get(14)?)?,
-        started_at: row
-            .get::<_, Option<i64>>(15)?
-            .map(|ms| ts(15, ms))
-            .transpose()?,
-        finished_at: row
-            .get::<_, Option<i64>>(16)?
-            .map(|ms| ts(16, ms))
-            .transpose()?,
+        result: row.opt_text(10)?,
+        error: row.opt_text(11)?,
+        attempts: clamp_u32(row.int(12)?),
+        created_at: timestamp(row.int(13)?)?,
+        updated_at: timestamp(row.int(14)?)?,
+        started_at: row.opt_int(15)?.map(timestamp).transpose()?,
+        finished_at: row.opt_int(16)?.map(timestamp).transpose()?,
     })
 }
 
@@ -262,7 +240,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 pub(crate) fn create_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     task: &NewTask,
     now: DateTime<Utc>,
 ) -> Result<TaskRecord> {
@@ -278,59 +256,66 @@ pub(crate) fn create_task(
         .transpose()
         .map_err(|err| StoreError::InvalidArgument(format!("metadata: {err}")))?;
     let now_ms = now.timestamp_millis();
-    conn.prepare_cached(
-        "INSERT INTO tasks (title, prompt, repo, branch, backend, max_tokens, timeout_ms, \
-         metadata, status, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9)",
+    let id = db
+        .query_one(
+            "INSERT INTO tasks (title, prompt, repo, branch, backend, max_tokens, timeout_ms, \
+             metadata, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9) RETURNING id",
+            &vals![
+                task.title.as_deref(),
+                task.prompt.as_str(),
+                task.repo.as_deref(),
+                task.branch.as_deref(),
+                task.backend.as_deref(),
+                to_sql(task.limits.max_tokens),
+                to_sql(task.limits.timeout_ms),
+                metadata,
+                now_ms,
+            ],
+        )?
+        .int(0)?;
+    get_task(db, id)?.ok_or_else(|| StoreError::Internal("inserted task vanished".into()))
+}
+
+pub(crate) fn get_task(db: &mut dyn Db, id: i64) -> Result<Option<TaskRecord>> {
+    db.query_opt(
+        &format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"),
+        &vals![id],
     )?
-    .execute(params![
-        task.title,
-        task.prompt,
-        task.repo,
-        task.branch,
-        task.backend,
-        to_sql(task.limits.max_tokens),
-        to_sql(task.limits.timeout_ms),
-        metadata,
-        now_ms,
-    ])?;
-    let id = conn.last_insert_rowid();
-    get_task(conn, id)?.ok_or_else(|| StoreError::Internal("inserted task vanished".into()))
+    .map(|row| task_from_row(&row))
+    .transpose()
 }
 
-pub(crate) fn get_task(conn: &Connection, id: i64) -> Result<Option<TaskRecord>> {
-    Ok(conn
-        .prepare_cached(&format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"))?
-        .query_row([id], task_from_row)
-        .optional()?)
-}
-
-pub(crate) fn list_tasks(conn: &Connection, query: &TaskQuery) -> Result<TaskPage> {
+pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage> {
     let limit = match query.limit {
         None | Some(0) => DEFAULT_TASK_LIMIT,
         Some(n) => n.min(MAX_TASK_LIMIT),
     };
     let mut clauses = Vec::new();
-    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    let mut values: Vec<Val> = Vec::new();
     if let Some(before) = query.before_id {
-        clauses.push("id < ?");
-        values.push(before.into());
+        values.push(Val::Int(before));
+        clauses.push(format!("id < ?{}", values.len()));
     }
     if let Some(status) = query.status {
-        clauses.push("status = ?");
-        values.push(status.as_str().to_owned().into());
+        values.push(Val::Text(status.as_str().to_owned()));
+        clauses.push(format!("status = ?{}", values.len()));
     }
     let where_sql = if clauses.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", clauses.join(" AND "))
     };
-    values.push((i64::from(limit) + 1).into());
-    let sql = format!("SELECT {COLUMNS} FROM tasks {where_sql} ORDER BY id DESC LIMIT ?");
-    let mut tasks = conn
-        .prepare_cached(&sql)?
-        .query_map(params_from_iter(values), task_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    values.push(Val::Int(i64::from(limit) + 1));
+    let sql = format!(
+        "SELECT {COLUMNS} FROM tasks {where_sql} ORDER BY id DESC LIMIT ?{}",
+        values.len()
+    );
+    let mut tasks = db
+        .query(&sql, &values)?
+        .iter()
+        .map(task_from_row)
+        .collect::<Result<Vec<_>>>()?;
     let next_before_id = if tasks.len() > limit as usize {
         tasks.truncate(limit as usize);
         tasks.last().map(|t| t.id)
@@ -343,36 +328,37 @@ pub(crate) fn list_tasks(conn: &Connection, query: &TaskQuery) -> Result<TaskPag
     })
 }
 
-pub(crate) fn queued_tasks(conn: &Connection, limit: u32) -> Result<Vec<TaskRecord>> {
-    Ok(conn
-        .prepare_cached(&format!(
-            "SELECT {COLUMNS} FROM tasks WHERE status = 'queued' ORDER BY id ASC LIMIT ?1"
-        ))?
-        .query_map([i64::from(limit)], task_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+pub(crate) fn queued_tasks(db: &mut dyn Db, limit: u32) -> Result<Vec<TaskRecord>> {
+    db.query(
+        &format!("SELECT {COLUMNS} FROM tasks WHERE status = 'queued' ORDER BY id ASC LIMIT ?1"),
+        &vals![i64::from(limit)],
+    )?
+    .iter()
+    .map(task_from_row)
+    .collect()
 }
 
-/// `queued` → `running` (attempts + 1). `None` when the task was not queued (any more).
+/// `queued` → `running` (attempts + 1). `None` when the task was not queued (any more): the
+/// conditional update makes one claimant win, also across replicas.
 pub(crate) fn start_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     id: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    let changed = conn
-        .prepare_cached(
-            "UPDATE tasks SET status = 'running', attempts = attempts + 1, started_at = ?2, \
-             updated_at = ?2, error = NULL WHERE id = ?1 AND status = 'queued'",
-        )?
-        .execute(params![id, now.timestamp_millis()])?;
+    let changed = db.execute(
+        "UPDATE tasks SET status = 'running', attempts = attempts + 1, started_at = ?2, \
+         updated_at = ?2, error = NULL WHERE id = ?1 AND status = 'queued'",
+        &vals![id, now.timestamp_millis()],
+    )?;
     if changed == 0 {
         return Ok(None);
     }
-    get_task(conn, id)
+    get_task(db, id)
 }
 
 /// `running` → `status` (a final status or `blocked`). `None` when the task was not running.
 pub(crate) fn finish_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     id: i64,
     status: TaskStatus,
     result: Option<&str>,
@@ -386,51 +372,49 @@ pub(crate) fn finish_task(
     }
     let now_ms = now.timestamp_millis();
     let finished = status.is_final().then_some(now_ms);
-    let changed = conn
-        .prepare_cached(
-            "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, \
-             finished_at = ?6 WHERE id = ?1 AND status = 'running'",
-        )?
-        .execute(params![
+    let changed = db.execute(
+        "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, \
+         finished_at = ?6 WHERE id = ?1 AND status = 'running'",
+        &vals![
             id,
             status.as_str(),
             result.map(|r| truncate(r, MAX_TASK_RESULT_BYTES)),
             error.map(|e| truncate(e, 16 * 1024)),
             now_ms,
             finished,
-        ])?;
+        ],
+    )?;
     if changed == 0 {
         return Ok(None);
     }
-    get_task(conn, id)
+    get_task(db, id)
 }
 
 /// Cancels a `queued` or `blocked` task; anything else is returned unchanged (a running task is
 /// cancelled by the orchestrator). `None` for an unknown id.
 pub(crate) fn cancel_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     id: i64,
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    let now_ms = now.timestamp_millis();
-    conn.prepare_cached(
+    db.execute(
         "UPDATE tasks SET status = 'cancelled', error = ?2, updated_at = ?3, finished_at = ?3 \
          WHERE id = ?1 AND status IN ('queued', 'blocked')",
-    )?
-    .execute(params![id, reason, now_ms])?;
-    get_task(conn, id)
+        &vals![id, reason, now.timestamp_millis()],
+    )?;
+    get_task(db, id)
 }
 
 /// Puts a `blocked` or `failed` task back to `queued`, appending `message` (the operator's reply)
 /// to its prompt. Other statuses are refused with [`StoreError::InvalidArgument`].
 pub(crate) fn requeue_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     id: i64,
     message: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    let Some(task) = get_task(conn, id)? else {
+    let Some(task) = get_task(db, id)? else {
         return Ok(None);
     };
     if !matches!(task.status, TaskStatus::Blocked | TaskStatus::Failed) {
@@ -443,36 +427,38 @@ pub(crate) fn requeue_task(
         Some(message) => format!("{}\n\nOperator reply:\n{message}", task.prompt),
         None => task.prompt,
     };
-    conn.prepare_cached(
+    db.execute(
         "UPDATE tasks SET status = 'queued', prompt = ?2, error = NULL, result = NULL, \
-         finished_at = NULL, updated_at = ?3 WHERE id = ?1",
-    )?
-    .execute(params![id, prompt, now.timestamp_millis()])?;
-    get_task(conn, id)
+         finished_at = NULL, updated_at = ?3 WHERE id = ?1 AND status IN ('blocked', 'failed')",
+        &vals![id, prompt, now.timestamp_millis()],
+    )?;
+    get_task(db, id)
 }
 
 /// A running task whose run was stopped for an outside reason (kill switch, daily budget) goes
 /// back to `queued`, keeping `reason` as its error. Other statuses are left alone.
 pub(crate) fn release_task(
-    conn: &Connection,
+    db: &mut dyn Db,
     id: i64,
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    conn.prepare_cached(
+    db.execute(
         "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 \
          WHERE id = ?1 AND status = 'running'",
-    )?
-    .execute(params![id, reason, now.timestamp_millis()])?;
-    get_task(conn, id)
+        &vals![id, reason, now.timestamp_millis()],
+    )?;
+    get_task(db, id)
 }
 
-/// Startup: tasks left `running` by a previous process go back to `queued`.
-pub(crate) fn requeue_interrupted_tasks(conn: &Connection, now: DateTime<Utc>) -> Result<u64> {
-    let changed = conn.execute(
+/// Tasks left `running` by a process that is gone (no live `task:<id>` lease) go back to
+/// `queued`. Returns how many.
+pub(crate) fn requeue_interrupted_tasks(db: &mut dyn Db, now: DateTime<Utc>) -> Result<u64> {
+    db.execute(
         "UPDATE tasks SET status = 'queued', updated_at = ?1, \
-         error = 'interrupted by restart; queued again' WHERE status = 'running'",
-        [now.timestamp_millis()],
-    )?;
-    Ok(changed as u64)
+         error = 'interrupted by restart; queued again' WHERE status = 'running' \
+         AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.key = 'task:' || tasks.id \
+         AND leases.expires_at > ?1)",
+        &vals![now.timestamp_millis()],
+    )
 }

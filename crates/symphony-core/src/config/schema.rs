@@ -498,6 +498,8 @@ pub struct Settings {
     pub backends: BTreeMap<String, super::backend::BackendSettings>,
     /// The platform LLM connection contract (`LLM_*` environment), when set.
     pub llm: Option<super::llm::LlmConnection>,
+    /// `isolation:` (task runs only), when present.
+    pub isolation: Option<super::isolation::IsolationSettings>,
 }
 
 /// `Schema.normalize_state_limits/1`: keys become `trim + downcase`; values are untouched.
@@ -558,6 +560,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     );
     let server = cast_server(&Section::new(root, "server", &mut errors), &mut errors);
     let budget = cast_budget(&Section::new(root, "budget", &mut errors), &mut errors);
+    let isolation = super::isolation::cast_isolation(root, &mut errors);
     let llm = super::llm::from_env(env, &mut errors);
     if let Some(llm) = &llm {
         apply_llm_contract(root, llm, &mut agent, &mut codex);
@@ -584,6 +587,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         budget,
         backends,
         llm,
+        isolation,
     };
     Ok(finalize(settings, env))
 }

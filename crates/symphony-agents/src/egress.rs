@@ -1,0 +1,519 @@
+//! Default-deny network for task runs (`isolation.network.mode: deny`): an allow-list HTTP proxy
+//! owned by the runner, and the shim that carries a sandbox's traffic to it.
+//!
+//! ```text
+//! api shell in bubblewrap (--unshare-net)
+//!   └ HTTPS_PROXY=http://127.0.0.1:3128 ─▶ egress-shim ─Unix socket─▶ EgressProxy ─▶ allowed host:port
+//! api shell in seatbelt (network denied except localhost:<port>), codex, claude
+//!   └ HTTPS_PROXY=http://127.0.0.1:<port> ─────────────────────────▶ EgressProxy ─▶ allowed host:port
+//! ```
+//!
+//! * [`EgressProxy`] listens on a Unix socket in a fresh `0700` directory and on
+//!   `127.0.0.1:<ephemeral>`. It serves `CONNECT host:port` (tunnels, used for https) and
+//!   absolute-form plain HTTP requests (`GET http://host:port/path`), and only to entries of the
+//!   task's [`AllowList`] (exact host, case-insensitive, and exact port); anything else gets
+//!   `403`. Request heads are capped at [`MAX_HEAD_BYTES`] and must arrive within
+//!   [`HEAD_TIMEOUT`]; upstream connects are bounded by [`CONNECT_TIMEOUT`].
+//! * [`run_shim`] (`symphony egress-shim --socket S --port P -- CMD...`) runs inside the
+//!   bubblewrap sandbox, whose network namespace is empty: it listens on `127.0.0.1:P` there,
+//!   relays every connection to the proxy's socket, and runs `CMD` with the proxy variables.
+//!
+//! Enforcement differs by process: the sandboxed api shell has no other route out (bubblewrap)
+//! or is denied every other connection by the kernel (seatbelt). Codex, Claude Code and an
+//! unconfined shell (`sandbox: none`) only get the proxy variables, which well-behaved clients
+//! honour: there the boundary is the pod's NetworkPolicy.
+
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use symphony_codex::EgressRoute;
+use symphony_core::config::HostPort;
+use symphony_core::config::isolation::url_host_port;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{JoinHandle, JoinSet};
+
+/// The hidden `symphony` subcommand that runs [`run_shim`].
+pub const SHIM_SUBCOMMAND: &str = "egress-shim";
+/// Port the shim listens on inside a bubblewrap sandbox (its network namespace is private).
+pub const SHIM_PORT: u16 = 3128;
+/// Largest request head (request line + headers) the proxy reads.
+pub const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// How long a client may take to send its request head.
+pub const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the proxy waits for an upstream TCP connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The proxy variables for `url` (both cases; `NO_PROXY` emptied so nothing bypasses it).
+pub fn proxy_env(url: &str) -> Vec<(String, String)> {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), url.to_owned()))
+    .chain(["NO_PROXY", "no_proxy"].map(|name| (name.to_owned(), String::new())))
+    .collect()
+}
+
+/// The `host:port` entries a task may reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowList(Vec<HostPort>);
+
+impl AllowList {
+    /// An allow-list of `entries`.
+    pub fn new(entries: impl IntoIterator<Item = HostPort>) -> Self {
+        Self(entries.into_iter().collect())
+    }
+
+    /// `true` when `host` (exact, any case) and `port` are listed.
+    pub fn allows(&self, host: &str, port: u16) -> bool {
+        self.0.iter().any(|entry| entry.matches(host, port))
+    }
+
+    /// The entries.
+    pub fn entries(&self) -> &[HostPort] {
+        &self.0
+    }
+}
+
+static PROXIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The allow-list proxy of one task run (see the module docs). Dropping it stops the listeners,
+/// closes every relayed connection and removes its socket directory.
+#[derive(Debug)]
+pub struct EgressProxy {
+    dir: Option<PathBuf>,
+    socket: Option<PathBuf>,
+    tcp: SocketAddr,
+    allow: Arc<AllowList>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl EgressProxy {
+    /// Starts the proxy for `allow`. With `owner` (the task's uid/gid) the socket directory and
+    /// socket belong to that user, so processes running as it can connect.
+    pub async fn start(allow: AllowList, owner: Option<(u32, u32)>) -> io::Result<Self> {
+        let allow = Arc::new(allow);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let tcp = listener.local_addr()?;
+        let mut tasks = vec![tokio::spawn(accept_tcp(listener, Arc::clone(&allow)))];
+        let mut proxy = Self {
+            dir: None,
+            socket: None,
+            tcp,
+            allow: Arc::clone(&allow),
+            tasks: Vec::new(),
+        };
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "symphony-egress-{}-{}",
+                std::process::id(),
+                PROXIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+            }
+            proxy.dir = Some(dir.clone());
+            let socket = dir.join("proxy.sock");
+            let unix = tokio::net::UnixListener::bind(&socket)?;
+            if let Some((uid, gid)) = owner {
+                std::os::unix::fs::chown(&dir, Some(uid), Some(gid))?;
+                std::os::unix::fs::chown(&socket, Some(uid), Some(gid))?;
+            }
+            proxy.socket = Some(socket);
+            tasks.push(tokio::spawn(accept_unix(unix, Arc::clone(&allow))));
+        }
+        #[cfg(not(unix))]
+        let _ = (owner, &PROXIES);
+        proxy.tasks = tasks;
+        tracing::info!(
+            "Egress proxy started tcp={tcp} allow={}",
+            allow
+                .entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok(proxy)
+    }
+
+    /// Where it listens (for [`symphony_codex::StartOptions::egress`]).
+    pub fn route(&self) -> EgressRoute {
+        EgressRoute {
+            socket: self.socket.clone(),
+            tcp: self.tcp,
+        }
+    }
+
+    /// The Unix socket (Unix only).
+    pub fn socket(&self) -> Option<&Path> {
+        self.socket.as_deref()
+    }
+
+    /// The loopback TCP listener.
+    pub fn tcp_addr(&self) -> SocketAddr {
+        self.tcp
+    }
+
+    /// The allow-list.
+    pub fn allow_list(&self) -> &AllowList {
+        &self.allow
+    }
+}
+
+impl Drop for EgressProxy {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Accepts connections until aborted; aborting drops the set and so every open connection.
+async fn accept_tcp(listener: TcpListener, allow: Arc<AllowList>) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(serve(stream, Arc::clone(&allow)));
+                }
+                Err(err) => {
+                    tracing::warn!("Egress proxy accept failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+            Some(_) = connections.join_next() => {}
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn accept_unix(listener: tokio::net::UnixListener, allow: Arc<AllowList>) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    connections.spawn(serve(stream, Arc::clone(&allow)));
+                }
+                Err(err) => {
+                    tracing::warn!("Egress proxy accept failed: {err}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            },
+            Some(_) = connections.join_next() => {}
+        }
+    }
+}
+
+/// Why a request head could not be read.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadError {
+    TooLarge,
+    Closed,
+    TimedOut,
+}
+
+/// Reads up to the end of the request head; returns the head and any bytes read after it.
+async fn read_head<S: AsyncRead + Unpin>(client: &mut S) -> Result<(Vec<u8>, Vec<u8>), HeadError> {
+    let read = async {
+        let mut buf = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = client
+                .read(&mut chunk)
+                .await
+                .map_err(|_| HeadError::Closed)?;
+            if n == 0 {
+                return Err(HeadError::Closed);
+            }
+            let searched_from = buf.len().saturating_sub(3);
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(at) = buf[searched_from..]
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+            {
+                let end = searched_from + at + 4;
+                if end > MAX_HEAD_BYTES {
+                    return Err(HeadError::TooLarge);
+                }
+                let rest = buf.split_off(end);
+                return Ok((buf, rest));
+            }
+            if buf.len() > MAX_HEAD_BYTES {
+                return Err(HeadError::TooLarge);
+            }
+        }
+    };
+    tokio::time::timeout(HEAD_TIMEOUT, read)
+        .await
+        .unwrap_or(Err(HeadError::TimedOut))
+}
+
+async fn respond<S: AsyncWrite + Unpin>(client: &mut S, status: &str, message: &str) {
+    let body = format!("symphony egress: {message}\n");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = client.write_all(response.as_bytes()).await;
+    let _ = client.shutdown().await;
+}
+
+/// What a request head asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    /// `CONNECT host:port`.
+    Connect(HostPort),
+    /// An absolute-form `http://` request, rewritten to origin form.
+    Forward { target: HostPort, head: Vec<u8> },
+}
+
+/// Parses a request head; `Err` is the `400` message.
+fn parse_request(head: &[u8]) -> Result<Request, &'static str> {
+    let text = std::str::from_utf8(head).map_err(|_| "the request head is not UTF-8")?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("malformed request line");
+    };
+    if !version.starts_with("HTTP/1.") || method.is_empty() {
+        return Err("malformed request line");
+    }
+    if method.eq_ignore_ascii_case("CONNECT") {
+        return HostPort::parse(target)
+            .map(Request::Connect)
+            .ok_or("CONNECT needs host:port");
+    }
+    let Some(rest) = target
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .map(|_| &target[7..])
+    else {
+        return Err("only CONNECT and absolute http:// requests are proxied");
+    };
+    let split = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(split);
+    if authority.contains('@') {
+        return Err("credentials in the URL are not proxied");
+    }
+    let target_host =
+        url_host_port(&format!("http://{authority}")).ok_or("malformed request target")?;
+    let path = match path {
+        "" => "/".to_owned(),
+        p if p.starts_with('?') => format!("/{p}"),
+        p => p.to_owned(),
+    };
+    let mut out = format!("{method} {path} {version}\r\n");
+    for line in lines.filter(|l| !l.is_empty()) {
+        let name = line.split(':').next().unwrap_or_default().trim();
+        let hop_by_hop = [
+            "proxy-connection",
+            "proxy-authorization",
+            "connection",
+            "keep-alive",
+        ]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h));
+        if !hop_by_hop {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    Ok(Request::Forward {
+        target: target_host,
+        head: out.into_bytes(),
+    })
+}
+
+async fn connect_upstream(target: &HostPort) -> Result<TcpStream, (&'static str, String)> {
+    let connect = TcpStream::connect((target.host.as_str(), target.port));
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err((
+            "502 Bad Gateway",
+            format!("cannot connect to {target}: {err}"),
+        )),
+        Err(_) => Err((
+            "504 Gateway Timeout",
+            format!("connecting to {target} timed out"),
+        )),
+    }
+}
+
+/// Serves one client connection.
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut client: S, allow: Arc<AllowList>) {
+    let (head, rest) = match read_head(&mut client).await {
+        Ok(read) => read,
+        Err(HeadError::TooLarge) => {
+            respond(
+                &mut client,
+                "431 Request Header Fields Too Large",
+                "request head too large",
+            )
+            .await;
+            return;
+        }
+        Err(HeadError::TimedOut) => {
+            respond(&mut client, "408 Request Timeout", "request head timed out").await;
+            return;
+        }
+        Err(HeadError::Closed) => return,
+    };
+    let request = match parse_request(&head) {
+        Ok(request) => request,
+        Err(message) => {
+            respond(&mut client, "400 Bad Request", message).await;
+            return;
+        }
+    };
+    let target = match &request {
+        Request::Connect(target) | Request::Forward { target, .. } => target.clone(),
+    };
+    if !allow.allows(&target.host, target.port) {
+        tracing::warn!("Egress refused target={target} (not in the task allow-list)");
+        respond(
+            &mut client,
+            "403 Forbidden",
+            &format!("{target} is not in this task's allow-list"),
+        )
+        .await;
+        return;
+    }
+    let mut upstream = match connect_upstream(&target).await {
+        Ok(stream) => stream,
+        Err((status, message)) => {
+            respond(&mut client, status, &message).await;
+            return;
+        }
+    };
+    let ready = match &request {
+        Request::Connect(_) => client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_ok(),
+        Request::Forward { head, .. } => upstream.write_all(head).await.is_ok(),
+    };
+    if !ready || (!rest.is_empty() && upstream.write_all(&rest).await.is_err()) {
+        return;
+    }
+    let _ = copy_bidirectional(&mut client, &mut upstream).await;
+}
+
+/// `symphony egress-shim`: listens on `127.0.0.1:port` (`0` picks a free port), relays every
+/// connection to the proxy at `socket`, runs `argv` with the proxy variables pointing at the
+/// listener and returns its exit code (`128 + signal` when it was killed).
+#[cfg(unix)]
+pub async fn run_shim(socket: &Path, port: u16, argv: &[std::ffi::OsString]) -> io::Result<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command to run"))?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let addr = listener.local_addr()?;
+    let socket = socket.to_path_buf();
+    let relay = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((mut stream, _)) => {
+                        let socket = socket.clone();
+                        connections.spawn(async move {
+                            if let Ok(mut proxy) = tokio::net::UnixStream::connect(&socket).await {
+                                let _ = copy_bidirectional(&mut stream, &mut proxy).await;
+                            }
+                        });
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                },
+                Some(_) = connections.join_next() => {}
+            }
+        }
+    });
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    for (name, value) in proxy_env(&format!("http://{addr}")) {
+        command.env(name, value);
+    }
+    let status = command.status().await;
+    relay.abort();
+    let status = status?;
+    Ok(status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_are_parsed_and_rewritten_to_origin_form() {
+        assert_eq!(
+            parse_request(b"CONNECT GitHub.com:443 HTTP/1.1\r\nHost: github.com:443\r\n\r\n"),
+            Ok(Request::Connect(HostPort::new("github.com", 443)))
+        );
+        let Ok(Request::Forward { target, head }) = parse_request(
+            b"GET http://Example.test:8080?q=1 HTTP/1.1\r\nHost: example.test:8080\r\n\
+              Proxy-Connection: keep-alive\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+        ) else {
+            panic!("a forward request")
+        };
+        assert_eq!(target, HostPort::new("example.test", 8080));
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            "GET /?q=1 HTTP/1.1\r\nHost: example.test:8080\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        );
+        let Ok(Request::Forward { target, .. }) =
+            parse_request(b"GET http://plain.test/x HTTP/1.0\r\n\r\n")
+        else {
+            panic!("a forward request")
+        };
+        assert_eq!(target, HostPort::new("plain.test", 80));
+        for bad in [
+            &b"GET /relative HTTP/1.1\r\n\r\n"[..],
+            b"GET https://x.test/ HTTP/1.1\r\n\r\n",
+            b"GET http://user@x.test/ HTTP/1.1\r\n\r\n",
+            b"CONNECT x.test HTTP/1.1\r\n\r\n",
+            b"GARBAGE\r\n\r\n",
+        ] {
+            assert!(
+                parse_request(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_variables_cover_both_spellings_and_clear_no_proxy() {
+        let env = proxy_env("http://127.0.0.1:9");
+        for name in ["HTTPS_PROXY", "http_proxy", "ALL_PROXY"] {
+            assert!(env.contains(&(name.to_owned(), "http://127.0.0.1:9".to_owned())));
+        }
+        assert!(env.contains(&("NO_PROXY".to_owned(), String::new())));
+    }
+}

@@ -1154,3 +1154,43 @@ async fn key_files_win_and_max_retries_bounds_retries() {
     };
     assert!(err.to_string().contains("missing-key"), "{err}");
 }
+
+#[tokio::test]
+async fn a_task_egress_proxy_wins_over_network_true_and_task_variables_reach_the_shell() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        ApiProvider::OpenAi,
+        vec![
+            openai_tool_call(
+                false,
+                "shell",
+                json!({"command": "echo \"proxy=${HTTPS_PROXY:-none} gh=${GH_TOKEN:-unset} tracker=${GITHUB_TOKEN:-unset}\""}),
+            ),
+            openai_text(false, "ran it"),
+        ],
+    )
+    .await;
+    let env = Env::new();
+    let mut settings = api(ApiProvider::OpenAi, &server.uri(), false);
+    settings.network = true;
+    let backend = backend(backend_settings(settings));
+    let options = env
+        .options(env.settings(Some("github")))
+        .with_env("GITHUB_TOKEN", "ghp_operator_should_not_reach_the_shell")
+        .with_env("GH_TOKEN", "operator-gh-should-not-reach-the-shell")
+        .with_task_env("GH_TOKEN", "task-scoped-token")
+        .with_egress(Some(symphony_codex::EgressRoute {
+            socket: None,
+            tcp: "127.0.0.1:41999".parse().unwrap(),
+        }));
+    let mut session = backend.start(options).await.unwrap();
+    let (events, _rx) = sink();
+    session.run_turn("run", &issue(), &events).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let (_, content) = sent_tool_result(ApiProvider::OpenAi, &request_json(&requests[1]));
+    assert!(
+        content.contains("proxy=http://127.0.0.1:41999 gh=task-scoped-token tracker=unset"),
+        "{content}"
+    );
+}

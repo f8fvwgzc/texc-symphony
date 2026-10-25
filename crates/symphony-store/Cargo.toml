@@ -11,6 +11,13 @@ description = "SQLite persistence for Symphony runs, events, token usage and ret
 chrono = { workspace = true }
 # Bundled SQLite: identical builds on linux/amd64, linux/arm64 and macOS, no system libsqlite3.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# PostgreSQL (several replicas sharing one database): sync client on the store thread, TLS via
+# rustls with the system roots (the aws-lc-rs provider reqwest already uses).
+postgres = "0.19.14"
+tokio-postgres-rustls = "0.14.0"
+rustls = { version = "0.23.45", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
+rustls-native-certs = "0.8.4"
+url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

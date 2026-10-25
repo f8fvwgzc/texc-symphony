@@ -26,7 +26,7 @@ use symphony_core::Issue;
 use symphony_core::config::SandboxMode;
 use tokio::io::AsyncReadExt;
 
-use super::sandbox::{self, Confinement};
+use super::sandbox::{self, Confinement, NetworkAccess};
 use super::wire::{ToolCall, ToolDef, ToolOutcome};
 use crate::events::Emitter;
 use crate::process::GroupChild;
@@ -42,22 +42,28 @@ pub const MAX_SHELL_OUTPUT: usize = 64 * 1024;
 /// Largest file `read_file` reads and `edit_file` edits.
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// How the `shell` tool runs commands.
+/// How the `shell` tool runs commands (and who owns what the file tools write).
 #[derive(Debug, Clone)]
 pub struct ShellPolicy {
     /// Confinement mode.
     pub sandbox: SandboxMode,
-    /// Allow network access.
-    pub network: bool,
+    /// Network access of commands.
+    pub network: NetworkAccess,
     /// Upper bound of one command.
     pub timeout: Duration,
     /// Env vars removed from commands.
     pub secret_names: Vec<String>,
     /// Env vars added before the secrets are removed.
     pub extra_env: Vec<(String, String)>,
+    /// Env vars added after the secrets are removed (per-task values, see
+    /// [`symphony_codex::StartOptions::task_env`]).
+    pub task_env: Vec<(String, String)>,
     /// Secret files hidden from sandboxed commands (bubblewrap binds `/dev/null` over them,
     /// seatbelt denies reading them).
     pub masked_files: Vec<PathBuf>,
+    /// `(uid, gid)` commands run as, and the owner of files and directories the file tools
+    /// create or write (task isolation).
+    pub run_as: Option<(u32, u32)>,
 }
 
 /// The tools of one session.
@@ -412,12 +418,30 @@ impl Toolbox {
         Ok((bytes, longer))
     }
 
-    /// Replaces the contents of `path` (created if missing) after [`Self::open_regular`] checked it.
+    /// Replaces the contents of `path` (created if missing) after [`Self::open_regular`] checked it;
+    /// under task isolation the file then belongs to the task user.
     fn write_contents(&self, raw: &str, path: &Path, content: &str) -> Result<(), String> {
         let mut file = self.open_regular(raw, path, true)?;
         file.set_len(0)
             .and_then(|()| file.write_all(content.as_bytes()))
-            .map_err(|err| format!("cannot write `{raw}`: {err}"))
+            .map_err(|err| format!("cannot write `{raw}`: {err}"))?;
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.shell.run_as {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+                .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// Hands a directory the tools created to the task user (no-op without task isolation).
+    fn own(&self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.shell.run_as {
+            std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+        Ok(())
     }
 
     fn read_file(&self, args: &Value) -> Result<String, String> {
@@ -456,8 +480,17 @@ impl Toolbox {
         }
         let existed = path.exists();
         if let Some(parent) = path.parent() {
+            let mut missing: Vec<&Path> = parent
+                .ancestors()
+                .take_while(|dir| dir.symlink_metadata().is_err())
+                .collect();
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
+            missing.reverse();
+            for dir in missing {
+                self.own(dir)
+                    .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
+            }
         }
         // The parent now exists; check again so a symlinked parent cannot redirect the write.
         let path = self.resolve(raw)?;
@@ -588,9 +621,11 @@ impl Toolbox {
             .and_then(Value::as_u64)
             .map(Duration::from_millis)
             .map_or(self.shell.timeout, |t| t.min(self.shell.timeout));
-        // A login shell sources profiles that could export the removed secrets again.
-        let names =
+        // A login shell sources profiles that could export the removed secrets again (names the
+        // task sets itself are kept).
+        let mut names =
             symphony_codex::launch::valid_secret_names(self.shell.secret_names.iter().cloned());
+        names.retain(|name| !self.shell.task_env.iter().any(|(set, _)| set == name));
         let script = if names.is_empty() {
             script.to_owned()
         } else {
@@ -599,11 +634,13 @@ impl Toolbox {
         // A private temp dir per command: Symphony's own `$TMPDIR` (MCP relay configs, ...) stays
         // out of the sandbox's reach.
         let tmp = PrivateTmp::create().map_err(|err| format!("cannot create a temp dir: {err}"))?;
+        self.own(tmp.path())
+            .map_err(|err| format!("cannot hand the temp dir to the task user: {err}"))?;
         let mut command = sandbox::command(
             &confinement,
             &self.workspace,
             &script,
-            self.shell.network,
+            &self.shell.network,
             Some(tmp.path()),
             &self.shell.masked_files,
         );
@@ -616,6 +653,13 @@ impl Toolbox {
         }
         for name in &self.shell.secret_names {
             command.env_remove(name);
+        }
+        for (name, value) in &self.shell.task_env {
+            command.env(name, value);
+        }
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.shell.run_as {
+            command.uid(uid).gid(gid);
         }
         let mut child =
             GroupChild::spawn(&mut command).map_err(|err| format!("cannot run bash: {err}"))?;
@@ -733,11 +777,13 @@ mod tests {
             Arc::new(NoDynamicTools),
             ShellPolicy {
                 sandbox: SandboxMode::None,
-                network: false,
+                network: NetworkAccess::Denied,
                 timeout: Duration::from_secs(10),
                 secret_names: Vec::new(),
                 extra_env: Vec::new(),
+                task_env: Vec::new(),
                 masked_files: Vec::new(),
+                run_as: None,
             },
         )
     }
@@ -919,5 +965,134 @@ mod tests {
         let (kept, cut) = head(&text, 3);
         assert!(cut);
         assert_eq!(kept, "é");
+    }
+
+    #[cfg(unix)]
+    fn me() -> (u32, u32) {
+        (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_file_tools_hand_what_they_create_to_the_task_user() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["write_file", "edit_file", "shell"]);
+        // Without root only "chown to myself" is allowed; as root a foreign uid is used.
+        let owner = if rustix::process::geteuid().is_root() {
+            (4242, 4242)
+        } else {
+            me()
+        };
+        tools.shell.run_as = Some(owner);
+        tools
+            .write_file(&json!({"path": "made/deep/file.txt", "content": "x"}))
+            .unwrap();
+        tools
+            .edit_file(&json!({"path": "made/deep/file.txt", "old_string": "x", "new_string": "y"}))
+            .unwrap();
+        for path in ["made", "made/deep", "made/deep/file.txt"] {
+            let meta = std::fs::symlink_metadata(dir.path().join(path)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), owner, "{path}");
+        }
+        let (out, code) = tools
+            .exec("id -u; touch \"$TMPDIR/t\"", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert_eq!(
+            out.lines().next(),
+            Some(owner.0.to_string().as_str()),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_variables_survive_the_secret_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["shell"]);
+        tools.shell.secret_names = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        tools.shell.extra_env = vec![
+            ("GH_TOKEN".into(), "operator-token".into()),
+            ("GITHUB_TOKEN".into(), "operator-token".into()),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        tools.shell.task_env = vec![("GH_TOKEN".into(), "task-token".into())];
+        let (out, code) = tools
+            .exec("echo \"[$GH_TOKEN][${GITHUB_TOKEN:-}]\"", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("[task-token][]"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_lets_a_task_out_only_through_its_egress_proxy() {
+        use tokio::io::AsyncWriteExt;
+        if sandbox::resolve(SandboxMode::Seatbelt).is_err()
+            || symphony_codex::launch::find_executable("curl").is_none()
+        {
+            eprintln!("skipped: sandbox-exec or curl missing");
+            return;
+        }
+        async fn server() -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                }
+            });
+            addr
+        }
+        let allowed = server().await;
+        let other = server().await;
+        let proxy = crate::egress::EgressProxy::start(
+            crate::egress::AllowList::new([symphony_core::config::HostPort::new(
+                "127.0.0.1",
+                allowed.port(),
+            )]),
+            None,
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["shell"]);
+        tools.shell.sandbox = SandboxMode::Seatbelt;
+        tools.shell.network = NetworkAccess::Proxy {
+            route: proxy.route(),
+            shim: None,
+        };
+        let curl = "curl -sS --fail --max-time 5";
+        let (out, code) = tools
+            .exec(&format!("{curl} http://{allowed}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("ok"), "{out}");
+        // Through the proxy, another target is refused ...
+        let (out, code) = tools
+            .exec(&format!("{curl} http://{other}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_ne!(code, Some(0), "{out}");
+        assert!(out.contains("403"), "{out}");
+        // ... and bypassing it is denied by the sandbox.
+        let (out, code) = tools
+            .exec(&format!("{curl} --noproxy '*' http://{other}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_ne!(code, Some(0), "{out}");
     }
 }

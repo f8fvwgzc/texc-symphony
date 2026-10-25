@@ -7,8 +7,11 @@ use crate::error::{Result, StoreError};
 use crate::store::Store;
 
 /// Env var naming the database file (`:memory:` for an in-memory database; empty, `off`,
-/// `none`, `disabled`, `false` or `0` to turn persistence off).
+/// `none`, `disabled`, `false` or `0` to turn persistence off; a `postgres://` URL works too).
 pub const ENV_DB_PATH: &str = "SYMPHONY_DB_PATH";
+/// Env var with a PostgreSQL connection string (`postgres://user:pass@host/db?sslmode=require`);
+/// wins over [`ENV_DB_PATH`].
+pub const ENV_DATABASE_URL: &str = "SYMPHONY_DATABASE_URL";
 /// Env var with the retention window in whole days (`0` keeps history forever).
 pub const ENV_RETENTION_DAYS: &str = "SYMPHONY_DB_RETENTION_DAYS";
 /// Env var with the payload retention window in whole days (`0` keeps payloads as long as the
@@ -28,7 +31,7 @@ pub const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Where the store keeps its data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StoreLocation {
     /// Persistence turned off ([`Store::disabled`]).
     Disabled,
@@ -36,6 +39,27 @@ pub enum StoreLocation {
     Memory,
     /// SQLite database file.
     File(PathBuf),
+    /// PostgreSQL connection string (its password is never printed).
+    Postgres(String),
+}
+
+impl std::fmt::Debug for StoreLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            Self::Memory => f.write_str("Memory"),
+            Self::File(path) => f.debug_tuple("File").field(path).finish(),
+            Self::Postgres(url) => f
+                .debug_tuple("Postgres")
+                .field(&crate::store::redact_url(url))
+                .finish(),
+        }
+    }
+}
+
+fn is_postgres_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("postgres://") || lower.starts_with("postgresql://")
 }
 
 /// Resolved store configuration.
@@ -67,13 +91,23 @@ impl StoreConfig {
 
     /// Like [`StoreConfig::from_env`] with an injectable variable lookup (for tests).
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<StoreConfig> {
-        let location = match lookup(ENV_DB_PATH) {
-            None => StoreLocation::File(PathBuf::from(DEFAULT_DB_PATH)),
-            Some(raw) => {
+        let url = lookup(ENV_DATABASE_URL)
+            .map(|raw| raw.trim().to_owned())
+            .filter(|raw| !raw.is_empty());
+        let location = match (url, lookup(ENV_DB_PATH)) {
+            (Some(url), _) if is_postgres_url(&url) => StoreLocation::Postgres(url),
+            (Some(_), _) => {
+                return Err(StoreError::InvalidConfig(format!(
+                    "{ENV_DATABASE_URL} must be a postgres:// or postgresql:// URL"
+                )));
+            }
+            (None, None) => StoreLocation::File(PathBuf::from(DEFAULT_DB_PATH)),
+            (None, Some(raw)) => {
                 let value = raw.trim();
                 match value.to_ascii_lowercase().as_str() {
                     "" | "off" | "none" | "disabled" | "false" | "0" => StoreLocation::Disabled,
                     ":memory:" => StoreLocation::Memory,
+                    _ if is_postgres_url(value) => StoreLocation::Postgres(value.to_owned()),
                     _ => StoreLocation::File(PathBuf::from(value)),
                 }
             }
@@ -101,6 +135,7 @@ impl StoreConfig {
             StoreLocation::Disabled => Ok(Store::disabled()),
             StoreLocation::Memory => Store::open_in_memory(),
             StoreLocation::File(path) => Store::open(path),
+            StoreLocation::Postgres(url) => Store::open_postgres(url),
         }
     }
 }
@@ -192,5 +227,25 @@ mod tests {
             let err = config(&[(ENV_RETENTION_DAYS, bad)]).unwrap_err();
             assert!(matches!(err, StoreError::InvalidConfig(_)), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn postgres_urls_select_postgres_and_hide_the_password() {
+        let url = "postgres://symphony:s3cret@db.internal:5432/symphony?sslmode=require";
+        let cfg = config(&[(ENV_DATABASE_URL, url), (ENV_DB_PATH, "/ignored.db")]).unwrap();
+        assert_eq!(cfg.location, StoreLocation::Postgres(url.into()));
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(shown.contains("db.internal"), "{shown}");
+        let cfg = config(&[(ENV_DB_PATH, "postgresql://u@h/db")]).unwrap();
+        assert_eq!(
+            cfg.location,
+            StoreLocation::Postgres("postgresql://u@h/db".into())
+        );
+        assert!(config(&[(ENV_DATABASE_URL, "mysql://x")]).is_err());
+        assert_eq!(
+            crate::store::redact_url("host=db user=u password=secret dbname=s"),
+            "host=db user=u password=*** dbname=s"
+        );
     }
 }

@@ -1,3 +1,4 @@
+{{- if le (int .Values.replicaCount) 1 }}
 {{- range $name, $volume := dict "data" .Values.persistence.data "workspaces" .Values.persistence.workspaces }}
 ---
 apiVersion: v1
@@ -14,4 +15,5 @@ spec:
   resources:
     requests:
       storage: {{ $volume.size }}
+{{- end }}
 {{- end }}

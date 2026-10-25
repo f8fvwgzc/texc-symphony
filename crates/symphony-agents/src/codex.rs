@@ -79,6 +79,13 @@ impl AgentBackend for CodexBackend {
         {
             options = options.with_env(CODEX_LLM_KEY_ENV, key);
         }
+        // Advisory for Codex (it is not sandboxed by Symphony): the kernel-level boundary is the
+        // pod's NetworkPolicy.
+        if let Some(route) = options.egress.clone() {
+            for (name, value) in crate::egress::proxy_env(&route.proxy_url()) {
+                options = options.with_task_env(name, value);
+            }
+        }
         let session = AppServerSession::start(options).await?;
         Ok(Box::new(CodexSession { session }))
     }

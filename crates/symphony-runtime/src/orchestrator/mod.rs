@@ -66,23 +66,35 @@ use crate::workspace::{WorkspaceManager, worker_hosts};
 /// Writes kill-switch changes to the store from one task, in order, retrying while the store is
 /// busy, so an acknowledged pause also holds after a restart. A newer change replaces a pending
 /// older one, so an old retry can never overwrite the latest state.
-fn spawn_pause_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Option<String>> {
+/// `in_flight` counts changes not yet written (another replica's change is adopted only when it is
+/// zero, so a pending local change is never undone).
+fn spawn_pause_writer(
+    store: symphony_store::Store,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+) -> mpsc::UnboundedSender<Option<String>> {
+    use std::sync::atomic::Ordering;
     let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
     tokio::spawn(async move {
         while let Some(mut reason) = rx.recv().await {
             let mut delay = Duration::from_millis(50);
+            let mut taken = 1;
             loop {
                 while let Ok(newer) = rx.try_recv() {
                     reason = newer;
+                    taken += 1;
                 }
                 match store.set_control(PAUSED_CONTROL_KEY, reason.clone()).await {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        in_flight.fetch_sub(taken, Ordering::SeqCst);
+                        break;
+                    }
                     Err(symphony_store::StoreError::Busy) => {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_secs(5));
                     }
                     Err(err) => {
                         tracing::error!("Failed to persist the kill switch: {err}");
+                        in_flight.fetch_sub(taken, Ordering::SeqCst);
                         break;
                     }
                 }
@@ -91,6 +103,11 @@ fn spawn_pause_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Opt
     });
     tx
 }
+
+/// How long a dispatch lease lives without renewal (a dead replica's work is recovered after it).
+pub const LEASE_TTL: Duration = Duration::from_secs(60);
+/// How often held leases are renewed (and, with a shared store, dead replicas' work recovered).
+pub const LEASE_RENEW_EVERY: Duration = Duration::from_secs(15);
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
@@ -103,6 +120,7 @@ pub(crate) enum TimerEvent {
     Tick { token: u64 },
     RunPollCycle,
     RetryDue { issue_id: String, token: u64 },
+    LeaseRenew,
 }
 
 /// `refresh_issue_for_dispatch/1` outcome.
@@ -140,6 +158,8 @@ pub(crate) struct Orchestrator<'w> {
     task_writes: mpsc::UnboundedSender<TaskWrite>,
     /// Kill-switch changes, persisted in order by [`spawn_pause_writer`].
     pause_writes: mpsc::UnboundedSender<Option<String>>,
+    /// Kill-switch changes sent but not written yet.
+    pause_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A task status change for the store.
@@ -154,6 +174,12 @@ pub(crate) enum TaskWrite {
     Release {
         id: i64,
         reason: String,
+    },
+    /// A task's dispatch lease, released after its status writes (a replica recovering tasks
+    /// must not see it `running` without a lease).
+    DropLease {
+        key: String,
+        owner: String,
     },
 }
 
@@ -178,6 +204,9 @@ fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Task
                         .map(drop),
                     TaskWrite::Release { id, reason } => {
                         store.release_task(*id, reason.clone()).await.map(drop)
+                    }
+                    TaskWrite::DropLease { key, owner } => {
+                        store.release_lease(key.clone(), owner.clone()).await
                     }
                 };
                 match result {
@@ -208,7 +237,8 @@ impl<'w> Orchestrator<'w> {
         let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
-        let pause_writes = spawn_pause_writer(ctx.store.clone());
+        let pause_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pause_writes = spawn_pause_writer(ctx.store.clone(), Arc::clone(&pause_in_flight));
         Self {
             state: State::new(&settings),
             ctx,
@@ -223,6 +253,7 @@ impl<'w> Orchestrator<'w> {
             tokens: Counter::default(),
             task_writes: spawn_task_writer(ctx_store),
             pause_writes,
+            pause_in_flight,
         }
     }
 
@@ -285,11 +316,21 @@ impl<'w> Orchestrator<'w> {
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
         self.restore_spend().await;
+        // A restarted replica with a stable id owns no work any more.
+        if let Err(err) = self
+            .ctx
+            .store
+            .release_owner_leases(self.ctx.replica_id.clone())
+            .await
+        {
+            tracing::warn!("Failed to drop the leases of the previous process: {err}");
+        }
         match self.ctx.store.requeue_interrupted_tasks().await {
             Ok(0) => {}
             Ok(count) => tracing::info!("Queued {count} tasks interrupted by the previous process"),
             Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
         }
+        self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -380,6 +421,128 @@ impl<'w> Orchestrator<'w> {
             TimerEvent::RetryDue { issue_id, token } => {
                 self.handle_retry_due(&issue_id, token).await
             }
+            TimerEvent::LeaseRenew => self.renew_leases().await,
+        }
+    }
+
+    // ----- dispatch leases -------------------------------------------------------------------
+
+    /// Takes the dispatch lease of `issue_id` (kept while the issue is claimed). `false` when
+    /// another live replica holds it or the store cannot be reached (dispatch then waits).
+    pub(crate) async fn take_lease(&mut self, issue_id: &str) -> bool {
+        if self.state.leases.contains(issue_id) {
+            return true;
+        }
+        match self
+            .ctx
+            .store
+            .acquire_lease(issue_id, self.ctx.replica_id.clone(), LEASE_TTL)
+            .await
+        {
+            Ok(true) => {
+                self.state.leases.insert(issue_id.to_owned());
+                true
+            }
+            Ok(false) => {
+                tracing::debug!("Not dispatching issue_id={issue_id}: another replica holds it");
+                false
+            }
+            Err(err) => {
+                tracing::warn!("Not dispatching issue_id={issue_id}: lease failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// Gives up the lease of `issue_id` if this replica holds it.
+    pub(crate) fn drop_lease(&mut self, issue_id: &str) {
+        if !self.state.leases.remove(issue_id) {
+            return;
+        }
+        if task_id(issue_id).is_some() {
+            let _ = self.task_writes.send(TaskWrite::DropLease {
+                key: issue_id.to_owned(),
+                owner: self.ctx.replica_id.clone(),
+            });
+        } else {
+            self.ctx
+                .store
+                .release_lease(issue_id, self.ctx.replica_id.clone())
+                .detach();
+        }
+    }
+
+    /// Renews every held lease; with a shared store, also recovers the runs and tasks of
+    /// replicas whose leases expired. Re-arms itself.
+    pub(crate) async fn renew_leases(&mut self) {
+        let keys: Vec<String> = self.state.leases.iter().cloned().collect();
+        if !keys.is_empty() {
+            match self
+                .ctx
+                .store
+                .renew_leases(self.ctx.replica_id.clone(), keys.clone(), LEASE_TTL)
+                .await
+            {
+                Ok(held) if held < keys.len() as u64 => tracing::warn!(
+                    "Lost {} of {} dispatch leases (expired and taken by another replica)",
+                    keys.len() as u64 - held,
+                    keys.len()
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::warn!("Failed to renew dispatch leases: {err}"),
+            }
+        }
+        if self.ctx.store.is_shared() {
+            self.sync_kill_switch().await;
+            self.enforce_spend().await;
+            self.recover_orphans().await;
+        }
+        self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
+    }
+
+    /// Adopts a kill-switch change another replica made (shared store), unless a local change is
+    /// still being written.
+    pub(crate) async fn sync_kill_switch(&mut self) {
+        if self
+            .pause_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return;
+        }
+        let stored = match self.ctx.store.control(PAUSED_CONTROL_KEY).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                tracing::warn!("Failed to read the kill switch: {err}");
+                return;
+            }
+        };
+        if stored == self.state.spend.paused {
+            return;
+        }
+        match &stored {
+            Some(reason) => tracing::warn!("Kill switch engaged by another replica: {reason}"),
+            None => tracing::info!("Kill switch released by another replica; dispatch resumes"),
+        }
+        let resumed = stored.is_none();
+        self.state.spend.paused = stored;
+        if resumed {
+            self.schedule_tick(Duration::ZERO);
+        }
+        self.notify();
+    }
+
+    /// Closes runs and re-queues tasks whose process is gone (no live lease).
+    pub(crate) async fn recover_orphans(&mut self) {
+        match self.ctx.store.mark_interrupted_runs().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Closed {count} runs of stopped replicas"),
+            Err(err) => tracing::warn!("Failed to close interrupted runs: {err}"),
+        }
+        match self.ctx.store.requeue_interrupted_tasks().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Queued {count} tasks of stopped replicas again"),
+            Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
         }
     }
 
@@ -499,6 +662,8 @@ impl<'w> Orchestrator<'w> {
                 Some(reason) => tracing::warn!("Kill switch engaged: {reason}"),
                 None => tracing::info!("Kill switch released; dispatch resumes"),
             }
+            self.pause_in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = self.pause_writes.send(reason.clone());
             self.state.spend.paused = reason.clone();
             if reason.is_none() {

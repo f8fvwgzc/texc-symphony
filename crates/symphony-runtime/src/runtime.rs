@@ -84,6 +84,8 @@ pub struct RuntimeOptions {
     pub startup_cleanup_concurrency: usize,
     /// Orchestrator restart budget.
     pub restart_policy: RestartPolicy,
+    /// Replica id for dispatch leases (see [`RuntimeOptions::with_replica_id`]).
+    pub replica_id: Option<String>,
 }
 
 impl std::fmt::Debug for RuntimeOptions {
@@ -121,7 +123,15 @@ impl RuntimeOptions {
             worker_cancel_grace: DEFAULT_WORKER_CANCEL_GRACE,
             startup_cleanup_concurrency: DEFAULT_STARTUP_CLEANUP_CONCURRENCY,
             restart_policy: RestartPolicy::default(),
+            replica_id: None,
         }
+    }
+
+    /// Names this process in dispatch leases (default: `SYMPHONY_REPLICA_ID`, else `local` for a
+    /// SQLite store and `<host>-<pid>-<random>` for a shared PostgreSQL store).
+    pub fn with_replica_id(mut self, id: impl Into<String>) -> Self {
+        self.replica_id = Some(id.into());
+        self
     }
 
     /// Persists runs to `store`.
@@ -166,6 +176,30 @@ pub(crate) struct RuntimeContext {
     pub worker_cancel_grace: Duration,
     pub startup_cleanup_concurrency: usize,
     pub generation: watch::Sender<u64>,
+    /// This process in dispatch leases.
+    pub replica_id: String,
+}
+
+/// Env var that names this replica in dispatch leases (a stable id, such as a StatefulSet pod
+/// name, lets a restarted replica recover its own interrupted work at once).
+pub const ENV_REPLICA_ID: &str = "SYMPHONY_REPLICA_ID";
+
+fn default_replica_id(store: &Store) -> String {
+    if let Some(id) = std::env::var(ENV_REPLICA_ID)
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+    {
+        return id;
+    }
+    if !store.is_shared() {
+        return "local".to_owned();
+    }
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "symphony".to_owned());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    format!("{host}-{}-{nanos:08x}", std::process::id())
 }
 
 impl RuntimeContext {
@@ -189,6 +223,10 @@ impl RuntimeContext {
             worker_cancel_grace: options.worker_cancel_grace,
             startup_cleanup_concurrency: options.startup_cleanup_concurrency.max(1),
             generation,
+            replica_id: options
+                .replica_id
+                .clone()
+                .unwrap_or_else(|| default_replica_id(&options.store)),
         }
     }
 }

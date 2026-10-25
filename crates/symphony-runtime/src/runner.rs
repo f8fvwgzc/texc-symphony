@@ -14,8 +14,12 @@
 //! `after_run` runs whenever the workspace exists: after success, after a failure, and — unlike Elixir
 //! (G4) — also when the orchestrator cancels the run (bounded by the cancellation grace period). It
 //! does not run if the worker is aborted outright or panics.
+//!
+//! With `isolation:` a task run is isolated ([`crate::isolation`]): its own uid, a repository
+//! token of its own and a default-deny network, set up before the clone and torn down with the run.
 
 // Modified 2026-10-25: runs every backend through symphony_agents::AgentBackend; task runs (Part B).
+// Modified 2026-10-26: task isolation (uid, repository token, egress proxy).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +37,7 @@ use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
 use crate::agents;
+use crate::isolation::{self, TaskIsolation};
 use crate::process::{EnvPolicy, run_captured};
 use crate::ssh::{SshConfig, SshLauncher};
 use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
@@ -244,6 +249,11 @@ impl AgentRunner {
         let context = issue_log(&ctx.issue);
         tracing::info!("Starting agent run for {context} worker_host={host_log}");
         tracing::info!("Starting worker attempt for {context} worker_host={host_log}");
+        // Isolation applies to task runs only, and a run that cannot be isolated never starts.
+        let isolation_settings = ctx.task.as_ref().and(settings.isolation.as_ref());
+        if let Some(isolation_settings) = isolation_settings {
+            isolation::preflight(isolation_settings, worker_host)?;
+        }
 
         let workspaces = self.workspace_manager(&settings);
         let issue_context = IssueContext::from(&ctx.issue);
@@ -255,10 +265,26 @@ impl AgentRunner {
         ctx.reporter.runtime_info(worker_host, &workspace);
 
         let body = async {
+            let isolation = match (&ctx.task, isolation_settings) {
+                (Some(task), Some(isolation_settings)) => Some(
+                    TaskIsolation::prepare(
+                        &settings,
+                        isolation_settings,
+                        task,
+                        std::path::Path::new(&workspace),
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
             if let Some(task) = &ctx.task {
-                prepare_task_workspace(&settings, &workspace, task).await?;
+                let cloned =
+                    prepare_task_workspace(&settings, &workspace, task, isolation.as_ref()).await?;
+                if let Some(isolation) = &isolation {
+                    isolation.finish_workspace(std::path::Path::new(&workspace), cloned)?;
+                }
             }
-            self.run_in_workspace(ctx, &settings, &workspaces, &workspace)
+            self.run_in_workspace(ctx, &settings, &workspaces, &workspace, isolation.as_ref())
                 .await
         };
         let limit = ctx
@@ -306,6 +332,7 @@ impl AgentRunner {
         settings: &Arc<Settings>,
         workspaces: &WorkspaceManager,
         workspace: &str,
+        isolation: Option<&TaskIsolation>,
     ) -> WorkerResult {
         let worker_host = ctx.worker_host.as_deref();
         workspaces
@@ -340,6 +367,9 @@ impl AgentRunner {
         for (name, value) in &self.options.codex_env {
             options = options.with_env(name.clone(), value.clone());
         }
+        if let Some(isolation) = isolation {
+            options = isolation.apply(options);
+        }
 
         let mut session = backend.start(options).await?;
         // Recorded while it runs, so a Symphony restarted after a hard kill can stop it.
@@ -352,7 +382,13 @@ impl AgentRunner {
             _ => None,
         };
         let result = self
-            .run_turns(session.as_mut(), ctx, workspace, &backend_settings)
+            .run_turns(
+                session.as_mut(),
+                ctx,
+                workspace,
+                &backend_settings,
+                isolation,
+            )
             .await;
         session.stop().await;
         result
@@ -364,17 +400,26 @@ impl AgentRunner {
         ctx: &WorkerContext,
         workspace: &str,
         backend: &BackendSettings,
+        isolation: Option<&TaskIsolation>,
     ) -> WorkerResult {
         if let Some(task) = &ctx.task {
             let prompt = wrap_prompt(backend, task.prompt.clone(), &ctx.issue, ctx.attempt)?;
-            let outcome = session.run_turn(&prompt, &ctx.issue, &ctx.events).await?;
+            // The task's own token never leaves the run in an event or its result.
+            let events = match isolation {
+                Some(isolation) => isolation.redacted_events(&ctx.events),
+                None => ctx.events.clone(),
+            };
+            let outcome = session.run_turn(&prompt, &ctx.issue, &events).await?;
             tracing::info!(
                 "Completed task run for {} session_id={} workspace={workspace}",
                 issue_log(&ctx.issue),
                 outcome.session_id
             );
-            ctx.reporter
-                .task_result(outcome.final_message.as_deref().unwrap_or_default());
+            let result = outcome.final_message.as_deref().unwrap_or_default();
+            match isolation.and_then(TaskIsolation::redactor) {
+                Some(redactor) => ctx.reporter.task_result(&redactor.redact_str(result)),
+                None => ctx.reporter.task_result(result),
+            }
             return Ok(());
         }
         let max_turns = self
@@ -435,14 +480,18 @@ fn wrap_prompt(
 }
 
 /// Clones the task's repository into its fresh workspace (nothing to do without a repository or
-/// when the workspace already holds files from an earlier run of the task).
+/// when the workspace already holds files from an earlier run of the task); `true` when it cloned.
+///
+/// Under isolation the clone runs as the task uid with `HOME=<workspace>/.home`, and a repository
+/// on the GitHub App's host is cloned over https with the task's token (from the environment).
 async fn prepare_task_workspace(
     settings: &Settings,
     workspace: &str,
     task: &TaskSpec,
-) -> Result<(), RunError> {
+    isolation: Option<&TaskIsolation>,
+) -> Result<bool, RunError> {
     let Some(repo) = &task.repo else {
-        return Ok(());
+        return Ok(false);
     };
     if !symphony_core::task::valid_repo_url(repo)
         || task
@@ -461,8 +510,10 @@ async fn prepare_task_workspace(
         .map_err(|err| RunError::TaskClone(err.to_string()))?
         .is_some()
     {
-        return Ok(());
+        return Ok(false);
     }
+    let credentials = isolation.and_then(TaskIsolation::credentials);
+    let url = credentials.map_or_else(|| repo.clone(), |c| c.clone_url());
     let mut command = tokio::process::Command::new("git");
     // Only network transports: `ext::`, `file://` and friends stay disabled.
     command
@@ -482,8 +533,11 @@ async fn prepare_task_workspace(
     if let Some(branch) = &task.branch {
         command.args(["--branch", branch]);
     }
-    command.args(["--", repo, "."]);
+    command.args(["--", url.as_str(), "."]);
     EnvPolicy::strip(settings.secret_environment_names()).apply(&mut command);
+    if let Some(isolation) = isolation {
+        isolation.apply_to_command(&mut command);
+    }
     let output = run_captured(command, TASK_CLONE_TIMEOUT)
         .await
         .map_err(|err| RunError::TaskClone(err.to_string()))?;
@@ -497,13 +551,16 @@ async fn prepare_task_workspace(
             .into_iter()
             .rev()
             .collect();
+        let tail = match isolation.and_then(TaskIsolation::redactor) {
+            Some(redactor) => redactor.redact_str(tail.trim()).into_owned(),
+            None => tail.trim().to_owned(),
+        };
         return Err(RunError::TaskClone(format!(
-            "git clone exited {}: {}",
-            output.status,
-            tail.trim()
+            "git clone exited {}: {tail}",
+            output.status
         )));
     }
-    Ok(())
+    Ok(true)
 }
 
 fn issue_log(issue: &Issue) -> String {
