@@ -11,7 +11,7 @@
 //!   next UTC day; the kill switch does the same until it is released. Stopped agents release
 //!   their claims, so they are dispatched again normally once spending is allowed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use symphony_core::config::BudgetSettings;
@@ -111,6 +111,22 @@ pub(crate) struct Spend {
     day: Option<NaiveDate>,
     today: Usage,
     issues: HashMap<String, Usage>,
+    /// Issues whose stored history has been merged into `issues`.
+    seeded: HashSet<String>,
+}
+
+/// Prefixes of the block errors an exhausted issue budget leaves (see [`Spend::issue_stop`]).
+const ISSUE_BUDGET_ERRORS: [&str; 2] = [
+    "issue token budget exhausted",
+    "issue cost budget exhausted",
+];
+
+/// `true` when a blocked issue's `error` says its budget ran out (it is released once the
+/// budget allows it again).
+pub(crate) fn is_issue_budget_error(error: &str) -> bool {
+    ISSUE_BUDGET_ERRORS
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
 }
 
 impl Spend {
@@ -120,19 +136,26 @@ impl Spend {
         self.today = usage;
     }
 
-    /// `true` once the issue's history has been loaded (or counted from scratch).
+    /// `true` once the issue's stored history has been merged in.
     pub(crate) fn knows_issue(&self, issue_id: &str) -> bool {
-        self.issues.contains_key(issue_id)
+        self.seeded.contains(issue_id)
     }
 
-    /// Starts an issue's counters at its stored history (kept if already known).
+    /// Merges an issue's stored history into its counters. The store also holds the runs this
+    /// process recorded, so the larger of the two counts wins instead of adding them.
     pub(crate) fn seed_issue(&mut self, issue_id: &str, usage: Usage) {
-        self.issues.entry(issue_id.to_owned()).or_insert(usage);
+        if !self.seeded.insert(issue_id.to_owned()) {
+            return;
+        }
+        let counters = self.issues.entry(issue_id.to_owned()).or_default();
+        counters.tokens = counters.tokens.max(usage.tokens);
+        counters.cost_micro_usd = counters.cost_micro_usd.max(usage.cost_micro_usd);
     }
 
     /// Forgets an issue's counters (it left the active set; history is reloaded if it returns).
     pub(crate) fn forget_issue(&mut self, issue_id: &str) {
         self.issues.remove(issue_id);
+        self.seeded.remove(issue_id);
     }
 
     fn roll(&mut self, now: DateTime<Utc>) {
@@ -287,6 +310,43 @@ mod tests {
         );
         spend.forget_issue("i-1");
         assert!(!spend.knows_issue("i-1"));
+    }
+
+    #[test]
+    fn history_is_merged_even_after_usage_was_counted() {
+        let now = Utc::now();
+        let mut spend = Spend::default();
+        // Usage counted before any per-issue budget existed (no history loaded yet).
+        spend.record("i-1", 10, 0, now);
+        assert!(!spend.knows_issue("i-1"));
+        // The store holds earlier runs plus this one.
+        spend.seed_issue(
+            "i-1",
+            Usage {
+                tokens: 950,
+                cost_micro_usd: 7,
+            },
+        );
+        assert!(spend.knows_issue("i-1"));
+        assert_eq!(
+            spend.issue("i-1"),
+            Usage {
+                tokens: 950,
+                cost_micro_usd: 7
+            }
+        );
+        spend.seed_issue(
+            "i-1",
+            Usage {
+                tokens: 5,
+                cost_micro_usd: 0,
+            },
+        );
+        assert_eq!(spend.issue("i-1").tokens, 950, "seeded once");
+        assert!(is_issue_budget_error(
+            "issue token budget exhausted: 1 of 1 tokens used"
+        ));
+        assert!(!is_issue_budget_error("codex turn requires approval"));
     }
 
     #[test]

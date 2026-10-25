@@ -5,9 +5,10 @@ Symphony is one self-contained binary (`symphony`) with the web dashboard embedd
 it as a plain binary, in Docker, and under systemd, plus reverse proxies, backups and upgrades.
 
 > [!WARNING]
-> Symphony runs coding agents unattended, and its HTTP API has no authentication. Run it in a
-> trusted environment, keep the HTTP port on loopback or behind an authenticating proxy, and give
-> agents only the credentials they need.
+> Symphony runs coding agents unattended. Run it in a trusted environment and give agents only the
+> credentials they need. The HTTP API needs a bearer token (`server.api_token` or
+> `SYMPHONY_API_TOKEN`) on any non-loopback bind; Symphony refuses to start without one. Do not put
+> an HTTP basic-auth proxy in front: it uses the same `Authorization` header as the token.
 
 ## Command line and environment
 
@@ -40,7 +41,9 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 
 The HTTP server serves the dashboard at `/`, the API under `/api/v1` (see
 [`api/README.md`](api/README.md)) and a liveness probe at `GET /api/v1/health`, which never touches
-the orchestrator and needs no token.
+the orchestrator and needs no token. The `Host` allow-list still applies to it: a probe from
+outside the container must use a loopback name or one listed in `server.allowed_hosts` (a
+`0.0.0.0` bind host is not added to the list).
 
 **Exposure.** Symphony refuses to bind a non-loopback address unless an API token is configured
 (`server.api_token` or `SYMPHONY_API_TOKEN`). With a token, every other `/api/*` call needs

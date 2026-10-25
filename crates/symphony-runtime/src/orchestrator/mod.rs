@@ -63,6 +63,28 @@ use crate::tracker::FetchError;
 use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerMessage, WorkerResult};
 use crate::workspace::{WorkspaceManager, worker_hosts};
 
+/// Writes the kill switch to the store, retrying while the store is busy, so an acknowledged
+/// pause also holds after a restart.
+fn persist_pause(store: symphony_store::Store, reason: Option<String>) {
+    tokio::spawn(async move {
+        let mut delay = Duration::from_millis(50);
+        for _ in 0..10 {
+            match store.set_control(PAUSED_CONTROL_KEY, reason.clone()).await {
+                Ok(()) => return,
+                Err(symphony_store::StoreError::Busy) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+                Err(err) => {
+                    tracing::error!("Failed to persist the kill switch: {err}");
+                    return;
+                }
+            }
+        }
+        tracing::error!("Failed to persist the kill switch: the store stayed busy");
+    });
+}
+
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
 /// Bound on waiting for an aborted worker to be dropped.
@@ -386,10 +408,7 @@ impl<'w> Orchestrator<'w> {
                 Some(reason) => tracing::warn!("Kill switch engaged: {reason}"),
                 None => tracing::info!("Kill switch released; dispatch resumes"),
             }
-            self.ctx
-                .store
-                .set_control(PAUSED_CONTROL_KEY, reason.clone())
-                .detach();
+            persist_pause(self.ctx.store.clone(), reason.clone());
             self.state.spend.paused = reason.clone();
             if reason.is_none() {
                 self.schedule_tick(Duration::ZERO);

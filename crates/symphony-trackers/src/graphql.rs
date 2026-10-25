@@ -142,9 +142,14 @@ enum Selection {
     Inline(Vec<Selection>),
 }
 
+/// Deepest selection-set / fragment nesting accepted (deeper documents are refused instead of
+/// risking the stack of the orchestrator process).
+pub const MAX_DEPTH: usize = 64;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -208,6 +213,16 @@ impl Parser {
     }
 
     fn selection_set(&mut self) -> Result<Vec<Selection>, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return error(format!("selections nested deeper than {MAX_DEPTH}"));
+        }
+        let result = self.selection_set_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn selection_set_inner(&mut self) -> Result<Vec<Selection>, ParseError> {
         self.expect_punct("{")?;
         let mut selections = Vec::new();
         loop {
@@ -255,6 +270,9 @@ fn root_fields(
     visiting: &mut HashSet<String>,
     out: &mut Vec<String>,
 ) -> Result<(), ParseError> {
+    if visiting.len() > MAX_DEPTH {
+        return error(format!("fragments nested deeper than {MAX_DEPTH}"));
+    }
     for selection in selections {
         match selection {
             Selection::Field(name) => out.push(name.clone()),
@@ -279,6 +297,7 @@ pub fn summarize(document: &str) -> Result<DocumentSummary, ParseError> {
     let mut parser = Parser {
         tokens: tokenize(document)?,
         pos: 0,
+        depth: 0,
     };
     let mut fragments = HashMap::new();
     let mut mutations = Vec::new();
@@ -340,6 +359,30 @@ mod tests {
 
     fn mutations(document: &str) -> Vec<String> {
         summarize(document).unwrap().mutation_fields
+    }
+
+    #[test]
+    fn deeply_nested_documents_are_refused_not_recursed() {
+        let deep = format!(
+            "mutation {{ {}x{} }}",
+            "a { ".repeat(10_000),
+            " }".repeat(10_000)
+        );
+        assert!(summarize(&deep).is_err());
+        let ok = format!(
+            "mutation {{ {}x{} }}",
+            "a { ".repeat(MAX_DEPTH - 2),
+            " }".repeat(MAX_DEPTH - 2)
+        );
+        assert_eq!(
+            summarize(&ok).unwrap().mutation_fields,
+            vec!["a".to_owned()]
+        );
+        let fragments: String = (0..200)
+            .map(|i| format!("fragment F{i} on Mutation {{ ...F{} }} ", i + 1))
+            .collect();
+        let chain = format!("mutation {{ ...F0 }} {fragments} fragment F200 on Mutation {{ x }}");
+        assert!(summarize(&chain).is_err());
     }
 
     #[test]

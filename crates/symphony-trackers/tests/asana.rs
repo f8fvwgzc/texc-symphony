@@ -606,6 +606,19 @@ fn asana_api_scope_classifies_paths() {
             Some(json!({"data": {"projects": ["other"]}})),
             "body_out_of_scope",
         ),
+        // Listing the configured project next to another one would file the task there too.
+        (
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"projects": ["project-1", "other"]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"projects": []}})),
+            "body_out_of_scope",
+        ),
         (Method::Get, "/tasks", None, "body_out_of_scope"),
         (Method::Get, "/users/me", None, "path_out_of_scope"),
         (

@@ -344,7 +344,10 @@ fn scope_search(call: &mut RestCall, key: &str) -> Result<(), Denied> {
     let Some(slot) = slot else {
         return Err(missing());
     };
-    let Some(jql) = slot.as_str().filter(|jql| jql_names_project(jql, key)) else {
+    let Some(jql) = slot
+        .as_str()
+        .filter(|jql| jql_balanced(jql) && jql_names_project(jql, key))
+    else {
         return Err(missing());
     };
     *slot = Value::String(scoped_jql(jql, key));
@@ -422,6 +425,25 @@ pub fn jql_names_project(jql: &str, key: &str) -> bool {
                 _ => false,
             }
     })
+}
+
+/// `true` when the JQL's parentheses (outside string literals) balance and never close more than
+/// they opened, so [`scoped_jql`]'s wrapper cannot be escaped with a stray `)`.
+pub fn jql_balanced(jql: &str) -> bool {
+    let mut depth = 0i64;
+    for (_, token) in jql_tokens(jql) {
+        match token {
+            JqlToken::Punct('(') => depth += 1,
+            JqlToken::Punct(')') => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// `project = "KEY" AND (<jql>)`, keeping a top-level `ORDER BY` clause at the end.
@@ -749,6 +771,15 @@ impl Tracker for JiraTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbalanced_jql_cannot_escape_the_project_wrapper() {
+        assert!(jql_balanced("project = SYM AND (status = Open)"));
+        assert!(jql_balanced("summary ~ \"a ) b\" AND project = SYM"));
+        assert!(!jql_balanced("project = SYM) OR (project = OTHER"));
+        assert!(!jql_balanced("project = SYM AND (status = Open"));
+        assert!(!jql_balanced(")("));
+    }
 
     #[test]
     fn jql_quotes_and_escapes() {
