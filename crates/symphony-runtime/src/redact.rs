@@ -44,7 +44,8 @@ pub static PATTERNS: LazyLock<Regex> = LazyLock::new(|| {
         r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
         r"\b[0-9]/[0-9]{10,}:[0-9a-f]{20,}\b",
         r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
-        r#"(?P<assign>(?i:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|passwd|client[_-]?secret)["']?\s*[:=]\s*["']?)[^\s"',;&]{6,}"#,
+        // `\\?`: the quotes may be JSON-escaped (`password=\"...\"` inside a JSON string).
+        r#"(?P<assign>(?i:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password|passwd|client[_-]?secret)\\?["']?\s*[:=]\s*\\?["']?)[^\s"'\\,;&]{6,}"#,
     ];
     // The patterns are literals tested below; failing to compile them is a programming error.
     #[allow(clippy::expect_used)]

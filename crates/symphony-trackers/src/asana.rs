@@ -300,13 +300,88 @@ pub enum ScopeTarget {
     Section(String),
 }
 
-/// The static part of the `asana_api` scope (see the module docs); task and section targets still
-/// need [`AsanaTracker`]'s membership lookup.
+/// Task gids the body of `call` names at `pointers` (strings, or arrays of strings); each must be
+/// a task of the project as well.
+fn body_tasks(call: &RestCall, pointers: &[&str]) -> Vec<ScopeTarget> {
+    let Some(body) = call.body.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pointer in pointers {
+        match body.pointer(pointer) {
+            Some(Value::String(gid)) => out.push(ScopeTarget::Task(gid.clone())),
+            Some(Value::Array(items)) => out.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().or_else(|| item.pointer("/gid")?.as_str()))
+                    .map(|gid| ScopeTarget::Task(gid.to_owned())),
+            ),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// `data.projects` and `data.memberships[].project` must name only `project` (absent is fine
+/// unless `required`).
+fn projects_ok(call: &RestCall, project: &str, required: bool) -> bool {
+    let body = call.body.as_ref();
+    let projects = scope::string_array(body, "/data/projects");
+    let memberships: Vec<Option<&str>> = body
+        .and_then(|b| b.pointer("/data/memberships"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|m| {
+                    m.pointer("/project")
+                        .and_then(|p| p.as_str().or_else(|| p.pointer("/gid")?.as_str()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let raw_projects = body
+        .and_then(|b| b.pointer("/data/projects"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if raw_projects != projects.len() || memberships.iter().any(Option::is_none) {
+        return false; // entries that are not plain gids cannot be checked
+    }
+    let named = projects.len() + memberships.len();
+    (named > 0 || !required)
+        && projects.iter().all(|p| *p == project)
+        && memberships.iter().flatten().all(|p| *p == project)
+}
+
+/// The static part of the `asana_api` scope (see the module docs). The returned targets (the task
+/// or section of the path, and every task the body names: `data.task`, `data.parent`,
+/// `data.insert_before`/`insert_after`, `data.dependencies`/`dependents`) still need
+/// [`AsanaTracker`]'s membership lookup; all of them must belong to the project.
 pub fn check_scope(
     settings: &AsanaSettings,
     call: &RestCall,
     policy: &AgentToolSettings,
-) -> Result<ScopeTarget, Denied> {
+) -> Result<Vec<ScopeTarget>, Denied> {
+    let mut targets = check_path(settings, call, policy)?;
+    targets.extend(body_tasks(
+        call,
+        &[
+            "/data/task",
+            "/data/parent",
+            "/data/insert_before",
+            "/data/insert_after",
+            "/data/dependencies",
+            "/data/dependents",
+        ],
+    ));
+    Ok(targets)
+}
+
+fn check_path(
+    settings: &AsanaSettings,
+    call: &RestCall,
+    policy: &AgentToolSettings,
+) -> Result<Vec<ScopeTarget>, Denied> {
     let segments = scope::split_path(TOOL.name, &call.path)?;
     scope::refuse_encoded_slashes(TOOL.name, &segments)?;
     let project = &settings.project_gid;
@@ -316,16 +391,12 @@ pub fn check_scope(
             if !policy.allow_admin_paths && scope::matches_admin(rest, ADMIN_SUBPATHS) {
                 return Err(scope::admin_path(TOOL.name, &call.path));
             }
-            Ok(ScopeTarget::Project)
+            Ok(vec![ScopeTarget::Project])
         }
         [tasks] if tasks.is("tasks") => {
-            let projects = scope::string_array(call.body.as_ref(), "/data/projects");
             // Exactly the configured project: extra entries would file the task elsewhere too.
-            if call.method == Method::Post
-                && !projects.is_empty()
-                && projects.iter().all(|p| *p == project.as_str())
-            {
-                Ok(ScopeTarget::Project)
+            if call.method == Method::Post && projects_ok(call, project, true) {
+                Ok(vec![ScopeTarget::Project])
             } else {
                 Err(Denied::new(
                     "body_out_of_scope",
@@ -355,11 +426,24 @@ pub fn check_scope(
                     ));
                 }
             }
-            Ok(ScopeTarget::Task(gid.decoded.clone()))
+            // A subtask must not be filed into other projects either.
+            if rest.first().is_some_and(|s| s.is("subtasks"))
+                && call.method == Method::Post
+                && !projects_ok(call, project, false)
+            {
+                return Err(Denied::new(
+                    "body_out_of_scope",
+                    format!(
+                        "`{}` may only create subtasks without projects or in project {project}.",
+                        TOOL.name
+                    ),
+                ));
+            }
+            Ok(vec![ScopeTarget::Task(gid.decoded.clone())])
         }
         [sections, gid, rest @ ..] if sections.is("sections") => {
             scope::check_scope_root(TOOL.name, rest, call.method, policy, "a section")?;
-            Ok(ScopeTarget::Section(gid.decoded.clone()))
+            Ok(vec![ScopeTarget::Section(gid.decoded.clone())])
         }
         _ => Err(scope::out_of_scope(
             TOOL.name,
@@ -508,16 +592,18 @@ impl Tracker for AsanaTracker {
             Err(err) => return TOOL.client_error(&err),
         };
         let policy = &ctx.settings.agent_tools;
-        let target = match scope::check_method(&TOOL, call.method, policy)
+        let targets = match scope::check_method(&TOOL, call.method, policy)
             .and_then(|()| check_scope(&resolved, &call, policy))
         {
-            Ok(target) => target,
+            Ok(targets) => targets,
             Err(denied) => return denied.tool_result(),
         };
-        match self.verify_target(&resolved, &target).await {
-            Ok(Ok(())) => {}
-            Ok(Err(denied)) => return denied.tool_result(),
-            Err(err) => return TOOL.client_error(&err),
+        for target in &targets {
+            match self.verify_target(&resolved, target).await {
+                Ok(Ok(())) => {}
+                Ok(Err(denied)) => return denied.tool_result(),
+                Err(err) => return TOOL.client_error(&err),
+            }
         }
         match self
             .perform(&resolved, call.method, &call.path, &call.query, call.body)

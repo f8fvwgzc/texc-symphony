@@ -229,6 +229,11 @@ impl RunRecorder {
             }
         }
         let mut payload = event.to_json();
+        // `raw` is the same message as one JSON string: key-based redaction cannot see inside it
+        // and escaped quotes hide assignments from the patterns, so it is not stored.
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("raw");
+        }
         self.redactor.redact_value(&mut payload);
         let message = summary(event).map(|m| self.redactor.redact_str(&m).into_owned());
         self.send(RecordOp::Event {
@@ -387,6 +392,43 @@ mod tests {
         assert!(!text.contains("operator-tracker-secret"), "{text}");
         assert!(!text.contains("ghp_0123456789"), "{text}");
         assert!(text.contains("[REDACTED]"), "{text}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn quoted_and_key_named_secrets_never_reach_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        let mut recorder = RunRecorder::start(&store, NewRun::new("i-1", "MT-1"), Arc::default());
+        recorder.event(&notification(json!({
+            "method": "item/completed",
+            "params": {"item": {"type": "commandExecution",
+                "aggregatedOutput": "login password=\"hunter2hunter2\" ok",
+                "headers": {"cookie": "session=cookie-value-123456", "refresh_token": "rt-0123456789"}}},
+        })));
+        recorder.event(&CodexEvent::new(
+            CodexEventData::Malformed {
+                raw: r#"{"broken": "client_secret='malformed-secret-99'"#.into(),
+            },
+            None,
+            None,
+        ));
+        recorder.finish(RunStatus::Succeeded, None);
+        let run = only_run(&store).await;
+        let events = store.list_events(run.id, None, None).await.unwrap();
+        let text = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "hunter2hunter2",
+            "cookie-value-123456",
+            "rt-0123456789",
+            "malformed-secret-99",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(
+            events
+                .iter()
+                .all(|e| e.payload.as_ref().is_none_or(|p| p.get("raw").is_none())),
+            "raw copies are not stored"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
