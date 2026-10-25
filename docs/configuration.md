@@ -615,7 +615,10 @@ tracker:
   entries (`invalid_asana_states`). Completed tasks are never dispatched.
 - Tool: `asana_api`, limited to the configured project: `/projects/<project_gid>` and below,
   `/tasks/<gid>...` and `/sections/<gid>...` after one `GET` confirms the task or section belongs
-  to the project, and `POST /tasks` whose `data.projects` includes the project. Changing the project
+  to the project, and `POST /tasks` whose `data.projects` is exactly the project. Every task the
+  body names (`data.task` of `addTask`, `data.parent`, `data.insert_before`/`insert_after`,
+  `data.dependencies`/`dependents`) must belong to the project too; `addProject` must target the
+  project, and `subtasks` may only name the project in `data.projects`/`memberships`. Changing the project
   or a section itself is an admin call, as are the project subpaths `addMembers`, `removeMembers`,
   `addFollowers`, `removeFollowers`, `project_memberships`, `duplicate`, `saveAsTemplate`,
   `addCustomFieldSetting` and `removeCustomFieldSetting`. Other paths (users, workspaces, other
