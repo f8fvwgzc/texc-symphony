@@ -594,6 +594,14 @@ fn asana_api_scope_classifies_paths() {
     assert_eq!(
         check(
             Method::Post,
+            "/tasks/42/addProject",
+            Some(json!({"data": {"project": "project-1"}}))
+        ),
+        Ok(ScopeTarget::Task("42".into()))
+    );
+    assert_eq!(
+        check(
+            Method::Post,
             "/tasks",
             Some(json!({"data": {"name": "n", "projects": ["project-1"]}}))
         ),
@@ -620,6 +628,18 @@ fn asana_api_scope_classifies_paths() {
             "body_out_of_scope",
         ),
         (Method::Get, "/tasks", None, "body_out_of_scope"),
+        (
+            Method::Post,
+            "/tasks/42/addProject",
+            Some(json!({"data": {"project": "other"}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addProject",
+            None,
+            "body_out_of_scope",
+        ),
         (Method::Get, "/users/me", None, "path_out_of_scope"),
         (
             Method::Get,

@@ -336,7 +336,27 @@ pub fn check_scope(
                 ))
             }
         }
-        [tasks, gid, ..] if tasks.is("tasks") => Ok(ScopeTarget::Task(gid.decoded.clone())),
+        [tasks, gid, rest @ ..] if tasks.is("tasks") => {
+            // The task is checked to belong to the project; the destination of addProject must
+            // be the project too, or the agent could file the task elsewhere.
+            if rest.first().is_some_and(|s| s.is("addProject")) {
+                let target = call
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.pointer("/data/project"))
+                    .and_then(Value::as_str);
+                if target != Some(project.as_str()) {
+                    return Err(Denied::new(
+                        "body_out_of_scope",
+                        format!(
+                            "`{}` may only add tasks to project {project} (data.project).",
+                            TOOL.name
+                        ),
+                    ));
+                }
+            }
+            Ok(ScopeTarget::Task(gid.decoded.clone()))
+        }
         [sections, gid, rest @ ..] if sections.is("sections") => {
             scope::check_scope_root(TOOL.name, rest, call.method, policy, "a section")?;
             Ok(ScopeTarget::Section(gid.decoded.clone()))

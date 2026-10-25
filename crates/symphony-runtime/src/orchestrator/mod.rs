@@ -63,26 +63,33 @@ use crate::tracker::FetchError;
 use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerMessage, WorkerResult};
 use crate::workspace::{WorkspaceManager, worker_hosts};
 
-/// Writes the kill switch to the store, retrying while the store is busy, so an acknowledged
-/// pause also holds after a restart.
-fn persist_pause(store: symphony_store::Store, reason: Option<String>) {
+/// Writes kill-switch changes to the store from one task, in order, retrying while the store is
+/// busy, so an acknowledged pause also holds after a restart. A newer change replaces a pending
+/// older one, so an old retry can never overwrite the latest state.
+fn spawn_pause_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Option<String>> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
     tokio::spawn(async move {
-        let mut delay = Duration::from_millis(50);
-        for _ in 0..10 {
-            match store.set_control(PAUSED_CONTROL_KEY, reason.clone()).await {
-                Ok(()) => return,
-                Err(symphony_store::StoreError::Busy) => {
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(5));
+        while let Some(mut reason) = rx.recv().await {
+            let mut delay = Duration::from_millis(50);
+            loop {
+                while let Ok(newer) = rx.try_recv() {
+                    reason = newer;
                 }
-                Err(err) => {
-                    tracing::error!("Failed to persist the kill switch: {err}");
-                    return;
+                match store.set_control(PAUSED_CONTROL_KEY, reason.clone()).await {
+                    Ok(()) => break,
+                    Err(symphony_store::StoreError::Busy) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to persist the kill switch: {err}");
+                        break;
+                    }
                 }
             }
         }
-        tracing::error!("Failed to persist the kill switch: the store stayed busy");
     });
+    tx
 }
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
@@ -131,6 +138,8 @@ pub(crate) struct Orchestrator<'w> {
     tokens: Counter,
     /// Task status writes, applied in order (and retried while the store is busy).
     task_writes: mpsc::UnboundedSender<TaskWrite>,
+    /// Kill-switch changes, persisted in order by [`spawn_pause_writer`].
+    pause_writes: mpsc::UnboundedSender<Option<String>>,
 }
 
 /// A task status change for the store.
@@ -199,6 +208,7 @@ impl<'w> Orchestrator<'w> {
         let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let pause_writes = spawn_pause_writer(ctx.store.clone());
         Self {
             state: State::new(&settings),
             ctx,
@@ -212,6 +222,7 @@ impl<'w> Orchestrator<'w> {
             shutdown,
             tokens: Counter::default(),
             task_writes: spawn_task_writer(ctx_store),
+            pause_writes,
         }
     }
 
@@ -488,7 +499,7 @@ impl<'w> Orchestrator<'w> {
                 Some(reason) => tracing::warn!("Kill switch engaged: {reason}"),
                 None => tracing::info!("Kill switch released; dispatch resumes"),
             }
-            persist_pause(self.ctx.store.clone(), reason.clone());
+            let _ = self.pause_writes.send(reason.clone());
             self.state.spend.paused = reason.clone();
             if reason.is_none() {
                 self.schedule_tick(Duration::ZERO);
