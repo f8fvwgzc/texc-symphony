@@ -8,6 +8,7 @@ all-features = true
 # Every RustSec advisory (vulnerability, unsound, unmaintained) and every yanked version fails the
 # check. Accept one only with an entry here: `{ id = "RUSTSEC-…", reason = "why it does not apply, and until when" }`.
 yanked = "deny"
+unsound = "all"
 # An unmaintained crate fails only as a direct dependency; deeper ones are reported by `cargo audit`.
 unmaintained = "workspace"
 ignore = []
