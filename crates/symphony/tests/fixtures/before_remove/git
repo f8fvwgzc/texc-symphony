@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake `git`: every call prints the branch the test chose.
+printf '%s\n' "$FAKE_GIT_BRANCH"

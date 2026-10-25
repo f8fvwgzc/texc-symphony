@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake `gh` for `symphony workspace before-remove` (the Elixir test defaults): logs every call to $GH_LOG.
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "pr list") printf '101\n102\n'; exit 0 ;;
+  "pr close")
+    if [ "$3" = "101" ]; then exit 0; fi
+    if [ "$3" = "102" ]; then echo boom >&2; exit 17; fi ;;
+esac
+exit 99
