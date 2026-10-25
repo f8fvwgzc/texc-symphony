@@ -392,6 +392,25 @@ fn cast_claude(entry: &Entry<'_>, errors: &mut Errors) -> ClaudeCodeSettings {
     out.max_turns = entry.positive_u32("max_turns", errors);
     out.api_key_env = entry.env_name("api_key_env", errors);
     out.extra_args = entry.list("extra_args", errors).unwrap_or_default();
+    // Symphony pins where Claude Code reads settings and MCP servers from (a cloned repository
+    // must not configure them); bypassing permissions goes through `permission_mode`.
+    const PINNED: [&str; 5] = [
+        "--setting-sources",
+        "--settings",
+        "--mcp-config",
+        "--strict-mcp-config",
+        "--dangerously-skip-permissions",
+    ];
+    if out.extra_args.iter().any(|arg| {
+        PINNED
+            .iter()
+            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    }) {
+        errors.push(
+            &entry.key("extra_args"),
+            "must not set --setting-sources, --settings, --mcp-config, --strict-mcp-config or --dangerously-skip-permissions",
+        );
+    }
     out
 }
 
@@ -500,6 +519,18 @@ fn cast_api(
             SandboxMode::Auto
         }
     };
+    // No confinement must be chosen knowingly: the shell then reaches the network (whatever
+    // `network` says) and every file and process environment Symphony can read.
+    let unconfined = entry.boolean("unconfined", errors).unwrap_or(false);
+    match (sandbox, unconfined) {
+        (SandboxMode::None, false) => errors.push(
+            &entry.key("sandbox"),
+            "none needs unconfined: true (commands then have network access and Symphony's own file and environment access)",
+        ),
+        (SandboxMode::None, true) => {}
+        (_, true) => errors.push(&entry.key("unconfined"), "only applies to sandbox: none"),
+        (_, false) => {}
+    }
     let temperature = match entry.get("temperature") {
         None => None,
         Some(value) => match cast_number(value) {
@@ -666,12 +697,26 @@ pub(crate) fn cast_backends(
     out
 }
 
-/// Env var names that hold host-side API keys of `api` backends (removed from every child).
+/// Env var names that hold the API keys of `api` and `claude_code` backends: removed from every
+/// child (the `claude_code` backend hands its key to Claude Code as `ANTHROPIC_API_KEY` itself)
+/// and redacted. Codex's `codex.provider.api_key_env` is not listed: Codex reads it itself.
 pub fn backend_secret_environment_names(
     backends: &BTreeMap<String, BackendSettings>,
 ) -> Vec<String> {
     env::uniq(backends.values().filter_map(|b| match &b.kind {
         BackendKind::Api(api) => api.api_key_env.clone(),
-        _ => None,
+        BackendKind::ClaudeCode(claude) => claude.api_key_env.clone(),
+        BackendKind::Codex => None,
     }))
+}
+
+/// Files holding the API keys of `api` backends (their contents are redacted).
+pub fn backend_secret_files(backends: &BTreeMap<String, BackendSettings>) -> Vec<PathBuf> {
+    backends
+        .values()
+        .filter_map(|b| match &b.kind {
+            BackendKind::Api(api) => api.api_key_file.clone(),
+            _ => None,
+        })
+        .collect()
 }

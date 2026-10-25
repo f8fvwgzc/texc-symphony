@@ -1,17 +1,18 @@
 //! Confinement of the API agent loop's `shell` tool (`sandbox` / `network` of an `api` backend).
 //!
-//! * **bubblewrap** (Linux): the root file system read-only, the workspace and a private `/tmp`
-//!   writable, a fresh `/dev`, a private PID namespace with its own `/proc` (host processes and
-//!   their environments are invisible; everything dies with the command), a new session, and no
-//!   network (`--unshare-net`) unless allowed.
-//! * **seatbelt** (macOS `sandbox-exec`): file writes only to the workspace, `/private/tmp`, a
-//!   private per-command temp directory (`$TMPDIR` for the command) and a few device files; no
-//!   LaunchServices, AppleEvents, `open`, `osascript` or `launchctl` (which would start programs
-//!   outside the sandbox); network denied unless allowed.
-//! * **none**: no confinement beyond the workspace cwd and the filtered environment.
+//! * **bubblewrap** (Linux, the only production sandbox): only the system directories
+//!   ([`SYSTEM_DIRS`], [`ETC_ENTRIES`]) are bound read-only, so `$HOME`, `/run`, `/var`, the data
+//!   directory, other workspaces, credential files and filesystem sockets are not there; the
+//!   workspace and a private `/tmp` are writable; every namespace is new (`--unshare-all`: user,
+//!   PID with its own `/proc`, IPC, UTS, cgroup, and network unless allowed); a new session; the
+//!   environment is cleared and rebuilt from an allow-list.
+//! * **seatbelt** (macOS `sandbox-exec`, development only, never picked by `auto`): file writes
+//!   only to the workspace and temp directories, network denied unless allowed, a few launchers
+//!   denied by path. Reads are unrestricted and a copied launcher escapes it: not a security
+//!   boundary.
+//! * **none**: no confinement; needs `unconfined: true` on the backend.
 //!
-//! `auto` picks bubblewrap or seatbelt when installed and refuses otherwise: running commands of
-//! a remote model unconfined has to be an explicit `sandbox: none`.
+//! `auto` picks bubblewrap and refuses without it.
 
 use std::path::{Path, PathBuf};
 
@@ -54,15 +55,11 @@ pub fn resolve(mode: SandboxMode) -> Result<Confinement, String> {
             {
                 return Ok(Confinement::Bubblewrap(bwrap));
             }
-            if cfg!(target_os = "macos")
-                && let Some(seatbelt) = seatbelt_binary()
-            {
-                return Ok(Confinement::Seatbelt(seatbelt));
-            }
             Err(
-                "the shell tool needs a sandbox: install bubblewrap (`bwrap`, Linux) or use \
-                 macOS sandbox-exec, or set `sandbox: none` on the backend to run commands \
-                 unconfined (for example inside a container that is the sandbox)"
+                "the shell tool needs a sandbox: install bubblewrap (`bwrap`, Linux, with \
+                 unprivileged user namespaces). For development on macOS set `sandbox: \
+                 seatbelt` (not a security boundary); `sandbox: none` with `unconfined: true` \
+                 runs commands with Symphony's own access"
                     .into(),
             )
         }
@@ -115,6 +112,53 @@ pub fn seatbelt_profile(
     profile
 }
 
+/// System directories bound read-only into bubblewrap (when they exist).
+pub const SYSTEM_DIRS: [&str; 9] = [
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/opt",
+    "/nix/store",
+];
+
+/// The parts of `/etc` toolchains need (bound read-only when they exist); the rest of `/etc`
+/// (service configs such as `/etc/symphony`) stays out.
+pub const ETC_ENTRIES: [&str; 26] = [
+    "/etc/alternatives",
+    "/etc/bash.bashrc",
+    "/etc/ca-certificates",
+    "/etc/ca-certificates.conf",
+    "/etc/environment",
+    "/etc/gai.conf",
+    "/etc/gitconfig",
+    "/etc/group",
+    "/etc/host.conf",
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/inputrc",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/localtime",
+    "/etc/mime.types",
+    "/etc/nsswitch.conf",
+    "/etc/os-release",
+    "/etc/passwd",
+    "/etc/pki",
+    "/etc/profile",
+    "/etc/profile.d",
+    "/etc/resolv.conf",
+    "/etc/ssl",
+    "/etc/timezone",
+];
+
+/// Variables copied from Symphony's environment into bubblewrap (everything else is cleared).
+pub const PASSED_ENV: [&str; 6] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"];
+
 /// `bash -lc <script>` in `workspace` under `confinement`. stderr of bash goes to stdout (so
 /// the model sees one stream in order); the wrapper's own stderr stays separate. `tmp` is the
 /// command's private temp directory (seatbelt: the only writable temp dir besides
@@ -126,6 +170,7 @@ pub fn command(
     network: bool,
     tmp: Option<&Path>,
     masked: &[PathBuf],
+    env: &[(String, String)],
 ) -> Command {
     let script = format!("exec 2>&1\n{script}");
     let mut command = match confinement {
@@ -136,17 +181,37 @@ pub fn command(
         }
         Confinement::Bubblewrap(bwrap) => {
             let mut command = Command::new(bwrap);
+            for dir in SYSTEM_DIRS.iter().chain(ETC_ENTRIES.iter()) {
+                command.args(["--ro-bind-try", dir, dir]);
+            }
             command
-                .args(["--ro-bind", "/", "/", "--dev", "/dev"])
-                // A PID namespace (needed for `--proc` without setuid, and it hides host
-                // processes) and a new session; everything inside dies with the command.
-                .args(["--unshare-pid", "--new-session", "--proc", "/proc"])
-                .args(["--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp"])
+                .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+                // Every namespace new (user, PID with its own /proc, IPC, UTS, cgroup, network)
+                // and a new session; everything inside dies with the command.
+                .args(["--unshare-all", "--new-session"]);
+            if network {
+                command.arg("--share-net");
+            }
+            command
+                .args([
+                    "--clearenv",
+                    "--setenv",
+                    "HOME",
+                    "/tmp",
+                    "--setenv",
+                    "TMPDIR",
+                    "/tmp",
+                ])
                 .arg("--bind")
                 .arg(workspace)
                 .arg(workspace);
-            if !network {
-                command.arg("--unshare-net");
+            for name in PASSED_ENV {
+                if let Some(value) = std::env::var_os(name) {
+                    command.arg("--setenv").arg(name).arg(value);
+                }
+            }
+            for (name, value) in env {
+                command.args(["--setenv", name, value]);
             }
             // Secret files (the LLM key, ...) read as empty inside the sandbox.
             for file in masked.iter().filter(|f| f.is_file()) {
@@ -208,25 +273,44 @@ mod tests {
     }
 
     #[test]
-    fn bubblewrap_commands_bind_the_workspace_and_drop_the_network() {
-        let command = command(
-            &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
-            Path::new("/w/MT-1"),
-            "ls",
-            false,
-            None,
-            &[],
-        );
-        let args: Vec<String> = command
+    fn bubblewrap_binds_only_system_dirs_and_clears_the_environment() {
+        let argv = |network: bool| -> String {
+            command(
+                &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+                Path::new("/w/MT-1"),
+                "ls",
+                network,
+                None,
+                &[],
+                &[("GIT_AUTHOR_NAME".to_owned(), "Agent".to_owned())],
+            )
             .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let joined = args.join(" ");
-        assert!(joined.starts_with(
-            "--ro-bind / / --dev /dev --unshare-pid --new-session --proc /proc --tmpfs /tmp"
-        ));
-        assert!(joined.contains("--bind /w/MT-1 /w/MT-1 --unshare-net"));
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        let joined = argv(false);
+        assert!(
+            !joined.contains("--ro-bind / /"),
+            "the host root is not bound"
+        );
+        assert!(joined.contains("--ro-bind-try /usr /usr"));
+        assert!(joined.contains("--ro-bind-try /etc/ssl /etc/ssl"));
+        assert!(!joined.contains("--ro-bind-try /etc /etc"));
+        assert!(joined.contains("--unshare-all --new-session --clearenv"));
+        assert!(!joined.contains("--share-net"));
+        assert!(joined.contains("--bind /w/MT-1 /w/MT-1"));
+        assert!(joined.contains("--setenv GIT_AUTHOR_NAME Agent"));
         assert!(joined.ends_with("-- bash -lc exec 2>&1\nls"));
+        assert!(argv(true).contains("--unshare-all --new-session --share-net"));
+    }
+
+    #[test]
+    fn auto_never_picks_seatbelt() {
+        if cfg!(target_os = "macos") {
+            let err = resolve(SandboxMode::Auto).unwrap_err();
+            assert!(err.contains("sandbox: seatbelt"), "{err}");
+        }
     }
 }

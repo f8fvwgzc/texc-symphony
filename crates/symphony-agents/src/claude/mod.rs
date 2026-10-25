@@ -168,6 +168,11 @@ pub fn turn_command(
     args.extend([
         "--permission-mode".to_owned(),
         claude.permission_mode.clone(),
+        // Only the operator's user settings: a cloned repository's `.claude/settings.json`
+        // (permissions, hooks) or `.mcp.json` must not widen `allowed_tools` or run commands.
+        "--setting-sources".to_owned(),
+        "user".to_owned(),
+        "--strict-mcp-config".to_owned(),
     ]);
     let bridged = bridge.map_or(&[][..], |b| b.tools);
     if !claude.allowed_tools.is_empty() || !bridged.is_empty() {
@@ -189,11 +194,7 @@ pub fn turn_command(
         ]);
     }
     if let Some(bridge) = bridge {
-        args.extend([
-            "--mcp-config".to_owned(),
-            bridge.config.to_owned(),
-            "--strict-mcp-config".to_owned(),
-        ]);
+        args.extend(["--mcp-config".to_owned(), bridge.config.to_owned()]);
     }
     if let Some(resume) = resume {
         args.extend(["--resume".to_owned(), resume.to_owned()]);
@@ -620,7 +621,7 @@ mod tests {
             permission_mode: "acceptEdits".into(),
             max_turns: Some(30),
             api_key_env: None,
-            extra_args: vec!["--setting-sources".into(), "project".into()],
+            extra_args: vec!["--add-dir".into(), "/srv/shared".into()],
         };
         let tools = vec!["mcp__symphony__github_api".to_owned()];
         let bridge = ToolBridge {
@@ -636,15 +637,17 @@ mod tests {
                 Some(bridge)
             ),
             "claude '-p' '--output-format' 'stream-json' '--verbose' '--model' 'sonnet' \
-             '--permission-mode' 'acceptEdits' '--allowedTools' 'Read' 'Bash(git log:*)' \
+             '--permission-mode' 'acceptEdits' '--setting-sources' 'user' '--strict-mcp-config' \
+             '--allowedTools' 'Read' 'Bash(git log:*)' \
              'mcp__symphony__github_api' '--disallowedTools' 'WebFetch' '--max-turns' '30' \
              '--append-system-prompt' 'Be brief.' '--mcp-config' '/tmp/s/mcp.json' \
-             '--strict-mcp-config' '--resume' 'abc' '--setting-sources' 'project'"
+             '--resume' 'abc' '--add-dir' '/srv/shared'"
         );
         let minimal = ClaudeCodeSettings::default();
         assert_eq!(
             turn_command(&minimal, None, None, None, None),
-            "claude '-p' '--output-format' 'stream-json' '--verbose' '--permission-mode' 'acceptEdits'"
+            "claude '-p' '--output-format' 'stream-json' '--verbose' '--permission-mode' 'acceptEdits' \
+             '--setting-sources' 'user' '--strict-mcp-config'"
         );
     }
 

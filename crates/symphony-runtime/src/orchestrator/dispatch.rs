@@ -403,7 +403,7 @@ pub(crate) struct RunPlan {
     pub task: Option<(TaskSpec, Option<u64>)>,
 }
 
-/// The issue a task's runs are recorded under (`task:<id>` / `TASK-<id>`).
+/// The issue a task's runs are recorded under (`task:<id>` / `task-<id>`).
 pub(crate) fn task_issue(task: &TaskRecord) -> Issue {
     let title = task.title.clone().unwrap_or_else(|| {
         let first = task.prompt.lines().next().unwrap_or_default();

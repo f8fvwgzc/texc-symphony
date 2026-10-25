@@ -111,6 +111,7 @@ fn fail(message: &str) -> ExitCode {
 
 /// Boots Symphony for a validated invocation and blocks until it stops.
 pub fn run(invocation: Invocation) -> ExitCode {
+    crate::hardening::protect_secrets();
     let workflow_path = invocation.workflow.display().to_string();
     let workflow = match WorkflowStore::start(Some(invocation.workflow.clone())) {
         Ok(workflow) => workflow,
@@ -345,6 +346,19 @@ async fn serve_until_stopped(
     };
 
     let settings = workflow.settings();
+    // Say what the LLM connection contract changes, so it is never a silent switch.
+    match symphony_core::config::llm::describe(&settings) {
+        Some(line) => tracing::info!("{line}"),
+        None => {
+            let stray = symphony_core::config::llm::stray_variables(&symphony_core::ProcessEnv);
+            if !stray.is_empty() {
+                tracing::warn!(
+                    "Ignoring {} without LLM_PROVIDER or LLM_GATEWAY_URL (the LLM connection contract is off)",
+                    stray.join(", ")
+                );
+            }
+        }
+    }
     let host = invocation
         .host
         .clone()

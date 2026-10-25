@@ -50,8 +50,11 @@ queued / blocked / running ──▶ cancelled   (POST /cancel)
   `unblock` also re-queues a `failed` task.
 - The kill switch and an exhausted daily budget stop running tasks and put them back to `queued`;
   so does a restart (tasks that were `running` are queued again).
-- Workspaces are named `TASK-<id>` under `workspace.root`; runs appear in the dashboard and in
-  `GET /api/v1/runs?issue=TASK-<id>`. The workflow's hooks do not run for tasks.
+- A task's identifier is `task-<id>` (lowercase, so it cannot be a Linear or Jira key); its runs
+  appear in the dashboard and in `GET /api/v1/runs?issue=task-<id>`. Its workspace is
+  `<workspace.root>/.tasks/<id>`, a directory no tracker identifier maps to, and it is removed
+  when the task succeeds, fails or is cancelled (a blocked task keeps it until it ends). The
+  workflow's hooks do not run for tasks.
 - `repo` is shallow-cloned into the empty workspace (`https://`, `ssh://` or `user@host:path`;
   local paths, `file://` and git transport helpers are refused). The agent's own git credentials
   apply; the tracker token is not passed on.

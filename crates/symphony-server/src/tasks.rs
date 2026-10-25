@@ -11,7 +11,7 @@
 //!   changes and `run_event` events with its runs' recorded events, until the task is final.
 //!
 //! Tasks need the run-history store (`503 store_disabled` otherwise). Their runs are ordinary runs
-//! recorded under the identifier `TASK-<id>`.
+//! recorded under the identifier `task-<id>`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -29,7 +29,6 @@ use serde_json::Value;
 use symphony_core::task::{MAX_TASK_PROMPT_BYTES, valid_branch, valid_repo_url};
 use symphony_store::{
     NewTask, RunQuery, RunStatus, TaskLimits, TaskPage, TaskQuery, TaskRecord, TaskStatus,
-    task_identifier,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -37,6 +36,9 @@ use crate::app::AppState;
 use crate::config::SSE_RETRY;
 use crate::error::ApiError;
 use crate::history::{enabled_store, invalid, limit_param, parse_query};
+
+// The API's prompt limit is the store's (operator replies may not grow a prompt past it either).
+const _: () = assert!(MAX_TASK_PROMPT_BYTES == symphony_store::MAX_TASK_PROMPT_BYTES);
 
 /// Default and maximum page size of `GET /api/v1/tasks`.
 const TASKS_LIMIT: (u32, u32) = (50, 200);
@@ -306,7 +308,8 @@ impl Watch {
         let runs = store
             .list_runs(RunQuery {
                 limit: Some(20),
-                issue_identifier: Some(task_identifier(self.id)),
+                // By issue id: a tracker issue may share the identifier.
+                issue_id: Some(format!("task:{}", self.id)),
                 ..RunQuery::default()
             })
             .await?;

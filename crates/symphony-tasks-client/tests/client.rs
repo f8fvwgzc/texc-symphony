@@ -51,7 +51,7 @@ async fn create_watch_and_wait_for_a_task() {
         .await
         .unwrap();
     assert_eq!(task.status, TaskStatus::Queued);
-    assert_eq!(task.identifier, format!("TASK-{}", task.id));
+    assert_eq!(task.identifier, format!("task-{}", task.id));
     assert_eq!(client.get(task.id).await.unwrap(), task);
     let page = client
         .list(&ListTasks {
@@ -70,7 +70,7 @@ async fn create_watch_and_wait_for_a_task() {
             tokio::time::sleep(Duration::from_millis(100)).await;
             store.start_task(id).await.unwrap();
             let run = store
-                .start_run(NewRun::new(format!("task:{id}"), format!("TASK-{id}")))
+                .start_run(NewRun::new(format!("task:{id}"), format!("task-{id}")))
                 .await
                 .unwrap();
             store

@@ -106,7 +106,7 @@ pub struct NewTask {
 pub struct Task {
     /// Task id.
     pub id: i64,
-    /// `TASK-<id>`.
+    /// `task-<id>`.
     pub identifier: String,
     /// Short label.
     pub title: Option<String>,
@@ -233,11 +233,21 @@ struct Ticket {
 pub type TaskEvents = Pin<Box<dyn Stream<Item = Result<TaskEvent, ClientError>> + Send>>;
 
 /// Client of one Symphony server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TasksClient {
     base: Url,
     token: Option<String>,
     http: reqwest::Client,
+}
+
+/// Never prints the token.
+impl std::fmt::Debug for TasksClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TasksClient")
+            .field("base", &self.base.as_str())
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl TasksClient {
@@ -435,5 +445,20 @@ impl TasksClient {
             Some(task) if task.status.is_final() => Ok(*task),
             _ => Err(ClientError::StreamEnded),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_token() {
+        let client = TasksClient::new("http://127.0.0.1:4000")
+            .unwrap()
+            .with_token("secret-token-0123456789");
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
     }
 }

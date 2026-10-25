@@ -109,17 +109,25 @@ impl Redactor {
             .secret_environment_names()
             .into_iter()
             .filter_map(|name| env.var(&name));
-        // The LLM contract's credential may live in a file (a mounted Secret).
+        // The LLM contract's credential and `api` backend keys may live in files (mounted Secrets).
         let llm = settings
             .llm
             .as_ref()
             .and_then(|llm| llm.credential())
             .and_then(|source| source.read(env).ok());
+        let files = symphony_core::config::backend::backend_secret_files(&settings.backends)
+            .into_iter()
+            .filter_map(|path| {
+                symphony_core::config::SecretSource::File(path)
+                    .read(env)
+                    .ok()
+            });
         Self::new(
             from_env
                 .chain(settings.tracker.api_key.clone())
                 .chain(settings.server.api_token.clone())
-                .chain(llm),
+                .chain(llm)
+                .chain(files),
         )
     }
 
@@ -277,6 +285,34 @@ mod tests {
         let redactor = Redactor::from_settings(&settings, &env);
         assert_eq!(
             redactor.redact_str("plain-gh-token-value api-token-for-symphony"),
+            "[REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn backend_keys_are_stripped_and_redacted() {
+        use symphony_core::config;
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("api-key");
+        std::fs::write(&key_file, "file-key-0123456789\n").unwrap();
+        let serde_json::Value::Object(map) = serde_json::json!({"backends": {
+            "cc": {"kind": "claude_code", "api_key_env": "MY_CLAUDE_KEY"},
+            "api": {"kind": "api", "provider": "openai", "model": "m",
+                "api_key_file": key_file.display().to_string()},
+        }}) else {
+            unreachable!("an object")
+        };
+        let env = MapEnv::new().with("MY_CLAUDE_KEY", "claude-key-0123456789");
+        let settings = config::parse(&map, &env).unwrap();
+        assert!(
+            settings
+                .secret_environment_names()
+                .contains(&"MY_CLAUDE_KEY".to_owned()),
+            "removed from hooks, Codex and the api shell"
+        );
+        let redactor = Redactor::from_settings(&settings, &env);
+        assert_eq!(
+            redactor.redact_str("claude-key-0123456789 file-key-0123456789"),
             "[REDACTED] [REDACTED]"
         );
     }

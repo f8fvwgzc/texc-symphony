@@ -419,7 +419,7 @@ async fn cancelled_runs_stop_codex_and_still_run_after_run() {
 fn task_context(prompt: &str) -> WorkerContext {
     let mut ctx = WorkerContext::standalone(Issue {
         id: Some("task:7".into()),
-        identifier: Some("TASK-7".into()),
+        identifier: Some("task-7".into()),
         title: Some("A task".into()),
         state: Some("task".into()),
         ..Issue::default()
@@ -457,7 +457,7 @@ async fn tasks_skip_workflow_hooks_and_send_their_prompt_verbatim() {
         turns[0]["params"]["input"][0]["text"],
         json!("Summarize {{ not liquid }} the README")
     );
-    assert!(s.wf.workspace_root().join("TASK-7").is_dir());
+    assert!(s.wf.workspace_root().join(".tasks/7").is_dir());
 }
 
 #[tokio::test]
@@ -475,7 +475,7 @@ async fn backend_prompt_templates_wrap_the_first_turn() {
     let turns = methods(&messages, "turn/start");
     assert_eq!(
         turns[0]["params"]["input"][0]["text"],
-        json!("[TASK-7] do it")
+        json!("[task-7] do it")
     );
 }
 

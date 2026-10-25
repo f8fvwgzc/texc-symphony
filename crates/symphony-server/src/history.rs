@@ -55,6 +55,7 @@ pub(crate) async fn list_runs(
             limit: Some(limit),
             before_id,
             issue_identifier,
+            issue_id: None,
             status,
         })
         .await?;

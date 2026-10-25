@@ -86,10 +86,21 @@ jobs:
         with:
           shared-key: test
 
+      # The api backend's sandbox tests must run, not skip: bubblewrap with unprivileged user
+      # namespaces (Ubuntu 24.04 restricts them through AppArmor by default).
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # symphony-server embeds a placeholder page when web/dist is absent, so the Rust jobs do not
       # wait for the web build.
       - name: cargo test
         run: make test
+        env:
+          SYMPHONY_REQUIRE_SANDBOX: ${{ runner.os == 'Linux' && '1' || '' }}
 
   web:
     name: web (check + build)

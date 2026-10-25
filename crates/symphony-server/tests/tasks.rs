@@ -74,7 +74,7 @@ async fn tasks_are_created_listed_and_read() {
     assert_eq!(status, StatusCode::CREATED, "{task}");
     assert_schema("Task", &task);
     assert_eq!(task["status"], "queued");
-    assert_eq!(task["identifier"], format!("TASK-{}", task["id"]));
+    assert_eq!(task["identifier"], format!("task-{}", task["id"]));
     assert_eq!(
         task["limits"],
         json!({"max_tokens": 50000, "timeout_ms": 600000})
@@ -211,11 +211,20 @@ async fn the_task_stream_sends_the_record_and_run_events_until_the_task_is_final
     let store = harness.store.clone();
     store.start_task(id).await.unwrap();
     let run = store
-        .start_run(NewRun::new(format!("task:{id}"), format!("TASK-{id}")))
+        .start_run(NewRun::new(format!("task:{id}"), format!("task-{id}")))
         .await
         .unwrap();
     store
         .append_event(run, "session_started", Some("session started".into()), None)
+        .await
+        .unwrap();
+    // A tracker issue that happens to carry the same identifier must not leak into the stream.
+    let foreign = store
+        .start_run(NewRun::new("lin-1", format!("task-{id}")))
+        .await
+        .unwrap();
+    store
+        .append_event(foreign, "tracker_only", None, None)
         .await
         .unwrap();
 
@@ -255,6 +264,10 @@ async fn the_task_stream_sends_the_record_and_run_events_until_the_task_is_final
         kinds.push((event.event.clone(), event.json()));
     }
     assert_eq!(kinds[0].1["kind"], "turn_completed");
+    assert!(
+        kinds.iter().all(|(_, json)| json["kind"] != "tracker_only"),
+        "{kinds:?}"
+    );
     let last = &kinds.last().unwrap().1;
     assert_schema("Task", last);
     assert_schema("RunEvent", &kinds[0].1);

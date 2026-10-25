@@ -18,6 +18,7 @@ pub mod before_remove;
 pub mod cli;
 pub mod control;
 pub mod dashboard;
+pub mod hardening;
 pub mod logging;
 pub mod memory_seed;
 pub mod rotating;

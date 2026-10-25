@@ -49,6 +49,6 @@ pub use ops::{INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND};
 pub use schema::{BUSY_TIMEOUT, SCHEMA_VERSION};
 pub use store::{Pending, STORE_QUEUE_CAPACITY, Store};
 pub use tasks::{
-    DEFAULT_TASK_LIMIT, MAX_TASK_LIMIT, MAX_TASK_RESULT_BYTES, NewTask, TaskLimits, TaskPage,
-    TaskQuery, TaskRecord, TaskStatus, task_identifier,
+    DEFAULT_TASK_LIMIT, MAX_TASK_LIMIT, MAX_TASK_PROMPT_BYTES, MAX_TASK_RESULT_BYTES, NewTask,
+    TaskLimits, TaskPage, TaskQuery, TaskRecord, TaskStatus, task_identifier,
 };

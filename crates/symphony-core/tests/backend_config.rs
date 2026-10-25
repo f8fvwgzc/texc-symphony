@@ -39,7 +39,7 @@ fn an_openai_compatible_provider_needs_only_config() {
             "kind": "api", "provider": "openai", "base_url": "http://localhost:11434/v1",
             "model": "qwen2.5-coder:32b", "api_key_env": "$OLLAMA_KEY",
             "headers": {"X-Title": "symphony"}, "tools": ["read_file", "shell"],
-            "max_steps": 12, "temperature": 0.2, "stream": false, "sandbox": "none",
+            "max_steps": 12, "temperature": 0.2, "stream": false, "sandbox": "none", "unconfined": true,
             "network": true, "prompt_template": "Task:\n{{ prompt }}",
             "pricing": {"input_usd_per_million_tokens": 0.5, "output_usd_per_million_tokens": 1},
         }},
@@ -161,4 +161,24 @@ fn the_none_tracker_needs_no_credentials() {
     let settings = parse(json!({"tracker": {"kind": "none"}})).unwrap();
     validate_settings(&settings, &MapEnv::new()).unwrap();
     assert!(settings.active_states().is_empty());
+}
+
+#[test]
+fn claude_code_extra_args_cannot_unpin_settings_or_mcp() {
+    for flag in [
+        "--setting-sources",
+        "--settings=x.json",
+        "--mcp-config",
+        "--dangerously-skip-permissions",
+    ] {
+        let message = invalid(
+            json!({"backends": {"cc": {"kind": "claude_code", "extra_args": [flag, "project"]}}}),
+        );
+        assert!(
+            message.contains("backends.cc.extra_args must not set --setting-sources"),
+            "{flag}: {message}"
+        );
+    }
+    parse(json!({"backends": {"cc": {"kind": "claude_code", "extra_args": ["--add-dir", "/x"]}}}))
+        .unwrap();
 }

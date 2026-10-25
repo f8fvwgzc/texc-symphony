@@ -236,18 +236,51 @@ fn url_ok(value: &str) -> bool {
     }
 }
 
+/// `LLM_*` variables that are set although the contract is inactive (no `LLM_PROVIDER` or
+/// `LLM_GATEWAY_URL`): likely a typo, worth a warning.
+pub fn stray_variables(env: &dyn EnvSource) -> Vec<&'static str> {
+    if get(env, LLM_PROVIDER).is_some() || get(env, LLM_GATEWAY_URL).is_some() {
+        return Vec::new();
+    }
+    [
+        LLM_BASE_URL,
+        LLM_API_KEY,
+        LLM_API_KEY_FILE,
+        LLM_MODEL,
+        LLM_MODEL_SMALL,
+    ]
+    .into_iter()
+    .filter(|name| get(env, name).is_some())
+    .collect()
+}
+
+/// One line describing what the contract configures in `settings` (startup log).
+pub fn describe(settings: &super::Settings) -> Option<String> {
+    let llm = settings.llm.as_ref()?;
+    let endpoint = match &llm.gateway {
+        Some(gateway) => format!("gateway {}", gateway.url),
+        None => format!("{} {}", llm.provider.as_str(), llm.api_base_url()),
+    };
+    let codex = match &settings.codex.provider {
+        Some(p) if p.name == CODEX_LLM_PROVIDER => "codex uses it",
+        Some(_) => "codex keeps codex.provider",
+        None => "codex keeps its own login",
+    };
+    Some(format!(
+        "LLM connection contract: {endpoint}, model {}; backend `llm` available; {codex}; \
+         agent.backend is `{}`",
+        llm.model, settings.agent.backend
+    ))
+}
+
 /// Reads the contract from `env`; `None` when neither `LLM_PROVIDER` nor `LLM_GATEWAY_URL` is set.
 /// Problems are reported under the variable's name (`LLM_PROVIDER is invalid`).
 pub(crate) fn from_env(env: &dyn EnvSource, errors: &mut Errors) -> Option<LlmConnection> {
     let provider = get(env, LLM_PROVIDER);
     let gateway_url = get(env, LLM_GATEWAY_URL);
     if provider.is_none() && gateway_url.is_none() {
-        let stray = [LLM_BASE_URL, LLM_API_KEY, LLM_API_KEY_FILE, LLM_MODEL]
-            .into_iter()
-            .any(|name| get(env, name).is_some());
-        if stray {
-            errors.push(LLM_PROVIDER, "can't be blank");
-        }
+        // Inactive. Other `LLM_*` variables alone are ignored (startup logs a warning, see
+        // [`stray_variables`]): they must not break a workflow that never used the contract.
         return None;
     }
     let before = errors.len();

@@ -881,7 +881,8 @@ async fn the_seatbelt_sandbox_blocks_writes_outside_the_workspace() {
     .await;
     let env = Env::new();
     let mut settings = api(ApiProvider::OpenAi, &server.uri(), false);
-    settings.sandbox = SandboxMode::Auto;
+    // Explicit: `auto` never picks seatbelt (development only).
+    settings.sandbox = SandboxMode::Seatbelt;
     let backend = backend(backend_settings(settings));
     let mut session = backend
         .start(env.options(env.settings(None)))
@@ -1050,8 +1051,11 @@ async fn keyless_local_servers_get_no_authorization_header() {
 }
 
 /// `true` when `bwrap` exists and may create namespaces here (often not in CI containers).
+/// `true` when bubblewrap runs here. With `SYMPHONY_REQUIRE_SANDBOX` set (CI on Linux) a missing
+/// or broken bubblewrap fails the test instead of skipping it.
 fn bubblewrap_works() -> bool {
-    sandbox_available(SandboxMode::Bubblewrap)
+    let works = cfg!(target_os = "linux")
+        && sandbox_available(SandboxMode::Bubblewrap)
         && std::process::Command::new("bwrap")
             .args([
                 "--ro-bind",
@@ -1059,16 +1063,75 @@ fn bubblewrap_works() -> bool {
                 "/",
                 "--dev",
                 "/dev",
-                "--unshare-net",
+                "--unshare-all",
                 "true",
             ])
             .status()
-            .is_ok_and(|s| s.success())
+            .is_ok_and(|s| s.success());
+    if !works && std::env::var_os("SYMPHONY_REQUIRE_SANDBOX").is_some_and(|v| !v.is_empty()) {
+        panic!("SYMPHONY_REQUIRE_SANDBOX is set but bubblewrap cannot run here");
+    }
+    works
+}
+
+/// Runs one `shell` call of `command` under bubblewrap and returns its output.
+async fn bubblewrap_shell(env: &Env, command: &str) -> String {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        ApiProvider::OpenAi,
+        vec![
+            openai_tool_call(false, "shell", json!({"command": command})),
+            openai_text(false, "done"),
+        ],
+    )
+    .await;
+    let mut settings = api(ApiProvider::OpenAi, &server.uri(), false);
+    settings.sandbox = SandboxMode::Bubblewrap;
+    let mut session = backend(backend_settings(settings))
+        .start(env.options(env.settings(None)))
+        .await
+        .unwrap();
+    let (events, _rx) = sink();
+    session.run_turn("probe", &issue(), &events).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    sent_tool_result(ApiProvider::OpenAi, &request_json(&requests[1])).1
+}
+
+#[tokio::test]
+async fn the_bubblewrap_sandbox_hides_the_host_network_and_environment() {
+    if !bubblewrap_works() {
+        return;
+    }
+    let env = Env::new();
+    // A sibling workspace and the user's home directory hold secrets the agent must not read.
+    let sibling = env.workspace.parent().unwrap().join("OTHER-1");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("secret.txt"), "sibling-secret").unwrap();
+    let home = std::env::var("HOME").unwrap();
+    let output = bubblewrap_shell(
+        &env,
+        &format!(
+            "cat '{}' 2>&1; ls '{home}' >/dev/null 2>&1 && echo HOME-VISIBLE; \
+             (exec 3<>/dev/tcp/1.1.1.1/443) 2>/dev/null && echo NET-OPEN; \
+             env | grep -c '^CARGO' ; echo pid1=$(cat /proc/1/comm)",
+            sibling.join("secret.txt").display()
+        ),
+    )
+    .await;
+    assert!(!output.contains("sibling-secret"), "{output}");
+    assert!(!output.contains("HOME-VISIBLE"), "{output}");
+    assert!(!output.contains("NET-OPEN"), "{output}");
+    assert!(
+        output.contains("\n0\n"),
+        "Symphony's environment is cleared: {output}"
+    );
+    assert!(!output.contains("pid1=symphony"), "{output}");
 }
 
 #[tokio::test]
 async fn the_bubblewrap_sandbox_blocks_writes_outside_the_workspace() {
-    if !cfg!(target_os = "linux") || !bubblewrap_works() {
+    if !bubblewrap_works() {
         return;
     }
     let outside = tempfile::tempdir().unwrap();

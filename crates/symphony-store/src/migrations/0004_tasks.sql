@@ -1,5 +1,5 @@
 -- Tasks submitted through the task API (POST /api/v1/tasks): work without a tracker issue.
--- Their runs are ordinary `runs` rows with issue_identifier `TASK-<id>`.
+-- Their runs are ordinary `runs` rows with issue_identifier `task-<id>`.
 CREATE TABLE IF NOT EXISTS tasks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT,
