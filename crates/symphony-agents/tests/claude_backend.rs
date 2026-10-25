@@ -408,3 +408,110 @@ async fn tracker_tools_are_bridged_through_an_mcp_config() {
     session.stop().await;
     assert!(!config.exists(), "the bridge files go with the session");
 }
+
+#[tokio::test]
+async fn the_llm_contract_points_claude_code_at_the_gateway() {
+    use symphony_core::config::{LlmConnection, LlmGateway, LlmProvider, SecretSource};
+    let f = fixture();
+    f.write("turn.jsonl", TURN_TWO);
+    let token = f.dir.path().join("gateway-token");
+    std::fs::write(&token, "gw-token-0123456789\n").unwrap();
+    let mut settings = (*f.settings()).clone();
+    settings.llm = Some(LlmConnection {
+        provider: LlmProvider::Anthropic,
+        base_url: None,
+        api_key: Some(SecretSource::Env("LLM_API_KEY".into())),
+        model: "claude-sonnet-4-5".into(),
+        model_small: Some("claude-haiku-4-5".into()),
+        timeout_secs: Some(90),
+        max_retries: Some(2),
+        gateway: Some(LlmGateway {
+            url: "http://gateway.platform:8080".into(),
+            token: Some(SecretSource::File(token)),
+        }),
+    });
+    let mut options = f
+        .options()
+        .with_env("ANTHROPIC_API_KEY", "sk-ant-stray-key-0123456789");
+    options.settings = Arc::new(settings);
+    let backend = ClaudeCodeBackend::new(backend_settings(claude_settings(), 60_000)).with_env(
+        Arc::new(MapEnv::new().with("LLM_API_KEY", "provider-key-unused")),
+    );
+    let mut session = backend.start(options).await.unwrap();
+    let (sink, _rx) = events();
+    session.run_turn("hi", &issue(), &sink).await.unwrap();
+    let env = f.read("env.1");
+    for line in [
+        "ANTHROPIC_BASE_URL=http://gateway.platform:8080",
+        "ANTHROPIC_AUTH_TOKEN=gw-token-0123456789",
+        "ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4-5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5",
+        "API_TIMEOUT_MS=90000",
+    ] {
+        assert!(env.lines().any(|l| l == line), "missing {line}");
+    }
+    assert!(
+        !env.contains("ANTHROPIC_API_KEY="),
+        "no provider key bypasses the gateway"
+    );
+    assert!(!env.contains("provider-key-unused"));
+    session.stop().await;
+
+    // A backend's own key wins over the contract.
+    let f = fixture();
+    f.write("turn.jsonl", TURN_TWO);
+    let mut settings = (*f.settings()).clone();
+    settings.llm = Some(LlmConnection {
+        provider: LlmProvider::Anthropic,
+        base_url: Some("https://anthropic.proxy.example".into()),
+        api_key: Some(SecretSource::Env("LLM_API_KEY".into())),
+        model: "claude-sonnet-4-5".into(),
+        model_small: None,
+        timeout_secs: None,
+        max_retries: None,
+        gateway: None,
+    });
+    let mut options = f.options();
+    options.settings = Arc::new(settings.clone());
+    let backend = ClaudeCodeBackend::new(backend_settings(claude_settings(), 60_000)).with_env(
+        Arc::new(MapEnv::new().with("LLM_API_KEY", "sk-ant-contract-0123456789")),
+    );
+    let mut session = backend.start(options).await.unwrap();
+    session.run_turn("hi", &issue(), &sink).await.unwrap();
+    let env = f.read("env.1");
+    assert!(
+        env.lines()
+            .any(|l| l == "ANTHROPIC_API_KEY=sk-ant-contract-0123456789")
+    );
+    assert!(
+        env.lines()
+            .any(|l| l == "ANTHROPIC_BASE_URL=https://anthropic.proxy.example")
+    );
+    session.stop().await;
+
+    let f = fixture();
+    f.write("turn.jsonl", TURN_TWO);
+    let mut options = f.options();
+    let mut own = (*f.settings()).clone();
+    own.llm = settings.llm;
+    options.settings = Arc::new(own);
+    let mut claude = claude_settings();
+    claude.api_key_env = Some("MY_CLAUDE_KEY".into());
+    let backend = ClaudeCodeBackend::new(backend_settings(claude, 60_000)).with_env(Arc::new(
+        MapEnv::new()
+            .with("LLM_API_KEY", "sk-ant-contract-0123456789")
+            .with("MY_CLAUDE_KEY", "sk-ant-own-0123456789"),
+    ));
+    let mut session = backend.start(options).await.unwrap();
+    session.run_turn("hi", &issue(), &sink).await.unwrap();
+    let env = f.read("env.1");
+    assert!(
+        env.lines()
+            .any(|l| l == "ANTHROPIC_API_KEY=sk-ant-own-0123456789")
+    );
+    assert!(
+        !env.contains("anthropic.proxy.example"),
+        "the contract's endpoint is not used with the backend's own key"
+    );
+    session.stop().await;
+}

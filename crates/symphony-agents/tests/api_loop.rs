@@ -62,6 +62,8 @@ fn api(provider: ApiProvider, base_url: &str, stream: bool) -> ApiBackendSetting
         provider,
         base_url: base_url.to_owned(),
         api_key_env: Some("TEST_API_KEY".into()),
+        api_key_file: None,
+        max_retries: 3,
         headers: [("x-extra".to_owned(), "yes".to_owned())].into(),
         tools: [
             "read_file",
@@ -1008,7 +1010,7 @@ async fn start_refuses_ssh_workers_missing_keys_and_foreign_workspaces() {
     };
     assert_eq!(
         err,
-        CodexError::Backend("the API key variable TEST_API_KEY is not set".into())
+        CodexError::Backend("no API key: the variable TEST_API_KEY is not set".into())
     );
 
     let outside = tempfile::tempdir().unwrap();
@@ -1104,4 +1106,51 @@ async fn the_bubblewrap_sandbox_blocks_writes_outside_the_workspace() {
         std::fs::read_to_string(env.workspace.join("ok.txt")).unwrap(),
         "inside\n"
     );
+}
+
+#[tokio::test]
+async fn key_files_win_and_max_retries_bounds_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let env = Env::new();
+    let key_file = env.root.join("api-key");
+    std::fs::write(&key_file, "sk-from-file-0123456789\n").unwrap();
+    let mut settings = api(ApiProvider::Anthropic, &server.uri(), false);
+    settings.api_key_file = Some(key_file);
+    settings.max_retries = 1;
+    let mut session = backend(backend_settings(settings))
+        .start(env.options(env.settings(None)))
+        .await
+        .unwrap();
+    let (events, _rx) = sink();
+    let err = session.run_turn("go", &issue(), &events).await.unwrap_err();
+    assert!(err.to_string().contains("HTTP 503"), "{err}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "one try plus max_retries = 1");
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("x-api-key")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "sk-from-file-0123456789",
+        "the file wins over api_key_env"
+    );
+
+    // An unreadable key file stops the session before any request.
+    let mut settings = api(ApiProvider::Anthropic, &server.uri(), false);
+    settings.api_key_file = Some(env.root.join("missing-key"));
+    let err = match backend(backend_settings(settings))
+        .start(env.options(env.settings(None)))
+        .await
+    {
+        Err(err) => err,
+        Ok(_) => panic!("a missing key file must fail the start"),
+    };
+    assert!(err.to_string().contains("missing-key"), "{err}");
 }

@@ -959,6 +959,8 @@ fn codex_model_and_provider_are_optional_and_validated() {
             name: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             api_key_env: Some("OLLAMA_API_KEY".into()),
+            request_max_retries: None,
+            stream_idle_timeout_ms: None,
         })
     );
 

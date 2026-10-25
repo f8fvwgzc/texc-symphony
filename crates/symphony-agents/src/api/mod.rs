@@ -33,7 +33,7 @@ use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 use serde_json::Value;
 use symphony_codex::launch::{valid_secret_names, validate_local_workspace};
 use symphony_codex::{CodexError, EventSink, StartOptions, TurnOutcome};
-use symphony_core::config::{ApiBackendSettings, BackendKind, BackendSettings};
+use symphony_core::config::{ApiBackendSettings, BackendKind, BackendSettings, SecretSource};
 use symphony_core::{EnvSource, Issue, ProcessEnv};
 
 use self::sse::SseParser;
@@ -42,8 +42,6 @@ use self::wire::{Message, Reply, Request, ToolDef, Wire};
 use crate::events::{Emitter, Usage};
 use crate::{AgentBackend, AgentSession};
 
-/// Retries of one model request after a 429, a 5xx or a connection failure.
-pub const MAX_RETRIES: u32 = 3;
 /// Longest wait between retries.
 pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Bytes of an error response quoted in the error.
@@ -140,13 +138,15 @@ impl AgentBackend for ApiBackend {
             .local_workspace_root(&options.workflow_path);
         let workspace = validate_local_workspace(&options.workspace, &root)
             .map_err(CodexError::InvalidWorkspaceCwd)?;
-        let key =
-            match &api.api_key_env {
-                None => None,
-                Some(name) => Some(self.env.var(name).filter(|v| !v.is_empty()).ok_or_else(
-                    || CodexError::Backend(format!("the API key variable {name} is not set")),
-                )?),
-            };
+        let source = match (&api.api_key_file, &api.api_key_env) {
+            (Some(path), _) => Some(SecretSource::File(path.clone())),
+            (None, Some(name)) => Some(SecretSource::Env(name.clone())),
+            (None, None) => None,
+        };
+        let key = source
+            .map(|source| source.read(self.env.as_ref()))
+            .transpose()
+            .map_err(|err| CodexError::Backend(format!("no API key: {err}")))?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(api.request_timeout_ms))
             .build()
@@ -168,6 +168,15 @@ impl AgentBackend for ApiBackend {
                 timeout: Duration::from_millis(api.shell_timeout_ms),
                 secret_names,
                 extra_env: options.env.clone(),
+                masked_files: options
+                    .settings
+                    .llm
+                    .as_ref()
+                    .map(|llm| llm.secret_files())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(api.api_key_file.clone())
+                    .collect(),
             },
         );
         let system = self
@@ -261,7 +270,9 @@ impl ApiSession {
             }
             let response = match builder.send().await {
                 Ok(response) => response,
-                Err(err) if attempt < MAX_RETRIES && (err.is_connect() || err.is_timeout()) => {
+                Err(err)
+                    if attempt < self.api.max_retries && (err.is_connect() || err.is_timeout()) =>
+                {
                     tracing::warn!("Model request failed, retrying: {err}");
                     tokio::time::sleep(self.retry_delay(attempt, None)).await;
                     attempt += 1;
@@ -286,7 +297,7 @@ impl ApiSession {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .map(Duration::from_secs);
             let text = response.text().await.unwrap_or_default();
-            if retryable && attempt < MAX_RETRIES {
+            if retryable && attempt < self.api.max_retries {
                 tracing::warn!(status = status.as_u16(), "Model API busy, retrying");
                 tokio::time::sleep(self.retry_delay(attempt, retry_after)).await;
                 attempt += 1;

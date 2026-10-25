@@ -55,6 +55,9 @@ pub struct ShellPolicy {
     pub secret_names: Vec<String>,
     /// Env vars added before the secrets are removed.
     pub extra_env: Vec<(String, String)>,
+    /// Secret files hidden from sandboxed commands (bubblewrap binds `/dev/null` over them,
+    /// seatbelt denies reading them).
+    pub masked_files: Vec<PathBuf>,
 }
 
 /// The tools of one session.
@@ -602,6 +605,7 @@ impl Toolbox {
             &script,
             self.shell.network,
             Some(tmp.path()),
+            &self.shell.masked_files,
         );
         command
             .stdin(Stdio::null())
@@ -733,6 +737,7 @@ mod tests {
                 timeout: Duration::from_secs(10),
                 secret_names: Vec::new(),
                 extra_env: Vec::new(),
+                masked_files: Vec::new(),
             },
         )
     }

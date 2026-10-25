@@ -6,6 +6,7 @@
 
 pub mod backend;
 mod cast;
+pub mod llm;
 pub mod schema;
 pub mod tracker;
 pub mod value;
@@ -19,6 +20,7 @@ pub use backend::{
     ClaudeCodeSettings, SandboxMode,
 };
 pub use cast::{cast_boolean, cast_integer, cast_number, cast_string_list};
+pub use llm::{LlmConnection, LlmGateway, LlmProvider, SecretSource};
 pub use schema::{
     AgentSettings, BudgetSettings, CodexProvider, CodexSettings, HooksSettings,
     ObservabilitySettings, PollingSettings, ServerSettings, Settings, StringOrMap, TrackerSettings,
@@ -178,7 +180,12 @@ impl Settings {
             tracker::secret_environment_names(&self.tracker)
                 .into_iter()
                 .chain(self.server.secret_environment_names.iter().cloned())
-                .chain(backend::backend_secret_environment_names(&self.backends)),
+                .chain(backend::backend_secret_environment_names(&self.backends))
+                .chain(
+                    self.llm
+                        .iter()
+                        .flat_map(|_| llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)),
+                ),
         )
     }
 

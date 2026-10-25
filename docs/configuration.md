@@ -231,7 +231,56 @@ Named agent backends: `kind` (`codex`, `claude_code`, `api`), `model`, `prompt_t
 OpenAI-compatible provider without code are in [`agents.md`](agents.md). Errors name the entry,
 for example `backends.local.base_url is invalid` or `backends.local.model can't be blank`.
 Changes apply to new runs. `api_key_env` variables of `api` backends are read host-side and
-removed from every agent child environment like tracker secrets.
+removed from every agent child environment like tracker secrets; `api_key_file` (an absolute path,
+re-read for every session) wins over it. `max_retries` (`0..=10`, default 3) bounds the retries of
+one model request.
+
+### LLM connection contract
+
+Every core of the platform reads the same `LLM_*` environment variables (contract v1), so one
+Kubernetes Secret and ConfigMap configure model access everywhere. Symphony applies the contract
+once `LLM_PROVIDER` or `LLM_GATEWAY_URL` is set; values from `WORKFLOW.md` always win.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `LLM_PROVIDER` | yes, unless gateway mode | `anthropic`, `openai` or `openai-compatible` (Ollama, vLLM, LM Studio, OpenRouter, Groq, Together, Gemini's OpenAI endpoint, Azure OpenAI: anything that speaks OpenAI Chat Completions, by `LLM_BASE_URL`). In gateway mode it picks the wire format of the API loop (default `anthropic`). |
+| `LLM_BASE_URL` | for `openai-compatible` | The provider's API base URL (`http://` allowed). Defaults: `https://api.anthropic.com`, `https://api.openai.com/v1`. |
+| `LLM_API_KEY_FILE` | | File holding the key (preferred: a mounted Secret). Re-read for every session, so a rotated Secret applies to the next one. Wins over `LLM_API_KEY`. |
+| `LLM_API_KEY` | | The key as text. |
+| `LLM_MODEL` | yes | The model. |
+| `LLM_MODEL_SMALL` | | A small, fast model (Claude Code's background calls). |
+| `LLM_TIMEOUT_SECS` | | Timeout of one model request (`> 0`). |
+| `LLM_MAX_RETRIES` | | Retries of one request (`0..=10`). |
+| `LLM_GATEWAY_URL` | | **Gateway mode**: every model call goes to the platform's model gateway (attache), which speaks Anthropic Messages (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`). The root URL; a trailing `/v1` is ignored. Symphony then uses no provider key. |
+| `LLM_GATEWAY_TOKEN_FILE` | with the gateway | File holding the gateway token, sent as a bearer token. |
+
+Errors name the variable (`LLM_PROVIDER is invalid`, `LLM_MODEL can't be blank`) and fail the
+workflow load like any other setting. Setting `LLM_MODEL`, `LLM_BASE_URL` or a key without
+`LLM_PROVIDER` or `LLM_GATEWAY_URL` is an error, so a typo does not silently disable the contract.
+
+What the contract configures:
+
+| Where | Default it supplies | Overridden by |
+|---|---|---|
+| Built-in backend `llm` | An `api` backend (Symphony's agent loop, [agents.md](agents.md#api-the-built-in-agent-loop)) with the contract's wire format, endpoint, credential, model, timeout and retries. | `backends.llm` |
+| `agent.backend` | `llm` | `agent.backend` |
+| `api` backends | `provider`; and, when they set no `base_url` and use the contract's wire format, the endpoint, the credential and the model. A backend with its own `base_url` never receives the contract's key. `request_timeout_ms` and `max_retries` default from the contract. | the backend's own keys |
+| Codex | `codex.provider` (`symphony-llm`: the contract's OpenAI-compatible endpoint, `request_max_retries`, `stream_idle_timeout_ms`) and `codex.model`, for `openai` / `openai-compatible` and gateway mode (Codex speaks only the Responses API). Codex reads its key from the environment, so its process gets the credential as `SYMPHONY_LLM_API_KEY` (local runs; SSH workers need their own). | `codex.provider`, `codex.model` |
+| Claude Code (`claude_code`) | For `anthropic` and gateway mode (Claude Code speaks only Anthropic Messages): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (provider) or `ANTHROPIC_AUTH_TOKEN` (gateway; a stray `ANTHROPIC_API_KEY` is then removed), `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `API_TIMEOUT_MS`, and the backend's `model`. Claude Code has no retry setting. | the backend's `api_key_env`, `model` |
+
+Secrets: `LLM_API_KEY`, `LLM_API_KEY_FILE` and `LLM_GATEWAY_TOKEN_FILE` are removed from every
+agent child environment; the credential's value is redacted in recorded events; the key files read
+as empty inside the `api` backend's bubblewrap sandbox and are unreadable under seatbelt. The API
+loop keeps the key in Symphony's process. Codex and Claude Code call the model themselves, so they
+receive the credential; prefer gateway mode, whose token is the only secret they then see.
+
+In Kubernetes the chart in [`deploy/helm/symphony`](../deploy/helm/symphony) reads the shared
+ConfigMap `llm-config` (non-secret `LLM_*` keys, as `envFrom`) and mounts the shared Secret
+`llm-credentials` at `/var/run/secrets/llm` (`api-key` → `LLM_API_KEY_FILE`, `gateway-token` →
+`LLM_GATEWAY_TOKEN_FILE`). `global.llm.*` values (`provider`, `baseUrl`, `model`, `modelSmall`,
+`timeoutSecs`, `maxRetries`, `gatewayUrl`) win over the ConfigMap. With `global.llm.gatewayUrl`
+set, only the gateway token is mounted, so the pod holds no provider key. See
+[deployment.md](deployment.md#option-3-kubernetes-helm).
 
 ### `codex`
 

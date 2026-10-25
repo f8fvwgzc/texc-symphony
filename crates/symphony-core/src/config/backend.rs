@@ -22,10 +22,12 @@
 //! entry with its `base_url`; no code is needed.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
 use super::cast::{Errors, cast_boolean, cast_integer, cast_number, cast_string_list};
+use super::llm::{LLM_BACKEND, LlmConnection, SecretSource};
 use super::tracker::is_https_url;
 use crate::env;
 
@@ -35,6 +37,8 @@ pub const CODEX_BACKEND: &str = "codex";
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default OpenAI API base URL.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Retries of one model request of an `api` backend unless `max_retries` / `LLM_MAX_RETRIES`.
+pub const DEFAULT_API_RETRIES: u32 = 3;
 /// Tools the API agent loop can offer.
 pub const API_TOOLS: [&str; 6] = [
     "read_file",
@@ -132,6 +136,10 @@ pub struct ApiBackendSettings {
     /// Name of the env var holding the API key (sent as `x-api-key` / `Authorization: Bearer`).
     /// Read host-side and removed from every agent child. Unset: no key is sent.
     pub api_key_env: Option<String>,
+    /// File holding the API key (wins over `api_key_env`; re-read for every session).
+    pub api_key_file: Option<PathBuf>,
+    /// Retries of one model request after a 429, a 5xx or a connection failure.
+    pub max_retries: u32,
     /// Extra request headers (non-secret, e.g. OpenRouter's `HTTP-Referer`).
     pub headers: BTreeMap<String, String>,
     /// Tools offered to the model (subset of [`API_TOOLS`]).
@@ -304,6 +312,16 @@ impl Entry<'_> {
         cast
     }
 
+    fn path(&self, key: &str, errors: &mut Errors) -> Option<PathBuf> {
+        let value = self.string(key, errors)?;
+        if Path::new(&value).is_absolute() {
+            Some(PathBuf::from(value))
+        } else {
+            errors.push(&self.key(key), "must be an absolute path");
+            None
+        }
+    }
+
     fn env_name(&self, key: &str, errors: &mut Errors) -> Option<String> {
         let value = self.string(key, errors)?;
         // `$NAME` is accepted too, for symmetry with other `$VAR` settings.
@@ -377,7 +395,45 @@ fn cast_claude(entry: &Entry<'_>, errors: &mut Errors) -> ClaudeCodeSettings {
     out
 }
 
-fn cast_api(entry: &Entry<'_>, errors: &mut Errors) -> Option<ApiBackendSettings> {
+/// The `api` settings of the built-in `llm` backend.
+fn api_from_contract(llm: &LlmConnection) -> ApiBackendSettings {
+    let (api_key_env, api_key_file) = credential_fields(llm.credential());
+    ApiBackendSettings {
+        provider: llm.wire(),
+        base_url: llm.api_base_url(),
+        api_key_env,
+        api_key_file,
+        max_retries: llm.max_retries.unwrap_or(DEFAULT_API_RETRIES),
+        headers: BTreeMap::new(),
+        tools: API_TOOLS.iter().map(|t| (*t).to_owned()).collect(),
+        max_steps: 50,
+        max_output_tokens: 8192,
+        temperature: None,
+        stream: true,
+        request_timeout_ms: llm.timeout_secs.map_or(600_000, |s| s.saturating_mul(1000)),
+        sandbox: SandboxMode::Auto,
+        network: false,
+        shell_timeout_ms: 600_000,
+    }
+}
+
+fn credential_fields(source: Option<&SecretSource>) -> (Option<String>, Option<PathBuf>) {
+    match source {
+        Some(SecretSource::Env(name)) => (Some(name.clone()), None),
+        Some(SecretSource::File(path)) => (None, Some(path.clone())),
+        None => (None, None),
+    }
+}
+
+/// Casts an `api` entry. Fields left out default from the LLM contract (`llm`): the provider,
+/// and, when the provider matches and no `base_url` is set, the endpoint, the credential and the
+/// model (a backend with its own endpoint never receives the contract's key). The `bool` says
+/// whether the endpoint came from the contract.
+fn cast_api(
+    entry: &Entry<'_>,
+    llm: Option<&LlmConnection>,
+    errors: &mut Errors,
+) -> Option<(ApiBackendSettings, bool)> {
     let before = errors.len();
     let provider = match entry.string("provider", errors).as_deref() {
         Some("anthropic") => Some(ApiProvider::Anthropic),
@@ -386,10 +442,13 @@ fn cast_api(entry: &Entry<'_>, errors: &mut Errors) -> Option<ApiBackendSettings
             errors.push(&entry.key("provider"), "is invalid");
             None
         }
-        None => {
-            errors.push(&entry.key("provider"), "can't be blank");
-            None
-        }
+        None => match llm {
+            Some(llm) => Some(llm.wire()),
+            None => {
+                errors.push(&entry.key("provider"), "can't be blank");
+                None
+            }
+        },
     };
     let base_url = entry.token("base_url", errors);
     if let Some(url) = &base_url
@@ -451,13 +510,40 @@ fn cast_api(entry: &Entry<'_>, errors: &mut Errors) -> Option<ApiBackendSettings
             }
         },
     };
+    let contract = llm.filter(|llm| base_url.is_none() && provider == Some(llm.wire()));
+    let explicit_key = (
+        entry.env_name("api_key_env", errors),
+        entry.path("api_key_file", errors),
+    );
+    let (api_key_env, api_key_file) = match (explicit_key, contract) {
+        ((None, None), Some(llm)) => credential_fields(llm.credential()),
+        (explicit, _) => explicit,
+    };
+    let max_retries = match entry.get("max_retries") {
+        None => llm
+            .and_then(|l| l.max_retries)
+            .unwrap_or(DEFAULT_API_RETRIES),
+        Some(value) => match cast_integer(value) {
+            Some(n) if (0..=i64::from(super::llm::MAX_LLM_RETRIES)).contains(&n) => n as u32,
+            _ => {
+                errors.push(&entry.key("max_retries"), "is invalid");
+                DEFAULT_API_RETRIES
+            }
+        },
+    };
     let api = ApiBackendSettings {
         provider: provider.unwrap_or(ApiProvider::OpenAi),
-        base_url: base_url.unwrap_or_else(|| match provider {
-            Some(ApiProvider::Anthropic) => ANTHROPIC_BASE_URL.to_owned(),
-            _ => OPENAI_BASE_URL.to_owned(),
-        }),
-        api_key_env: entry.env_name("api_key_env", errors),
+        base_url: match (base_url, contract) {
+            (Some(url), _) => url,
+            (None, Some(llm)) => llm.api_base_url(),
+            (None, None) => match provider {
+                Some(ApiProvider::Anthropic) => ANTHROPIC_BASE_URL.to_owned(),
+                _ => OPENAI_BASE_URL.to_owned(),
+            },
+        },
+        api_key_env,
+        api_key_file,
+        max_retries,
         headers,
         tools,
         max_steps: entry.positive_u32("max_steps", errors).unwrap_or(50),
@@ -468,17 +554,25 @@ fn cast_api(entry: &Entry<'_>, errors: &mut Errors) -> Option<ApiBackendSettings
         stream: entry.boolean("stream", errors).unwrap_or(true),
         request_timeout_ms: entry
             .positive("request_timeout_ms", errors)
-            .unwrap_or(600_000),
+            .unwrap_or_else(|| {
+                llm.and_then(|l| l.timeout_secs)
+                    .map_or(600_000, |s| s.saturating_mul(1000))
+            }),
         sandbox,
         network: entry.boolean("network", errors).unwrap_or(false),
         shell_timeout_ms: entry
             .positive("shell_timeout_ms", errors)
             .unwrap_or(600_000),
     };
-    (errors.len() == before).then_some(api)
+    (errors.len() == before).then_some((api, contract.is_some()))
 }
 
-fn cast_entry(name: &str, value: &Value, errors: &mut Errors) -> Option<BackendSettings> {
+fn cast_entry(
+    name: &str,
+    value: &Value,
+    llm: Option<&LlmConnection>,
+    errors: &mut Errors,
+) -> Option<BackendSettings> {
     let path = format!("backends.{name}");
     if !valid_name(name) {
         errors.push(&path, "is invalid");
@@ -490,10 +584,25 @@ fn cast_entry(name: &str, value: &Value, errors: &mut Errors) -> Option<BackendS
     };
     let entry = Entry { path, map };
     let before = errors.len();
+    // The contract's model applies where its endpoint does.
+    let mut contract_model = None;
     let kind = match entry.string("kind", errors).as_deref() {
         Some("codex") => Some(BackendKind::Codex),
-        Some("claude_code") => Some(BackendKind::ClaudeCode(cast_claude(&entry, errors))),
-        Some("api") => cast_api(&entry, errors).map(BackendKind::Api),
+        Some("claude_code") => {
+            let claude = cast_claude(&entry, errors);
+            if claude.api_key_env.is_none() {
+                contract_model = llm
+                    .filter(|l| l.serves_anthropic())
+                    .map(|l| l.model.clone());
+            }
+            Some(BackendKind::ClaudeCode(claude))
+        }
+        Some("api") => cast_api(&entry, llm, errors).map(|(api, from_contract)| {
+            if from_contract {
+                contract_model = llm.map(|l| l.model.clone());
+            }
+            BackendKind::Api(api)
+        }),
         Some(_) => {
             errors.push(&entry.key("kind"), "is invalid");
             None
@@ -503,7 +612,7 @@ fn cast_entry(name: &str, value: &Value, errors: &mut Errors) -> Option<BackendS
             None
         }
     };
-    let model = entry.token("model", errors);
+    let model = entry.token("model", errors).or(contract_model);
     if matches!(kind, Some(BackendKind::Api(_))) && model.is_none() && errors.len() == before {
         errors.push(&entry.key("model"), "can't be blank");
     }
@@ -521,9 +630,11 @@ fn cast_entry(name: &str, value: &Value, errors: &mut Errors) -> Option<BackendS
     (errors.len() == before).then_some(settings)
 }
 
-/// Casts `backends:` (a map of name to entry) and adds the built-in `codex` entry.
+/// Casts `backends:` (a map of name to entry) and adds the built-in `codex` entry and, with the
+/// LLM contract, the built-in `llm` entry (both unless the workflow defines its own).
 pub(crate) fn cast_backends(
     root: &Map<String, Value>,
+    llm: Option<&LlmConnection>,
     errors: &mut Errors,
 ) -> BTreeMap<String, BackendSettings> {
     let mut out = BTreeMap::new();
@@ -531,7 +642,7 @@ pub(crate) fn cast_backends(
         None | Some(Value::Null) => {}
         Some(Value::Object(map)) => {
             for (name, value) in map {
-                if let Some(entry) = cast_entry(name, value, errors) {
+                if let Some(entry) = cast_entry(name, value, llm, errors) {
                     out.insert(name.clone(), entry);
                 }
             }
@@ -540,6 +651,18 @@ pub(crate) fn cast_backends(
     }
     out.entry(CODEX_BACKEND.to_owned())
         .or_insert_with(BackendSettings::codex);
+    if let Some(llm) = llm {
+        out.entry(LLM_BACKEND.to_owned())
+            .or_insert_with(|| BackendSettings {
+                name: LLM_BACKEND.to_owned(),
+                kind: BackendKind::Api(api_from_contract(llm)),
+                model: Some(llm.model.clone()),
+                prompt_template: None,
+                system_prompt: None,
+                pricing: None,
+                turn_timeout_ms: 3_600_000,
+            });
+    }
     out
 }
 

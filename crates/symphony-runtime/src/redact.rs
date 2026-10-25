@@ -101,17 +101,24 @@ impl Redactor {
         Self { secrets }
     }
 
-    /// The secrets of `settings`: the resolved tracker key, the API token and the values of
-    /// every env var stripped from agent children.
+    /// The secrets of `settings`: the resolved tracker key, the API token, the LLM contract's
+    /// credential and the values of every env var stripped from agent children.
     pub fn from_settings(settings: &Settings, env: &dyn EnvSource) -> Self {
         let from_env = settings
             .secret_environment_names()
             .into_iter()
             .filter_map(|name| env.var(&name));
+        // The LLM contract's credential may live in a file (a mounted Secret).
+        let llm = settings
+            .llm
+            .as_ref()
+            .and_then(|llm| llm.credential())
+            .and_then(|source| source.read(env).ok());
         Self::new(
             from_env
                 .chain(settings.tracker.api_key.clone())
-                .chain(settings.server.api_token.clone()),
+                .chain(settings.server.api_token.clone())
+                .chain(llm),
         )
     }
 

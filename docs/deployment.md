@@ -34,6 +34,7 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
 | `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
 | `SYMPHONY_API_TOKEN` | unset | API bearer token when `server.api_token` is not set; required for a non-loopback `SYMPHONY_HOST` |
+| `LLM_*` | unset | the platform LLM connection contract: provider, endpoint, key file, model, gateway ([configuration.md](configuration.md#llm-connection-contract)) |
 | `SYMPHONY_LOG_FORMAT` | `text` | `json` for one JSON object per line on stdout (the log file stays text) |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info` or `symphony=debug,info` |
 | `SYMPHONY_SSH_CONFIG` | | SSH client config for `worker.ssh_hosts` |
@@ -108,7 +109,30 @@ cd docker && cp .env.example .env && mkdir -p config && cp WORKFLOW.example.md c
 docker compose up -d
 ```
 
-## Option 3: systemd (Linux server, binary install)
+## Option 3: Kubernetes (Helm)
+
+The chart in [`deploy/helm/symphony`](../deploy/helm/symphony) runs one replica with the image,
+`WORKFLOW.md` from values (a ConfigMap at `/config`), persistent volumes for `/data` and
+`/workspaces`, the API token from a Secret, and the platform LLM connection contract
+([configuration.md](configuration.md#llm-connection-contract)):
+
+```sh
+kubectl create secret generic symphony-api-token --from-literal=token="$(openssl rand -hex 32)"
+kubectl create configmap llm-config --from-literal=LLM_GATEWAY_URL=http://attache-gateway:8080 \
+  --from-literal=LLM_MODEL=claude-sonnet-4-5          # usually shared by every core
+kubectl create secret generic llm-credentials --from-file=gateway-token=./gateway-token
+helm install symphony deploy/helm/symphony --set acknowledgeGuardrails=true \
+  --set global.llm.gatewayUrl=http://attache-gateway:8080
+```
+
+- `global.llm.*` (`provider`, `baseUrl`, `model`, `modelSmall`, `timeoutSecs`, `maxRetries`,
+  `gatewayUrl`) set `LLM_*` explicitly and win over the `llm-config` ConfigMap. Set
+  `global.llm.gatewayUrl` in gateway mode so only the gateway token is mounted.
+- Credentials are files under `/var/run/secrets/llm` (Secret `llm-credentials`, keys `api-key`
+  and `gateway-token`, both optional). Set `global.llm.apiKeySecretKey=""` for keyless servers.
+- The pod runs as uid 10001 with no capabilities. `make helm-check` lints and renders the chart.
+
+## Option 4: systemd (Linux server, binary install)
 
 Create a service user and directories:
 

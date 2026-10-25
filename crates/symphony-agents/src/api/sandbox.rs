@@ -76,7 +76,12 @@ fn sb_string(path: &Path) -> String {
 }
 
 /// The seatbelt profile for `workspace` (`writable` adds further writable directories).
-pub fn seatbelt_profile(workspace: &Path, writable: &[PathBuf], network: bool) -> String {
+pub fn seatbelt_profile(
+    workspace: &Path,
+    writable: &[PathBuf],
+    network: bool,
+    masked: &[PathBuf],
+) -> String {
     let mut roots = vec![workspace.to_path_buf(), PathBuf::from("/private/tmp")];
     roots.extend(writable.iter().cloned());
     let subpaths: Vec<String> = roots
@@ -101,6 +106,12 @@ pub fn seatbelt_profile(workspace: &Path, writable: &[PathBuf], network: bool) -
     if !network {
         profile.push_str("(deny network*)\n");
     }
+    for file in masked {
+        profile.push_str(&format!(
+            "(deny file-read* (literal {}))\n",
+            sb_string(file)
+        ));
+    }
     profile
 }
 
@@ -114,6 +125,7 @@ pub fn command(
     script: &str,
     network: bool,
     tmp: Option<&Path>,
+    masked: &[PathBuf],
 ) -> Command {
     let script = format!("exec 2>&1\n{script}");
     let mut command = match confinement {
@@ -136,6 +148,10 @@ pub fn command(
             if !network {
                 command.arg("--unshare-net");
             }
+            // Secret files (the LLM key, ...) read as empty inside the sandbox.
+            for file in masked.iter().filter(|f| f.is_file()) {
+                command.args(["--ro-bind", "/dev/null"]).arg(file);
+            }
             command
                 .arg("--die-with-parent")
                 .arg("--chdir")
@@ -149,7 +165,7 @@ pub fn command(
             let mut command = Command::new(sandbox_exec);
             command
                 .arg("-p")
-                .arg(seatbelt_profile(workspace, &writable, network))
+                .arg(seatbelt_profile(workspace, &writable, network, masked))
                 .args(["bash", "-lc"])
                 .arg(&script);
             command
@@ -173,7 +189,13 @@ mod tests {
 
     #[test]
     fn seatbelt_profiles_confine_writes_and_network() {
-        let profile = seatbelt_profile(Path::new("/w/MT-1"), &[PathBuf::from("/t")], false);
+        let profile = seatbelt_profile(
+            Path::new("/w/MT-1"),
+            &[PathBuf::from("/t")],
+            false,
+            &[PathBuf::from("/run/secrets/llm/api-key")],
+        );
+        assert!(profile.contains("(deny file-read* (literal \"/run/secrets/llm/api-key\"))"));
         assert!(profile.contains("(deny file-write*)"));
         assert!(profile.contains("(subpath \"/w/MT-1\")"));
         assert!(profile.contains("(subpath \"/t\")"));
@@ -181,7 +203,7 @@ mod tests {
         assert!(profile.contains("(deny appleevent-send)"));
         assert!(profile.contains("(literal \"/usr/bin/open\")"));
         assert!(profile.contains("com.apple.lsd.mapdb"));
-        assert!(!seatbelt_profile(Path::new("/w"), &[], true).contains("network*"));
+        assert!(!seatbelt_profile(Path::new("/w"), &[], true, &[]).contains("network*"));
         assert_eq!(sb_string(Path::new("/a\"b")), "\"/a\\\"b\"");
     }
 
@@ -193,6 +215,7 @@ mod tests {
             "ls",
             false,
             None,
+            &[],
         );
         let args: Vec<String> = command
             .as_std()

@@ -30,6 +30,9 @@ environment.
 loop over Anthropic Messages or OpenAI-compatible Chat Completions with workspace tools (files, a
 sandboxed shell) and the scoped tracker tools. A new OpenAI-compatible provider (OpenAI, Ollama,
 vLLM, LM Studio, OpenRouter, Groq, Together, Gemini's OpenAI endpoint) is a few lines of config.
+On the platform, the shared `LLM_*` connection contract (including gateway mode) configures all
+three ([configuration](docs/configuration.md#llm-connection-contract)); a Helm chart is in
+[`deploy/helm/symphony`](deploy/helm/symphony).
 
 **Task API.** Products assign work without a tracker: `POST /api/v1/tasks` with a prompt and,
 optionally, a repository, backend and limits; then cancel, unblock or watch it over SSE

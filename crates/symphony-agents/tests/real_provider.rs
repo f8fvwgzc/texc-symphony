@@ -34,6 +34,8 @@ async fn one_turn(provider: ApiProvider, base_url: String, key_env: &str, model:
             provider,
             base_url,
             api_key_env: Some(key_env.into()),
+            api_key_file: None,
+            max_retries: 3,
             headers: Default::default(),
             tools: vec!["write_file".into(), "read_file".into()],
             max_steps: 4,

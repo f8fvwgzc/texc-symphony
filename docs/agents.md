@@ -33,7 +33,10 @@ backends:
 | `api` | Symphony's own agent loop over a model API | native tools | no |
 
 `codex` always exists; define `backends.codex` only to set its `model`, `prompt_template` or
-`pricing`.
+`pricing`. With the platform's LLM connection contract (`LLM_*` environment,
+[configuration.md](configuration.md#llm-connection-contract)) there is also a built-in `llm`
+backend (an `api` backend from the contract), which becomes the default; the contract also
+supplies defaults to the other backends.
 
 ## Adding a provider (no code)
 

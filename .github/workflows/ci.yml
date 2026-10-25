@@ -104,6 +104,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  helm:
+    name: helm (lint + template)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install helm
+        uses: azure/setup-helm@v5 # v5.0.1
+        with:
+          version: v3.19.0
+
+      - name: Lint and render the chart
+        run: make helm-check
+
   docker:
     name: docker (linux/amd64 + linux/arm64)
     runs-on: ubuntu-24.04

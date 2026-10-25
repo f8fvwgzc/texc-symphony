@@ -13,8 +13,9 @@
 //! The prompt goes to stdin. The first turn starts a new Claude session; its id (from the `init`
 //! or `result` message) is passed as `--resume` on later turns, so a multi-turn run keeps its
 //! context. `--output-format stream-json` lines become events ([`stream`]). When
-//! `api_key_env` is set its value is passed as `ANTHROPIC_API_KEY`; otherwise Claude Code uses
-//! its own login. A turn that prints nothing for `turn_timeout_ms` is killed (`turn_timeout`);
+//! `api_key_env` is set its value is passed as `ANTHROPIC_API_KEY`; otherwise the LLM contract
+//! applies when it serves Anthropic Messages ([`contract_env`]), and else Claude Code uses its own
+//! login. A turn that prints nothing for `turn_timeout_ms` is killed (`turn_timeout`);
 //! a dropped turn kills its whole process group.
 //!
 //! The tracker's scoped tools reach Claude Code through MCP ([`crate::mcp`]): when the session
@@ -51,6 +52,44 @@ use crate::{AgentBackend, AgentSession};
 
 /// Env var Claude Code reads its API key from.
 pub const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
+
+/// Claude Code's environment for the LLM contract: the gateway (`ANTHROPIC_BASE_URL` +
+/// `ANTHROPIC_AUTH_TOKEN`) or the provider (`ANTHROPIC_BASE_URL` when set + `ANTHROPIC_API_KEY`),
+/// the small model (`ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`) and the request
+/// timeout (`API_TIMEOUT_MS`). Claude Code has no retry setting.
+pub fn contract_env(
+    llm: &symphony_core::config::LlmConnection,
+    env: &dyn EnvSource,
+) -> Result<Vec<(String, String)>, CodexError> {
+    let mut out = Vec::new();
+    let credential = llm
+        .credential()
+        .map(|source| source.read(env))
+        .transpose()
+        .map_err(|err| CodexError::Backend(format!("no LLM credential for Claude Code: {err}")))?;
+    if llm.gateway.is_some() || llm.base_url.is_some() {
+        out.push(("ANTHROPIC_BASE_URL".to_owned(), llm.anthropic_base_url()));
+    }
+    if let Some(credential) = credential {
+        let name = if llm.gateway.is_some() {
+            "ANTHROPIC_AUTH_TOKEN"
+        } else {
+            ANTHROPIC_API_KEY
+        };
+        out.push((name.to_owned(), credential));
+    }
+    if let Some(small) = &llm.model_small {
+        out.push(("ANTHROPIC_SMALL_FAST_MODEL".to_owned(), small.clone()));
+        out.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL".to_owned(), small.clone()));
+    }
+    if let Some(secs) = llm.timeout_secs {
+        out.push((
+            "API_TIMEOUT_MS".to_owned(),
+            secs.saturating_mul(1000).to_string(),
+        ));
+    }
+    Ok(out)
+}
 /// Longest stdout line accepted (longer lines are skipped).
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// stderr lines kept for error messages.
@@ -205,10 +244,19 @@ impl AgentBackend for ClaudeCodeBackend {
                 .into_iter()
                 .chain(options.tool_handler.secret_environment_names()),
         );
-        if api_key.is_some() {
-            // Replaced below by the configured key rather than removed.
-            secret_names.retain(|name| name != ANTHROPIC_API_KEY);
-        }
+        let llm_env = match (api_key, &options.settings.llm) {
+            (Some(key), _) => vec![(ANTHROPIC_API_KEY.to_owned(), key)],
+            (None, Some(llm)) if llm.serves_anthropic() => {
+                if llm.gateway.is_some() {
+                    // Every call goes through the gateway: no provider key may bypass it.
+                    secret_names.push(ANTHROPIC_API_KEY.to_owned());
+                }
+                contract_env(llm, self.env.as_ref())?
+            }
+            (None, _) => Vec::new(),
+        };
+        // Set below rather than removed.
+        secret_names.retain(|name| !llm_env.iter().any(|(set, _)| set == name));
         let relay = self.relay(&options).await;
         Ok(Box::new(ClaudeSession {
             backend: self.settings.clone(),
@@ -217,7 +265,7 @@ impl AgentBackend for ClaudeCodeBackend {
             bash,
             secret_names,
             env: options.env,
-            api_key,
+            llm_env,
             thread_id: local_thread_id(),
             claude_session: None,
             usage: Usage::default(),
@@ -260,7 +308,8 @@ struct ClaudeSession {
     bash: PathBuf,
     secret_names: Vec<String>,
     env: Vec<(String, String)>,
-    api_key: Option<String>,
+    /// Model access variables (configured key or LLM contract), set last.
+    llm_env: Vec<(String, String)>,
     thread_id: String,
     claude_session: Option<String>,
     usage: Usage,
@@ -309,8 +358,8 @@ impl ClaudeSession {
         for name in &self.secret_names {
             command.env_remove(name);
         }
-        if let Some(key) = &self.api_key {
-            command.env(ANTHROPIC_API_KEY, key);
+        for (name, value) in &self.llm_env {
+            command.env(name, value);
         }
         command
     }
