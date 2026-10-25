@@ -1593,10 +1593,15 @@ async fn the_kill_switch_stops_everything_survives_a_restart_and_resumes() {
         snapshot.spend.stopped_reason.as_deref(),
         Some("dispatch paused: runaway spend")
     );
-    assert_eq!(
-        store.control(PAUSED_CONTROL_KEY).await.unwrap().as_deref(),
-        Some("runaway spend")
-    );
+    let mut persisted = None;
+    for _ in 0..100 {
+        persisted = store.control(PAUSED_CONTROL_KEY).await.unwrap();
+        if persisted.is_some() {
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    assert_eq!(persisted.as_deref(), Some("runaway spend"));
     drop(orch);
 
     // A restarted orchestrator comes back paused.
@@ -1619,7 +1624,16 @@ async fn the_kill_switch_stops_everything_survives_a_restart_and_resumes() {
     orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
         .await;
     assert!(orch.state.running.contains_key("i-1"));
-    assert_eq!(store.control(PAUSED_CONTROL_KEY).await.unwrap(), None);
+    // The write is retried in the background until the store takes it.
+    let mut released = false;
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    assert!(released, "the release was persisted");
     assert_eq!(started.lock().unwrap().len(), 2);
     orch.terminate_running_issue("i-1", false, "test").await;
 }
@@ -1636,4 +1650,49 @@ async fn released_claims_drop_the_completed_bookkeeping() {
     assert!(orch.state.completed.contains("i-1"));
     orch.release_issue_claim("i-1");
     assert!(!orch.state.completed.contains("i-1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn raising_the_issue_budget_releases_budget_blocked_issues() {
+    let store = Store::open_in_memory().unwrap();
+    let previous = store
+        .start_run(symphony_store::NewRun::new("i-1", "MT-1"))
+        .await
+        .unwrap();
+    store
+        .update_usage(
+            previous,
+            symphony_store::TokenUsage {
+                input: 100,
+                output: 50,
+                total: 150,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"budget": {"max_tokens_per_issue": 100}}),
+        blocking_factory(Arc::clone(&started)),
+        store,
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.blocked.contains_key("i-1"));
+    // Still over budget: the block holds.
+    orch.reconcile_blocked_issues().await;
+    assert!(orch.state.blocked.contains_key("i-1"));
+
+    h.wf.rewrite(json!({"budget": {"max_tokens_per_issue": 1000}}));
+    orch.ctx.workflow.force_reload().unwrap();
+    orch.reconcile_blocked_issues().await;
+    assert!(!orch.state.blocked.contains_key("i-1"));
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    orch.terminate_running_issue("i-1", false, "test").await;
 }

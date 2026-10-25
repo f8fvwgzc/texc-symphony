@@ -64,8 +64,14 @@ the server shows a placeholder page. `make build` (below) does both.
 **C. Docker** (amd64 and arm64):
 
 ```sh
-docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" -e LINEAR_API_KEY ghcr.io/f8fvwgzc/texc-symphony:latest
+export SYMPHONY_API_TOKEN="$(openssl rand -hex 32)"   # the container binds 0.0.0.0: a token is required
+docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" \
+  -e LINEAR_API_KEY -e SYMPHONY_API_TOKEN ghcr.io/f8fvwgzc/texc-symphony:latest \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md
 ```
+
+Pass the acknowledgement flag only after reviewing the sandbox settings in your `WORKFLOW.md`; the
+image does not pass it for you.
 
 The image includes git and the Codex CLI. For Compose, persistent volumes, Codex login inside the
 container and reverse proxies, see [`docker/README.md`](docker/README.md).

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use symphony_core::WorkflowStore;
+use symphony_core::{ProcessEnv, WorkflowStore};
 use symphony_runtime::redact::Redactor;
 use symphony_runtime::{
     BlockedSnapshot, CodexMessage, RefreshError, RetrySnapshot, RunningSnapshot, RuntimeHandle,
@@ -33,18 +33,18 @@ impl RuntimeControlPlane {
     }
 }
 
-/// The humanized last message, with credential-shaped text redacted (it reaches every client of
-/// `/api/v1/state` and the SSE stream).
-fn last_message(message: Option<&CodexMessage>) -> Option<String> {
+/// The humanized last message, with known secrets and credential-shaped text redacted (it
+/// reaches every client of `/api/v1/state` and the SSE stream).
+fn last_message(redactor: &Redactor, message: Option<&CodexMessage>) -> Option<String> {
     let text = humanize_codex_message(Some(message?));
-    Some(Redactor::patterns_only().redact_str(&text).into_owned())
+    Some(redactor.redact_str(&text).into_owned())
 }
 
 fn usd(micro: u64) -> f64 {
     micro as f64 / 1_000_000.0
 }
 
-fn running_entry(row: &RunningSnapshot) -> RunningEntry {
+fn running_entry(row: &RunningSnapshot, redactor: &Redactor) -> RunningEntry {
     RunningEntry {
         issue_id: row.issue_id.clone(),
         issue_identifier: row.identifier.clone(),
@@ -55,7 +55,7 @@ fn running_entry(row: &RunningSnapshot) -> RunningEntry {
         session_id: row.session_id.clone(),
         turn_count: row.turn_count,
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: last_message(row.last_codex_message.as_ref()),
+        last_message: last_message(redactor, row.last_codex_message.as_ref()),
         started_at: Some(row.started_at),
         last_event_at: row.last_codex_timestamp,
         tokens: TokenCounts {
@@ -79,7 +79,7 @@ fn retry_entry(row: &RetrySnapshot, now: DateTime<Utc>) -> RetryEntry {
     }
 }
 
-fn blocked_entry(row: &BlockedSnapshot) -> BlockedEntry {
+fn blocked_entry(row: &BlockedSnapshot, redactor: &Redactor) -> BlockedEntry {
     BlockedEntry {
         issue_id: row.issue_id.clone(),
         issue_identifier: row.identifier.clone(),
@@ -91,21 +91,40 @@ fn blocked_entry(row: &BlockedSnapshot) -> BlockedEntry {
         session_id: row.session_id.clone(),
         blocked_at: Some(row.blocked_at),
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: last_message(row.last_codex_message.as_ref()),
+        last_message: last_message(redactor, row.last_codex_message.as_ref()),
         last_event_at: row.last_codex_timestamp,
     }
 }
 
-/// Projects a runtime [`Snapshot`] onto the API's [`StateView`] (`due_at` relative to `now`).
+/// Projects a runtime [`Snapshot`] onto the API's [`StateView`] (`due_at` relative to `now`),
+/// redacting credential-shaped text in messages.
 pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
+    state_view_redacted(snapshot, now, &Redactor::patterns_only())
+}
+
+/// [`state_view`] with `redactor` (the live control plane passes one built from the settings, so
+/// configured secret values are redacted too).
+pub fn state_view_redacted(
+    snapshot: &Snapshot,
+    now: DateTime<Utc>,
+    redactor: &Redactor,
+) -> StateView {
     StateView {
-        running: snapshot.running.iter().map(running_entry).collect(),
+        running: snapshot
+            .running
+            .iter()
+            .map(|row| running_entry(row, redactor))
+            .collect(),
         retrying: snapshot
             .retrying
             .iter()
             .map(|row| retry_entry(row, now))
             .collect(),
-        blocked: snapshot.blocked.iter().map(blocked_entry).collect(),
+        blocked: snapshot
+            .blocked
+            .iter()
+            .map(|row| blocked_entry(row, redactor))
+            .collect(),
         codex_totals: CodexTotals {
             input_tokens: snapshot.codex_totals.input_tokens,
             output_tokens: snapshot.codex_totals.output_tokens,
@@ -133,7 +152,10 @@ pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
 impl ControlPlane for RuntimeControlPlane {
     async fn state(&self) -> Result<StateView, StateError> {
         match self.handle.snapshot().await {
-            Ok(snapshot) => Ok(state_view(&snapshot, Utc::now())),
+            Ok(snapshot) => {
+                let redactor = Redactor::from_settings(&self.workflow.settings(), &ProcessEnv);
+                Ok(state_view_redacted(&snapshot, Utc::now(), &redactor))
+            }
             Err(SnapshotError::Timeout) => Err(StateError::Timeout),
             Err(SnapshotError::Unavailable) => Err(StateError::Unavailable),
         }

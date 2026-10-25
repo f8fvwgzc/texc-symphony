@@ -320,13 +320,17 @@ pub fn check_scope(
         }
         [tasks] if tasks.is("tasks") => {
             let projects = scope::string_array(call.body.as_ref(), "/data/projects");
-            if call.method == Method::Post && projects.contains(&project.as_str()) {
+            // Exactly the configured project: extra entries would file the task elsewhere too.
+            if call.method == Method::Post
+                && !projects.is_empty()
+                && projects.iter().all(|p| *p == project.as_str())
+            {
                 Ok(ScopeTarget::Project)
             } else {
                 Err(Denied::new(
                     "body_out_of_scope",
                     format!(
-                        "`{}` may only create tasks with POST /tasks whose data.projects includes {project}.",
+                        "`{}` may only create tasks with POST /tasks whose data.projects is [{project}].",
                         TOOL.name
                     ),
                 ))
