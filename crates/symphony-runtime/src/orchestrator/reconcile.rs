@@ -150,21 +150,6 @@ impl Orchestrator<'_> {
     /// `reconcile_blocked_issues/1` (B.6.4). Blocked issues are never auto-retried, except that an
     /// issue blocked by its budget is released once the (possibly raised) budget allows it again.
     pub(crate) async fn reconcile_blocked_issues(&mut self) {
-        let budget = self.settings().budget.clone();
-        let affordable: Vec<String> = self
-            .state
-            .blocked
-            .iter()
-            .filter(|(id, entry)| {
-                spend::is_issue_budget_error(&entry.error)
-                    && self.state.spend.issue_stop(id, &budget).is_none()
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in affordable {
-            tracing::info!("Issue budget allows issue_id={id} again; releasing its block");
-            self.release_issue_claim(&id);
-        }
         let mut ids: Vec<String> = self.state.blocked.keys().cloned().collect();
         if ids.is_empty() {
             return;
@@ -184,7 +169,31 @@ impl Orchestrator<'_> {
                     );
                     self.release_issue_claim(id);
                 }
+                // After the refresh, so terminal issues were cleaned up first.
+                self.release_affordable_budget_blocks(&settings.budget);
             }
+        }
+    }
+
+    /// Releases the issues blocked by an exhausted issue budget that the (possibly raised)
+    /// budget allows again; the next poll dispatches them normally.
+    pub(crate) fn release_affordable_budget_blocks(
+        &mut self,
+        budget: &symphony_core::config::BudgetSettings,
+    ) {
+        let affordable: Vec<String> = self
+            .state
+            .blocked
+            .iter()
+            .filter(|(id, entry)| {
+                spend::is_issue_budget_error(&entry.error)
+                    && self.state.spend.issue_stop(id, budget).is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in affordable {
+            tracing::info!("Issue budget allows issue_id={id} again; releasing its block");
+            self.release_issue_claim(&id);
         }
     }
 
