@@ -82,8 +82,10 @@ ENV CARGO_TERM_COLOR=never \
     CARGO_INCREMENTAL=0 \
     SYMPHONY_WEB_DIST=/src/web/dist \
     SYMPHONY_VERSION_SUFFIX=${SYMPHONY_VERSION_SUFFIX}
-RUN --mount=type=cache,id=symphony-cargo-registry,target=/usr/local/cargo/registry,sharing=shared \
-    --mount=type=cache,id=symphony-cargo-git,target=/usr/local/cargo/git,sharing=shared \
+# The registry and git caches are `locked`: the two platform builds run in parallel, and two
+# cargo processes unpacking the same new crate into a shared cache fail ("failed to unpack").
+RUN --mount=type=cache,id=symphony-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=symphony-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=symphony-target-${TARGETPLATFORM},target=/src/target,sharing=locked \
     xx-cargo build --release --locked ${CARGO_BUILD_ARGS} && \
     triple="$(xx-cargo --print-target-triple)" && \
