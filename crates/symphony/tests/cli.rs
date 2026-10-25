@@ -168,21 +168,23 @@ fn invalid_environment_fallbacks_are_named() {
 
 #[cfg(unix)]
 mod before_remove {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     use super::*;
 
-    fn script(dir: &Path, name: &str, body: &str) {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    /// Links `dir/name` to the checked-in executable fixture of the same name. Writing a fresh
+    /// executable instead lets a parallel test's fork inherit the write handle for a moment, and
+    /// exec of the new file then fails with `Text file busy` (ETXTBSY).
+    fn fake(dir: &Path, name: &str) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/before_remove");
+        std::os::unix::fs::symlink(fixture.join(name), dir.join(name)).unwrap();
     }
 
     struct Harness {
         dir: tempfile::TempDir,
         bin: PathBuf,
         log: PathBuf,
+        branch: String,
     }
 
     impl Harness {
@@ -192,27 +194,20 @@ mod before_remove {
             let bin = dir.path().join("bin");
             std::fs::create_dir(&bin).unwrap();
             let log = dir.path().join("gh.log");
-            script(
-                &bin,
-                "gh",
-                r#"printf '%s\n' "$*" >> "$GH_LOG"
-case "$1 $2" in
-  "auth status") exit 0 ;;
-  "pr list") printf '101\n102\n'; exit 0 ;;
-  "pr close")
-    if [ "$3" = "101" ]; then exit 0; fi
-    if [ "$3" = "102" ]; then echo boom >&2; exit 17; fi ;;
-esac
-exit 99
-"#,
-            );
-            script(&bin, "git", &format!("printf '{branch}\\n'\n"));
-            Self { dir, bin, log }
+            fake(&bin, "gh");
+            fake(&bin, "git");
+            Self {
+                dir,
+                bin,
+                log,
+                branch: branch.to_owned(),
+            }
         }
 
         fn run(&self, args: &[&str], path: Option<&Path>) -> std::process::Output {
             let mut cmd = symphony(self.dir.path());
             cmd.env("GH_LOG", &self.log)
+                .env("FAKE_GIT_BRANCH", &self.branch)
                 .env(
                     "PATH",
                     path.map_or_else(|| self.bin.clone(), Path::to_path_buf),
