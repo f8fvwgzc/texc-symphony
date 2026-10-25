@@ -15,7 +15,7 @@ info:
     **Routing rules** (in priority order, first match wins):
 
     1. Literal routes: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/pause`, `/api/v1/resume`,
-       `/api/v1/metrics`, `/api/v1/health`, `/api/v1/events`, `/api/v1/events/tickets`, `/api/v1/runs`, `/api/v1/totals`, `/api/openapi.json`. Their names are therefore reserved and
+       `/api/v1/metrics`, `/api/v1/health`, `/api/v1/events`, `/api/v1/events/tickets`, `/api/v1/tasks`, `/api/v1/runs`, `/api/v1/totals`, `/api/openapi.json`. Their names are therefore reserved and
        can never be looked up as issue identifiers.
     2. `/api/v1/runs/{id}` and `/api/v1/runs/{id}/events`.
     3. `/api/v1/{issue_identifier}` (exactly one path segment, URL-decoded, case-sensitive).
@@ -56,7 +56,7 @@ info:
     `{"error": {"code": "<machine code>", "message": "<human text>"}}`. Codes:
     `not_found`, `method_not_allowed`, `issue_not_found`, `orchestrator_unavailable`,
     `run_not_found`, `invalid_parameter`, `store_disabled`, `request_failed`, `unauthorized`,
-    `host_not_allowed`, `origin_not_allowed`.
+    `host_not_allowed`, `origin_not_allowed`, `task_not_found`, `task_conflict`.
     `GET /api/v1/state` never fails with an error status: snapshot failures are reported inside a
     `200` body (`snapshot_timeout`, `snapshot_unavailable`).
   license:
@@ -68,6 +68,8 @@ servers:
   - url: http://127.0.0.1:4000
     description: Local orchestrator (port comes from `server.port` or `--port`)
 tags:
+  - name: tasks
+    description: Work assigned directly by products, without a tracker issue (needs the run-history store).
   - name: state
     description: Live orchestrator state (Elixir compatible).
   - name: control
@@ -346,6 +348,159 @@ paths:
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
 
+  /api/v1/tasks:
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: Queue a task
+      description: |
+        Queues work for an agent without a tracker issue. The task runs once, in a fresh workspace
+        (empty, or a shallow clone of `repo`), on `backend` (default `agent.backend`), with the
+        prompt sent as-is (wrapped by the backend's `prompt_template`). Its final agent message
+        becomes `result`. Runs are recorded under the identifier `TASK-<id>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskCreate' }
+            example:
+              title: Summarize the README
+              prompt: Read README.md and write a five-line summary.
+              repo: https://github.com/f8fvwgzc/texc-symphony
+              backend: local
+              limits: { max_tokens: 200000, timeout_ms: 600000 }
+              metadata: { ticket: PROD-17 }
+      responses:
+        '201':
+          description: Task queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: Tasks, newest first (keyset pagination)
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: before_id, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: status, in: query, required: false, schema: { $ref: '#/components/schemas/TaskStatus' } }
+      responses:
+        '200':
+          description: One page of tasks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPage' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: One task
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      responses:
+        '200':
+          description: The task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}/cancel:
+    post:
+      tags: [tasks]
+      operationId: cancelTask
+      summary: Cancel a task
+      description: Stops a running task (through the orchestrator) or cancels a queued or blocked one. Final tasks are returned unchanged.
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      responses:
+        '200':
+          description: The task after cancellation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503':
+          description: Store disabled, or a running task could not be stopped because the orchestrator is unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/tasks/{id}/unblock:
+    post:
+      tags: [tasks]
+      operationId: unblockTask
+      summary: Re-queue a blocked or failed task
+      description: The optional `message` (the operator's answer) is appended to the prompt as `Operator reply:`. Other statuses answer `409 task_conflict`.
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskUnblock' }
+      responses:
+        '200':
+          description: The re-queued task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '409':
+          description: The task is neither blocked nor failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                error: { code: task_conflict, message: 'task 3 is running; only blocked or failed tasks can be unblocked' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}/events:
+    get:
+      tags: [tasks]
+      operationId: streamTask
+      summary: Watch a task (Server-Sent Events)
+      description: |
+        Starts with `retry: 3000`, then sends `event: task` (data: `Task`) whenever the record
+        changes and `event: run_event` (data: `RunEvent`, `id: <run_id>-<seq>`) for every event
+        its runs record. Comment keep-alives every 15 s. The stream ends once the task is
+        `succeeded`, `failed` or `cancelled` and every event was sent. Browsers authenticate with
+        `?ticket=` (see `POST /api/v1/events/tickets`).
+      parameters:
+        - { $ref: '#/components/parameters/TaskId' }
+        - name: ticket
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+              x-sse-events:
+                task:
+                  schema: { $ref: '#/components/schemas/Task' }
+                run_event:
+                  schema: { $ref: '#/components/schemas/RunEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
   /api/v1/runs:
     get:
       tags: [history]
@@ -563,6 +718,12 @@ components:
       description: The API token (`server.api_token` / `SYMPHONY_API_TOKEN`). Not required when the server runs without one (loopback only).
 
   parameters:
+    TaskId:
+      name: id
+      in: path
+      required: true
+      description: Task id (positive integer). Non-integers answer `400 invalid_parameter`.
+      schema: { type: integer, minimum: 1 }
     RunId:
       name: id
       in: path
@@ -614,6 +775,14 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
           example:
             error: { code: invalid_parameter, message: 'limit must be an integer between 1 and 200' }
+    TaskNotFound:
+      description: No task with this id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: task_not_found, message: Task not found }
     StoreDisabled:
       description: Run history persistence is disabled in this process.
       content:
@@ -640,7 +809,7 @@ components:
         code:
           type: string
           description: Stable machine-readable code.
-          examples: [not_found, method_not_allowed, issue_not_found, orchestrator_unavailable, run_not_found, invalid_parameter, store_disabled, request_failed, unauthorized, host_not_allowed, origin_not_allowed]
+          examples: [not_found, method_not_allowed, issue_not_found, orchestrator_unavailable, run_not_found, invalid_parameter, store_disabled, request_failed, unauthorized, host_not_allowed, origin_not_allowed, task_not_found, task_conflict]
         message:
           type: string
           description: Human-readable text (not localized, may change).
@@ -940,6 +1109,75 @@ components:
           type: string
           enum: [sqlite, disabled]
           description: Whether run history endpoints are available.
+
+    TaskStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled, blocked]
+
+    TaskLimits:
+      type: object
+      required: [max_tokens, timeout_ms]
+      additionalProperties: false
+      properties:
+        max_tokens: { type: [integer, 'null'], minimum: 1, description: 'Tokens (input + output) across the task''s runs; the run fails when it is reached.' }
+        timeout_ms: { type: [integer, 'null'], minimum: 1, description: 'Wall-clock limit of one run.' }
+
+    TaskCreate:
+      type: object
+      required: [prompt]
+      additionalProperties: false
+      properties:
+        title: { type: [string, 'null'], maxLength: 200 }
+        prompt: { type: string, minLength: 1, description: 'What the agent should do (at most 256 KiB).' }
+        repo: { type: [string, 'null'], description: '`https://` or `ssh://` URL or `user@host:path`, shallow-cloned into the workspace. Omit for an empty workspace (non-coding tasks).' }
+        branch: { type: [string, 'null'], description: 'Branch or tag to clone (needs `repo`).' }
+        backend: { type: [string, 'null'], description: 'A `backends` entry of WORKFLOW.md; default `agent.backend`.' }
+        limits:
+          type: [object, 'null']
+          additionalProperties: false
+          properties:
+            max_tokens: { type: [integer, 'null'], minimum: 1 }
+            timeout_ms: { type: [integer, 'null'], minimum: 1 }
+        metadata: { type: [object, 'null'], description: 'Free-form JSON kept with the task (at most 16 KiB).' }
+
+    TaskUnblock:
+      type: object
+      additionalProperties: false
+      properties:
+        message: { type: [string, 'null'], description: 'Operator reply appended to the prompt.' }
+
+    Task:
+      type: object
+      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, status, result, error, attempts, created_at, updated_at, started_at, finished_at]
+      additionalProperties: false
+      properties:
+        id: { type: integer, minimum: 1 }
+        identifier: { type: string, description: '`TASK-<id>`: the identifier of its runs and live entries.' }
+        title: { type: [string, 'null'] }
+        prompt: { type: string }
+        repo: { type: [string, 'null'] }
+        branch: { type: [string, 'null'] }
+        backend: { type: [string, 'null'] }
+        limits: { $ref: '#/components/schemas/TaskLimits' }
+        metadata: { type: [object, 'null'] }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        result: { type: [string, 'null'], description: 'Final agent message of a succeeded task.' }
+        error: { type: [string, 'null'] }
+        attempts: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+
+    TaskPage:
+      type: object
+      required: [tasks, next_before_id]
+      additionalProperties: false
+      properties:
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        next_before_id: { type: [integer, 'null'] }
 
     SseTicket:
       type: object

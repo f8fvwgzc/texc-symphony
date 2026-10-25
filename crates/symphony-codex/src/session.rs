@@ -1,5 +1,7 @@
 //! `AppServerSession`: handshake, turns and shutdown (`Codex.AppServer.start_session/run_turn/stop_session`).
 
+// Modified 2026-10-25: the turn outcome carries the final agent message (Part B).
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,6 +121,8 @@ pub struct TurnOutcome {
     pub thread_id: String,
     /// Turn id.
     pub turn_id: String,
+    /// Text of the last agent message of the turn, if any (the result of a task).
+    pub final_message: Option<String>,
 }
 
 /// What a stream line means for the turn loop.
@@ -143,6 +147,8 @@ pub struct AppServerSession {
     stop_grace: Duration,
     /// Server messages that arrived while a response was awaited, replayed by the next turn loop.
     pending: VecDeque<StreamMessage>,
+    /// Text of the last `agentMessage` item completed in the current turn.
+    last_agent_message: Option<String>,
 }
 
 fn issue_context(issue: &Issue) -> String {
@@ -239,6 +245,7 @@ impl AppServerSession {
             tool_handler,
             stop_grace,
             pending: VecDeque::new(),
+            last_agent_message: None,
         };
         match session.handshake().instrument(span).await {
             Ok(thread_id) => {
@@ -408,6 +415,7 @@ impl AppServerSession {
         // server writes while handling `turn/start` is causally part of the turn (Elixir got this ordering for
         // free because it merged stderr into stdout).
         self.transport.set_label(StreamLabel::Turn);
+        self.last_agent_message = None;
         self.transport.send(&request).await;
         let started = async {
             let result = self
@@ -447,6 +455,7 @@ impl AppServerSession {
                     session_id,
                     thread_id: self.thread_id.clone(),
                     turn_id,
+                    final_message: self.last_agent_message.take(),
                 })
             }
             Err(reason) => {
@@ -610,6 +619,13 @@ impl AppServerSession {
             }
             _ => {
                 tracing::debug!("Codex notification: {method:?}");
+                if method == "item/completed"
+                    && let Some(item) = message.payload.pointer("/params/item")
+                    && item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && let Some(text) = item.get("text").and_then(Value::as_str)
+                {
+                    self.last_agent_message = Some(text.to_owned());
+                }
                 events.emit(self.stream_event(CodexEventData::Notification(message)));
                 Step::Continue
             }

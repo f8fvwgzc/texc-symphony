@@ -66,6 +66,31 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Run(invocation)) => run(invocation),
+        Ok(Command::AgentTools { socket }) => {
+            #[cfg(unix)]
+            let served = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(symphony_agents::mcp::serve_stdio(
+                            &socket,
+                            tokio::io::stdin(),
+                            tokio::io::stdout(),
+                        ))
+                        .map_err(|err| err.to_string())
+                });
+            #[cfg(not(unix))]
+            let served: Result<(), String> = Err(format!(
+                "agent-tools needs Unix sockets; {} is unavailable",
+                socket.display()
+            ));
+            match served {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => fail(&format!("symphony agent-tools: {err}")),
+            }
+        }
     }
 }
 

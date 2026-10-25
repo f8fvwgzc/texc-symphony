@@ -14,6 +14,9 @@
 //!   (`POST /api/v1/events/tickets`) because `EventSource` cannot send headers. A non-loopback
 //!   bind without auth is refused. See [`Auth`].
 //!
+//! * **Task API** (`/api/v1/tasks`): products queue work without a tracker, cancel, unblock and
+//!   watch it over SSE (`/api/v1/tasks/{id}/events`), backed by the store.
+//!
 //! The contract is `docs/api/openapi.yaml`; `docs/api/README.md` is the human guide.
 //!
 //! The server does not depend on the runtime. The binary implements [`ControlPlane`] for its
@@ -53,6 +56,7 @@ pub mod presenter;
 mod security;
 mod server;
 mod sse;
+mod tasks;
 pub mod testing;
 pub mod view;
 

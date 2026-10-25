@@ -69,6 +69,6 @@ pub use snapshot::{
 pub use ssh::{SshConfig, SshError, SshLauncher};
 pub use tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
 pub use worker::{
-    FnWorkerFactory, RunError, WorkerContext, WorkerFactory, WorkerReporter, WorkerResult,
+    FnWorkerFactory, RunError, TaskSpec, WorkerContext, WorkerFactory, WorkerReporter, WorkerResult,
 };
 pub use workspace::{IssueContext, WorkspaceError, WorkspaceManager};

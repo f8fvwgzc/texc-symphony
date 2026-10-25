@@ -413,3 +413,108 @@ async fn cancelled_runs_stop_codex_and_still_run_after_run() {
     })
     .await;
 }
+
+// ----- backends and tasks ---------------------------------------------------------------------
+
+fn task_context(prompt: &str) -> WorkerContext {
+    let mut ctx = WorkerContext::standalone(Issue {
+        id: Some("task:7".into()),
+        identifier: Some("TASK-7".into()),
+        title: Some("A task".into()),
+        state: Some("task".into()),
+        ..Issue::default()
+    });
+    ctx.task = Some(symphony_runtime::TaskSpec {
+        id: 7,
+        prompt: prompt.into(),
+        ..Default::default()
+    });
+    ctx
+}
+
+#[tokio::test]
+async fn tasks_skip_workflow_hooks_and_send_their_prompt_verbatim() {
+    let s = setup(json!({}), None, None);
+    let marker = s.wf.path("hook.marker");
+    s.wf.rewrite(json!({
+        "codex": {"command": codex_command("basic.sh")},
+        "hooks": {
+            "after_create": format!("touch '{}'", marker.display()),
+            "before_run": format!("touch '{}'", marker.display()),
+        },
+    }));
+    // The result message goes to the orchestrator through the reporter (covered by the
+    // orchestrator's task tests); here the reporter is detached.
+    s.runner
+        .run(task_context("Summarize {{ not liquid }} the README"))
+        .await
+        .unwrap();
+    assert!(!marker.exists(), "workflow hooks do not run for tasks");
+    let messages = traced_messages(&s.trace);
+    let turns = methods(&messages, "turn/start");
+    assert_eq!(turns.len(), 1, "a task runs exactly one turn");
+    assert_eq!(
+        turns[0]["params"]["input"][0]["text"],
+        json!("Summarize {{ not liquid }} the README")
+    );
+    assert!(s.wf.workspace_root().join("TASK-7").is_dir());
+}
+
+#[tokio::test]
+async fn backend_prompt_templates_wrap_the_first_turn() {
+    let s = setup(
+        json!({
+            "codex": {"command": codex_command("basic.sh")},
+            "backends": {"codex": {"kind": "codex", "prompt_template": "[{{ issue.identifier }}] {{ prompt }}"}},
+        }),
+        None,
+        None,
+    );
+    s.runner.run(task_context("do it")).await.unwrap();
+    let messages = traced_messages(&s.trace);
+    let turns = methods(&messages, "turn/start");
+    assert_eq!(
+        turns[0]["params"]["input"][0]["text"],
+        json!("[TASK-7] do it")
+    );
+}
+
+#[tokio::test]
+async fn unknown_backends_and_refused_repositories_fail_the_run() {
+    let s = setup(
+        json!({"codex": {"command": codex_command("basic.sh")}}),
+        None,
+        None,
+    );
+    let mut ctx = task_context("x");
+    ctx.backend = Some("missing".into());
+    assert_eq!(
+        s.runner.run(ctx).await.unwrap_err(),
+        RunError::UnknownBackend("missing".into())
+    );
+    let mut ctx = task_context("x");
+    if let Some(task) = ctx.task.as_mut() {
+        task.repo = Some("ext::sh -c id".into());
+    }
+    assert!(matches!(
+        s.runner.run(ctx).await.unwrap_err(),
+        RunError::TaskClone(_)
+    ));
+}
+
+#[tokio::test]
+async fn task_runs_stop_at_their_timeout() {
+    let s = setup(
+        json!({"codex": {"command": codex_command("silent_turn.sh"), "turn_timeout_ms": 60000}}),
+        None,
+        None,
+    );
+    let mut ctx = task_context("x");
+    if let Some(task) = ctx.task.as_mut() {
+        task.timeout_ms = Some(300);
+    }
+    assert_eq!(
+        s.runner.run(ctx).await.unwrap_err(),
+        RunError::TaskTimeout(300)
+    );
+}

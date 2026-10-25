@@ -9,6 +9,8 @@
 //! port, then the workflow file. Parsing happens first, so bad arguments print the usage line even
 //! without the acknowledgement flag. A flag always wins over its environment variable.
 
+// Modified 2026-10-25: hidden `agent-tools` subcommand (MCP bridge for Claude Code) (Part B).
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -99,6 +101,20 @@ struct RunArgs {
     workflow: Option<String>,
 }
 
+/// `symphony agent-tools`: the MCP server Claude Code starts to reach the tracker tools (hidden;
+/// started by the `claude_code` backend, never by hand).
+#[derive(Debug, Parser)]
+#[command(
+    name = "symphony agent-tools",
+    about = "Serve the tracker tools of a running claude_code session over MCP (internal).",
+    disable_help_subcommand = true
+)]
+struct AgentToolsArgs {
+    /// Unix socket of the session's tool relay.
+    #[arg(long, value_name = "path")]
+    socket: PathBuf,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "symphony workspace",
@@ -172,6 +188,11 @@ pub enum Command {
         branch: Option<String>,
         /// `--repo`.
         repo: String,
+    },
+    /// `symphony agent-tools --socket <path>` (internal MCP server of the `claude_code` backend).
+    AgentTools {
+        /// The session's tool relay socket.
+        socket: PathBuf,
     },
 }
 
@@ -261,6 +282,9 @@ pub fn file_regular(path: &Path) -> bool {
 pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliExit> {
     if args.get(1).is_some_and(|arg| arg == "workspace") {
         return evaluate_workspace(args);
+    }
+    if args.get(1).is_some_and(|arg| arg == "agent-tools") {
+        return evaluate_agent_tools(args);
     }
     let matches = RunArgs::command()
         .version(version())
@@ -353,6 +377,20 @@ fn evaluate_workspace(args: &[OsString]) -> Result<Command, CliExit> {
             Ok(Command::BeforeRemove { branch, repo })
         }
     }
+}
+
+fn evaluate_agent_tools(args: &[OsString]) -> Result<Command, CliExit> {
+    let argv =
+        std::iter::once(OsString::from("symphony agent-tools")).chain(args.iter().skip(2).cloned());
+    let parsed = AgentToolsArgs::try_parse_from(argv).map_err(|err| match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            CliExit::Help(err.render().to_string())
+        }
+        _ => CliExit::InvalidOption(invalid_option_message(&err)),
+    })?;
+    Ok(Command::AgentTools {
+        socket: parsed.socket,
+    })
 }
 
 /// `Invalid option(s): [{"--wat", nil}]` (Elixir `inspect` of `OptionParser`'s invalid list).
@@ -641,5 +679,19 @@ mod tests {
             .unwrap_err();
         assert_eq!(help.exit_code(), 0);
         assert!(help.message().contains("symphony workspace before-remove"));
+    }
+
+    #[test]
+    fn agent_tools_parses_its_socket_without_the_ack_flag() {
+        let fx = Fixture::new();
+        assert_eq!(
+            fx.eval(&["agent-tools", "--socket", "/tmp/s/tools.sock"]),
+            Ok(Command::AgentTools {
+                socket: PathBuf::from("/tmp/s/tools.sock")
+            })
+        );
+        let err = fx.eval(&["agent-tools"]).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(fx.checked.borrow().is_empty(), "no workflow lookup");
     }
 }

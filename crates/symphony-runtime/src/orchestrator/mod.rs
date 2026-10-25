@@ -28,7 +28,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
 use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
-use symphony_store::{NewRun, RetryRecord, RunStatus};
+use symphony_store::{NewRun, RetryRecord, RunStatus, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -41,8 +41,9 @@ use tracing::Instrument;
 pub use spend::PAUSED_CONTROL_KEY;
 pub(crate) use spend::{Pricing, SpendStop, Usage};
 pub(crate) use state::{
-    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, WorkerHandle,
-    blocker_error, candidate_issue, next_retry_attempt_from_running,
+    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, TaskRun,
+    WorkerHandle, blocker_error, candidate_issue, next_retry_attempt_from_running, task_id,
+    task_issue_id,
 };
 pub use state::{
     DelayType, FAILURE_RETRY_BASE_MS, HostChoice, POLL_TRANSITION_RENDER_DELAY, retry_delay,
@@ -59,7 +60,7 @@ use crate::snapshot::{
     SpendSnapshot, TrackerInfo,
 };
 use crate::tracker::FetchError;
-use crate::worker::{RunError, WorkerContext, WorkerMessage, WorkerResult};
+use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerMessage, WorkerResult};
 use crate::workspace::{WorkspaceManager, worker_hosts};
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
@@ -168,6 +169,11 @@ impl<'w> Orchestrator<'w> {
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
         self.restore_spend().await;
+        match self.ctx.store.requeue_interrupted_tasks().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Queued {count} tasks interrupted by the previous process"),
+            Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
+        }
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -179,7 +185,7 @@ impl<'w> Orchestrator<'w> {
             biased;
             () = self.shutdown.cancelled() => false,
             Some(command) = self.cmd_rx.recv() => {
-                self.handle_command(command);
+                self.handle_command(command).await;
                 self.enforce_spend().await;
                 true
             }
@@ -203,7 +209,7 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, command: RuntimeCommand) {
+    pub(crate) async fn handle_command(&mut self, command: RuntimeCommand) {
         match command {
             RuntimeCommand::Snapshot(reply) => {
                 let snapshot = self.snapshot();
@@ -212,6 +218,34 @@ impl<'w> Orchestrator<'w> {
             RuntimeCommand::RequestRefresh(reply) => {
                 let ack = self.request_refresh();
                 let _ = reply.send(ack);
+            }
+            RuntimeCommand::CancelTask { id, reply } => {
+                let issue_id = task_issue_id(id);
+                let running = self.state.running.contains_key(&issue_id);
+                if running {
+                    tracing::info!("Cancelling task run issue_id={issue_id}");
+                    self.ctx
+                        .store
+                        .finish_task(
+                            id,
+                            TaskStatus::Cancelled,
+                            None,
+                            Some("cancelled by client".into()),
+                        )
+                        .detach();
+                    self.terminate_running_issue(&issue_id, false, "cancelled by client")
+                        .await;
+                } else {
+                    self.release_issue_claim(&issue_id);
+                }
+                self.notify();
+                let _ = reply.send(running);
+            }
+            RuntimeCommand::UnblockTask { id, reply } => {
+                self.release_issue_claim(&task_issue_id(id));
+                self.schedule_tick(Duration::ZERO);
+                self.notify();
+                let _ = reply.send(());
             }
             RuntimeCommand::SetPaused {
                 paused,
@@ -400,6 +434,32 @@ impl<'w> Orchestrator<'w> {
             .collect();
         for (issue_id, reason) in over {
             self.stop_and_block(&issue_id, reason).await;
+        }
+        let over_task_limit: Vec<(String, i64, String)> = self
+            .state
+            .running
+            .iter()
+            .filter_map(|(issue_id, entry)| {
+                let task = entry.task.as_ref()?;
+                let limit = task.max_tokens?;
+                let used = self.state.spend.issue(issue_id).tokens;
+                (used >= limit).then(|| {
+                    (
+                        issue_id.clone(),
+                        task.id,
+                        format!("task token limit exhausted: {used} of {limit} tokens used"),
+                    )
+                })
+            })
+            .collect();
+        for (issue_id, task, reason) in over_task_limit {
+            tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
+            self.ctx
+                .store
+                .finish_task(task, TaskStatus::Failed, None, Some(reason.clone()))
+                .detach();
+            self.terminate_running_issue(&issue_id, false, &reason)
+                .await;
         }
     }
 

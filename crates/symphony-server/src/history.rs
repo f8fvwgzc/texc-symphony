@@ -110,7 +110,7 @@ pub(crate) async fn totals(State(app): State<AppState>) -> Result<Json<TotalsRec
     Ok(Json(store.totals().await?))
 }
 
-fn enabled_store(app: &AppState) -> Result<&symphony_store::Store, ApiError> {
+pub(crate) fn enabled_store(app: &AppState) -> Result<&symphony_store::Store, ApiError> {
     if app.store.is_enabled() {
         Ok(&app.store)
     } else {
@@ -118,7 +118,7 @@ fn enabled_store(app: &AppState) -> Result<&symphony_store::Store, ApiError> {
     }
 }
 
-fn invalid(message: &str) -> ApiError {
+pub(crate) fn invalid(message: &str) -> ApiError {
     ApiError::InvalidParameter(message.to_owned())
 }
 
@@ -131,7 +131,7 @@ fn run_id(path: Result<Path<String>, PathRejection>) -> Result<RunId, ApiError> 
 }
 
 /// `limit` within `1..=max`, `default` when absent.
-fn limit_param(
+pub(crate) fn limit_param(
     params: &HashMap<String, String>,
     (default, max): (u32, u32),
 ) -> Result<u32, ApiError> {
@@ -148,7 +148,7 @@ fn limit_param(
 }
 
 /// Decoded query parameters; the last occurrence of a name wins, unknown names are ignored.
-fn parse_query(query: Option<&str>) -> HashMap<String, String> {
+pub(crate) fn parse_query(query: Option<&str>) -> HashMap<String, String> {
     query
         .map(|query| {
             form_urlencoded::parse(query.as_bytes())

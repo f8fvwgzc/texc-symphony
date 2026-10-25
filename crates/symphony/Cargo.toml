@@ -19,6 +19,7 @@ name = "symphony"
 path = "src/main.rs"
 
 [dependencies]
+symphony-agents = { workspace = true }
 symphony-core = { workspace = true }
 symphony-trackers = { workspace = true }
 symphony-codex = { workspace = true }
@@ -30,7 +31,8 @@ chrono = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# io-std: `symphony agent-tools` serves MCP on stdin/stdout.
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

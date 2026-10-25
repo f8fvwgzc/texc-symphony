@@ -32,6 +32,7 @@ mod model;
 mod ops;
 mod schema;
 mod store;
+mod tasks;
 
 pub use config::{
     DEFAULT_DB_PATH, DEFAULT_KEEP_MIN_RUNS, DEFAULT_PAYLOAD_RETENTION_DAYS, DEFAULT_PRUNE_INTERVAL,
@@ -47,3 +48,7 @@ pub use model::{
 pub use ops::{INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND};
 pub use schema::{BUSY_TIMEOUT, SCHEMA_VERSION};
 pub use store::{Pending, STORE_QUEUE_CAPACITY, Store};
+pub use tasks::{
+    DEFAULT_TASK_LIMIT, MAX_TASK_LIMIT, MAX_TASK_RESULT_BYTES, NewTask, TaskLimits, TaskPage,
+    TaskQuery, TaskRecord, TaskStatus, task_identifier,
+};

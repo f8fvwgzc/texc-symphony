@@ -154,6 +154,26 @@ pub fn render_prompt(
     } else {
         template
     };
+    render_with(template, issue, attempt, None)
+}
+
+/// Renders a backend's `prompt_template` around an already rendered `prompt`: the template sees
+/// `prompt`, `issue` and `attempt` (strict, like [`render_prompt`]).
+pub fn render_backend_prompt(
+    template: &str,
+    prompt: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+) -> Result<String, PromptError> {
+    render_with(template, issue, attempt, Some(prompt))
+}
+
+fn render_with(
+    template: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+    prompt: Option<&str>,
+) -> Result<String, PromptError> {
     let parser =
         liquid::ParserBuilder::with_stdlib()
             .build()
@@ -179,6 +199,9 @@ pub fn render_prompt(
         attempt.map_or(LiquidValue::Nil, |a| LiquidValue::scalar(i64::from(a))),
     );
     globals.insert("issue".into(), LiquidValue::Object(issue_to_liquid(issue)));
+    if let Some(prompt) = prompt {
+        globals.insert("prompt".into(), LiquidValue::scalar(prompt.to_owned()));
+    }
     parsed
         .render(&globals)
         .map_err(|e| PromptError::TemplateRender(e.to_string()))

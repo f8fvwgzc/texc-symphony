@@ -219,8 +219,19 @@ there through `bash -lc`.
 | `agent.max_turns` | integer | `20` | `> 0`. Maximum back-to-back Codex turns in one agent run while the issue stays active. | live |
 | `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. A run that ends normally is re-checked after 1 s instead. | live |
 | `agent.continuation_delay_ms` | integer | `1000` | `> 0`. How long to wait after a run ends normally before checking whether the issue is still active (and running it again if so). Raise it when something outside the agent moves the issue to a terminal state after the run, for example an orchestrating service. | live |
+| `agent.backend` | string | `codex` | The `backends` entry that runs tracker issues and tasks without their own backend (`agent.backend must name an entry of backends`). | new runs |
 
 Counts must fit in an unsigned 32-bit integer.
+
+### `backends`
+
+Named agent backends: `kind` (`codex`, `claude_code`, `api`), `model`, `prompt_template`,
+`system_prompt`, `pricing`, `turn_timeout_ms`, and per kind the provider, `base_url`,
+`api_key_env`, tools and limits. The full reference, the provider table and how to add an
+OpenAI-compatible provider without code are in [`agents.md`](agents.md). Errors name the entry,
+for example `backends.local.base_url is invalid` or `backends.local.model can't be blank`.
+Changes apply to new runs. `api_key_env` variables of `api` backends are read host-side and
+removed from every agent child environment like tracker secrets.
 
 ### `codex`
 
@@ -357,6 +368,9 @@ needs the token). The tool is limited to the configured repository or project; s
 
 The checks run in the order listed; the first failure is reported. The error tags are explained in
 [Validation errors](#validation-errors).
+
+`tracker.kind: none` runs without a tracker: no issues are polled and agents get no tracker tool;
+work arrives through the [task API](tasks.md) only.
 
 ### Agent tool scope
 

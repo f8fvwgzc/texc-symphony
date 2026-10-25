@@ -270,6 +270,9 @@ pub struct AgentSettings {
     pub continuation_delay_ms: u64,
     /// Per-state concurrency caps keyed by normalized (trim + lowercase) state name.
     pub max_concurrent_agents_by_state: BTreeMap<String, u32>,
+    /// Name of the `backends` entry that runs tracker issues and tasks without their own
+    /// (default `codex`).
+    pub backend: String,
 }
 
 impl Default for AgentSettings {
@@ -280,6 +283,7 @@ impl Default for AgentSettings {
             max_retry_backoff_ms: 300_000,
             continuation_delay_ms: 1_000,
             max_concurrent_agents_by_state: BTreeMap::new(),
+            backend: super::backend::CODEX_BACKEND.into(),
         }
     }
 }
@@ -486,6 +490,8 @@ pub struct Settings {
     pub server: ServerSettings,
     /// `budget:`
     pub budget: BudgetSettings,
+    /// `backends:` by name (always contains `codex`).
+    pub backends: BTreeMap<String, super::backend::BackendSettings>,
 }
 
 /// `Schema.normalize_state_limits/1`: keys become `trim + downcase`; values are untouched.
@@ -546,6 +552,10 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     );
     let server = cast_server(&Section::new(root, "server", &mut errors), &mut errors);
     let budget = cast_budget(&Section::new(root, "budget", &mut errors), &mut errors);
+    let backends = super::backend::cast_backends(root, &mut errors);
+    if !backends.contains_key(&agent.backend) {
+        errors.push("agent.backend", "must name an entry of backends");
+    }
 
     if !errors.is_empty() {
         return Err(ConfigError::InvalidWorkflowConfig(errors.join()));
@@ -562,6 +572,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         observability,
         server,
         budget,
+        backends,
     };
     Ok(finalize(settings, env))
 }
@@ -697,6 +708,14 @@ fn cast_agent(s: &Section<'_>, errors: &mut Errors) -> AgentSettings {
     let v = s.positive("continuation_delay_ms", v, errors);
     if let Some(v) = s.fit("continuation_delay_ms", v, errors) {
         out.continuation_delay_ms = v;
+    }
+
+    if let Some(backend) = s.string("backend", errors) {
+        if backend.is_empty() {
+            errors.push(&s.path("backend"), "can't be blank");
+        } else {
+            out.backend = backend;
+        }
     }
 
     let field = "max_concurrent_agents_by_state";

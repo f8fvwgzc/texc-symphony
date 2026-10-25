@@ -4,6 +4,7 @@
 //! [`validate_settings`] is the dispatch preflight (tracker kind + adapter checks). Both run on every
 //! (re)load inside [`crate::WorkflowStore`].
 
+pub mod backend;
 mod cast;
 pub mod schema;
 pub mod tracker;
@@ -13,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+pub use backend::{
+    ApiBackendSettings, ApiProvider, BackendKind, BackendPricing, BackendSettings,
+    ClaudeCodeSettings, SandboxMode,
+};
 pub use cast::{cast_boolean, cast_integer, cast_number, cast_string_list};
 pub use schema::{
     AgentSettings, BudgetSettings, CodexProvider, CodexSettings, HooksSettings,
@@ -172,8 +177,20 @@ impl Settings {
         crate::env::uniq(
             tracker::secret_environment_names(&self.tracker)
                 .into_iter()
-                .chain(self.server.secret_environment_names.iter().cloned()),
+                .chain(self.server.secret_environment_names.iter().cloned())
+                .chain(backend::backend_secret_environment_names(&self.backends)),
         )
+    }
+
+    /// The backend named `name`, else `agent.backend` (`None` for an unknown name). `codex` is
+    /// always known, also in settings that were not parsed (`Settings::default()`).
+    pub fn backend(&self, name: Option<&str>) -> Option<BackendSettings> {
+        let name = name.unwrap_or(&self.agent.backend);
+        match self.backends.get(name) {
+            Some(backend) => Some(backend.clone()),
+            None if name == backend::CODEX_BACKEND => Some(BackendSettings::codex()),
+            None => None,
+        }
     }
 
     /// Active states, or an empty list when unset.

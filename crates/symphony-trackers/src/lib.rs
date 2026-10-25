@@ -47,7 +47,7 @@ pub use github::GitHubTracker;
 pub use gitlab::GitLabTracker;
 pub use jira::JiraTracker;
 pub use linear::LinearTracker;
-pub use memory::{MemoryIssues, MemoryTracker};
+pub use memory::{MemoryIssues, MemoryTracker, NoTracker};
 pub use tool::{ContentItem, ToolBinding, ToolContext, ToolResult};
 pub use transport::{
     HttpClient, HttpRequest, HttpResponse, Method, ReqwestTransport, RetryPolicy, Transport,
@@ -180,7 +180,7 @@ impl TrackerDeps {
 }
 
 /// Supported `tracker.kind` values (exact, case-sensitive).
-pub const TRACKER_KINDS: [&str; 6] = symphony_core::config::SUPPORTED_TRACKER_KINDS;
+pub const TRACKER_KINDS: [&str; 7] = symphony_core::config::SUPPORTED_TRACKER_KINDS;
 
 /// `Tracker.adapter_for_kind/1`: the adapter for an exact kind string.
 pub fn tracker_for_kind(kind: &str, deps: &TrackerDeps) -> Result<Arc<dyn Tracker>, TrackerError> {
@@ -191,6 +191,8 @@ pub fn tracker_for_kind(kind: &str, deps: &TrackerDeps) -> Result<Arc<dyn Tracke
         "jira" => Arc::new(JiraTracker::new(deps.http.clone(), Arc::clone(&deps.env))),
         "linear" => Arc::new(LinearTracker::new(deps.http.clone())),
         "memory" => Arc::new(MemoryTracker::new(deps.memory.clone())),
+        // No tracker: never any issues or tools (work arrives through the task API).
+        "none" => Arc::new(NoTracker),
         other => return Err(TrackerError::UnsupportedTrackerKind(other.to_owned())),
     };
     Ok(tracker)
