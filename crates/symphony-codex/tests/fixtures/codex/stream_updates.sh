@@ -1,5 +1,6 @@
 #!/bin/sh
-# Streams two item updates 0.15 s apart before completing (the silence timeout must reset).
+# Streams item updates 0.15 s apart for 0.75 s before completing: longer than the test's
+# silence timeout (so it must reset on every update), with a wide margin per gap for slow CI.
 count=0
 while IFS= read -r _line; do
   count=$((count + 1))
@@ -13,6 +14,10 @@ while IFS= read -r _line; do
       printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"one"}}}'
       sleep 0.15
       printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"two"}}}'
+      sleep 0.15
+      printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"three"}}}'
+      sleep 0.15
+      printf '%s\n' '{"method":"item/updated","params":{"item":{"id":"four"}}}'
       sleep 0.15
       printf '%s\n' '{"method":"turn/completed"}'
       exit 0

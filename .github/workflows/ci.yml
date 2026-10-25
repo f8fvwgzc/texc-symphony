@@ -44,6 +44,29 @@ jobs:
       - name: cargo clippy -D warnings
         run: make lint
 
+  supply-chain:
+    name: supply chain (cargo-deny + cargo-audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      # Advisories, licences, bans and sources, per deny.toml.
+      - name: cargo deny check
+        run: cargo deny --locked check
+
+      # A second RustSec reader: fails on any vulnerability, reports unmaintained crates.
+      - name: cargo audit
+        run: cargo audit
+
   rust-test:
     name: rust test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -122,7 +145,7 @@ jobs:
   docker:
     name: docker (linux/amd64 + linux/arm64)
     runs-on: ubuntu-24.04
-    needs: [rust-lint, web]
+    needs: [rust-lint, web, supply-chain]
     permissions:
       contents: read
       packages: write
