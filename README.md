@@ -40,10 +40,11 @@ see [Model providers](docs/configuration.md#model-providers).
 
 **A. Release binary** (Linux x86_64/arm64, macOS x86_64/arm64). Each release has raw executables
 named `symphony-<vX.Y.Z|nightly>-<linux_x86_64|linux_arm64|macos_x86_64|macos_arm64>` with a
-matching `.sha256` checksum file:
+matching `.sha256` checksum file. No version is tagged yet: until the first release, build from source (B).
 
 ```sh
-version=v0.1.0 target=linux_x86_64
+version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/f8fvwgzc/texc-symphony/releases/latest | sed 's|.*/||')
+target=linux_x86_64   # or linux_arm64, macos_arm64, macos_x86_64
 base=https://github.com/f8fvwgzc/texc-symphony/releases/download/$version
 curl -fL -O "$base/symphony-$version-$target" -O "$base/symphony-$version-$target.sha256"
 shasum -a 256 -c "symphony-$version-$target.sha256"
@@ -61,7 +62,7 @@ cargo install --locked --path crates/symphony
 The dashboard is embedded from `web/dist` at compile time; build it first (`make web`), otherwise
 the server shows a placeholder page. `make build` (below) does both.
 
-**C. Docker** (amd64 and arm64):
+**C. Docker** (amd64 and arm64; the image is published with each release, so `latest` exists from the first one):
 
 ```sh
 docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" -e LINEAR_API_KEY ghcr.io/f8fvwgzc/texc-symphony:latest

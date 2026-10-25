@@ -1,0 +1,7 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Keep CodeRabbit out of PR descriptions: its summary block is wrapped in HTML comments, which the
+# `pr description` CI check (`cargo run -p xtask -- pr-body-check`) rejects. The summary goes into
+# CodeRabbit's walkthrough comment instead.
+reviews:
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
