@@ -600,13 +600,17 @@ fn config_resolves_var_references_for_env_backed_secret_and_path_values() {
         config.tracker.secret_environment_names,
         strings(&["LINEAR_API_KEY", "SYMP_LINEAR_API_KEY_1"])
     );
-    // The HTTP API token (`SYMPHONY_API_TOKEN` by default) is stripped from agents too.
+    // The HTTP API token (`SYMPHONY_API_TOKEN` by default) and the LLM contract's secrets (even
+    // without the contract) are stripped from agents too.
     assert_eq!(
         config.secret_environment_names(),
         strings(&[
             "LINEAR_API_KEY",
             "SYMP_LINEAR_API_KEY_1",
-            "SYMPHONY_API_TOKEN"
+            "SYMPHONY_API_TOKEN",
+            "LLM_API_KEY",
+            "LLM_API_KEY_FILE",
+            "LLM_GATEWAY_TOKEN_FILE"
         ])
     );
     assert_eq!(config.workspace.root, "/tmp/symphony-workspace-root");
@@ -959,6 +963,8 @@ fn codex_model_and_provider_are_optional_and_validated() {
             name: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             api_key_env: Some("OLLAMA_API_KEY".into()),
+            request_max_retries: None,
+            stream_idle_timeout_ms: None,
         })
     );
 

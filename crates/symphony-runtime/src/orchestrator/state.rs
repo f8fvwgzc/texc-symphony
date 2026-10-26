@@ -39,6 +39,28 @@ pub(crate) struct WorkerHandle {
     pub done: oneshot::Receiver<()>,
 }
 
+/// Issue id prefix of task runs (`task:<id>`); tracker ids never look like this.
+pub(crate) const TASK_ID_PREFIX: &str = "task:";
+
+/// The task id of a task run's issue id.
+pub(crate) fn task_id(issue_id: &str) -> Option<i64> {
+    issue_id.strip_prefix(TASK_ID_PREFIX)?.parse().ok()
+}
+
+/// The issue id of a task's runs.
+pub(crate) fn task_issue_id(id: i64) -> String {
+    format!("{TASK_ID_PREFIX}{id}")
+}
+
+/// The task a running entry executes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TaskRun {
+    pub id: i64,
+    pub max_tokens: Option<u64>,
+    /// Final agent message, once the worker reported it.
+    pub result: Option<String>,
+}
+
 /// One running agent (`RunningEntry`).
 #[derive(Debug)]
 pub(crate) struct RunningEntry {
@@ -66,6 +88,8 @@ pub(crate) struct RunningEntry {
     pub pricing: Pricing,
     /// Cost of `tokens.totals` at `pricing`, in micro-USD.
     pub cost_micro_usd: u64,
+    /// Set for task runs.
+    pub task: Option<TaskRun>,
 }
 
 /// One blocked issue (`BlockedEntry`).

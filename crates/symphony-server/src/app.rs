@@ -35,17 +35,21 @@ use crate::error::{ApiError, method_not_allowed};
 use crate::security::{HostPolicy, TicketBook};
 use crate::sse::SseHub;
 use crate::view::{StatePayload, StateView};
-use crate::{api, assets, history, presenter, security, sse};
+use crate::{api, assets, history, presenter, security, sse, tasks};
 
 /// Path of the SSE endpoint (excluded from the request timeout and from compression).
 pub(crate) const EVENTS_PATH: &str = "/api/v1/events";
 /// Issues single-use SSE tickets (`EventSource` cannot send an `Authorization` header).
 pub(crate) const TICKETS_PATH: &str = "/api/v1/events/tickets";
 
-/// `true` for Server-Sent Events endpoints: no request timeout, and an SSE ticket may stand in
-/// for the bearer token.
+/// `true` for Server-Sent Events endpoints (`/api/v1/events`, `/api/v1/tasks/{id}/events`): no
+/// request timeout, and an SSE ticket may stand in for the bearer token.
 pub(crate) fn is_stream_path(path: &str) -> bool {
     path == EVENTS_PATH
+        || path
+            .strip_prefix("/api/v1/tasks/")
+            .and_then(|rest| rest.strip_suffix("/events"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 /// Content-Security-Policy for every response. The dashboard is a same-origin Vite bundle with
@@ -159,6 +163,28 @@ pub fn router(
         .route(
             "/api/v1/runs",
             get(history::list_runs).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks",
+            get(tasks::list)
+                .post(tasks::create)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}",
+            get(tasks::get).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/cancel",
+            post(tasks::cancel).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/unblock",
+            post(tasks::unblock).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/events",
+            get(tasks::events).fallback(method_not_allowed),
         )
         .route(
             "/api/v1/totals",

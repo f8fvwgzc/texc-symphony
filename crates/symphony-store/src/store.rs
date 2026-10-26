@@ -23,6 +23,7 @@ use crate::model::{
 };
 use crate::ops::{self, NewEvent};
 use crate::schema;
+use crate::tasks::{self, NewTask, TaskPage, TaskQuery, TaskRecord, TaskStatus};
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
@@ -266,6 +267,111 @@ impl Store {
             "prune_payloads",
             || 0,
             move |conn| ops::prune_payloads(conn, cutoff),
+        )
+    }
+
+    /// Queue a new task.
+    /// A disabled store cannot hold tasks: [`StoreError::Unavailable`].
+    pub fn create_task(&self, task: NewTask) -> Pending<TaskRecord> {
+        if !self.is_enabled() {
+            return Pending::ready(Err(StoreError::Unavailable));
+        }
+        let now = Utc::now();
+        self.submit(
+            "create_task",
+            // Impossible: a disabled store returned above.
+            || unreachable!("checked above"),
+            move |conn| tasks::create_task(conn, &task, now),
+        )
+    }
+
+    /// One task.
+    pub fn get_task(&self, id: i64) -> Pending<Option<TaskRecord>> {
+        self.submit("get_task", || None, move |conn| tasks::get_task(conn, id))
+    }
+
+    /// Tasks newest first, filtered and paginated by `query`.
+    pub fn list_tasks(&self, query: TaskQuery) -> Pending<TaskPage> {
+        self.submit("list_tasks", TaskPage::default, move |conn| {
+            tasks::list_tasks(conn, &query)
+        })
+    }
+
+    /// Up to `limit` queued tasks, oldest first.
+    pub fn queued_tasks(&self, limit: u32) -> Pending<Vec<TaskRecord>> {
+        self.submit("queued_tasks", Vec::new, move |conn| {
+            tasks::queued_tasks(conn, limit)
+        })
+    }
+
+    /// Claims a queued task for a run (`queued` → `running`); `None` when it is not queued.
+    pub fn start_task(&self, id: i64) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        self.submit(
+            "start_task",
+            || None,
+            move |conn| tasks::start_task(conn, id, now),
+        )
+    }
+
+    /// Ends a running task's run with `status` (final, or `blocked`); `None` when it was not
+    /// running.
+    pub fn finish_task(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    ) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        self.submit(
+            "finish_task",
+            || None,
+            move |conn| {
+                tasks::finish_task(conn, id, status, result.as_deref(), error.as_deref(), now)
+            },
+        )
+    }
+
+    /// Cancels a queued or blocked task (others are returned unchanged); `None` for an unknown id.
+    pub fn cancel_task(&self, id: i64, reason: impl Into<String>) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        let reason = reason.into();
+        self.submit(
+            "cancel_task",
+            || None,
+            move |conn| tasks::cancel_task(conn, id, &reason, now),
+        )
+    }
+
+    /// Re-queues a blocked or failed task with an optional operator reply appended to its prompt.
+    pub fn requeue_task(&self, id: i64, message: Option<String>) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        self.submit(
+            "requeue_task",
+            || None,
+            move |conn| tasks::requeue_task(conn, id, message.as_deref(), now),
+        )
+    }
+
+    /// A running task whose run was stopped for an outside reason goes back to `queued`.
+    pub fn release_task(&self, id: i64, reason: impl Into<String>) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        let reason = reason.into();
+        self.submit(
+            "release_task",
+            || None,
+            move |conn| tasks::release_task(conn, id, &reason, now),
+        )
+    }
+
+    /// Startup recovery: tasks left `running` go back to `queued`. Returns how many.
+    pub fn requeue_interrupted_tasks(&self) -> Pending<u64> {
+        let now = Utc::now();
+        self.submit(
+            "requeue_interrupted_tasks",
+            || 0,
+            move |conn| tasks::requeue_interrupted_tasks(conn, now),
         )
     }
 

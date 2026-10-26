@@ -15,6 +15,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_retry_queue.sql"),
     include_str!("migrations/0003_spend_controls.sql"),
+    include_str!("migrations/0004_tasks.sql"),
 ];
 
 /// Schema version this build creates and understands.

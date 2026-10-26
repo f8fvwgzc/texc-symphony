@@ -34,6 +34,9 @@ struct Inner {
     generation: u64,
     /// Kill switch reason while engaged.
     paused: Option<String>,
+    /// Task ids passed to `cancel_task` / `unblock_task`.
+    cancelled: Vec<i64>,
+    unblocked: Vec<i64>,
 }
 
 impl StaticControlPlane {
@@ -49,6 +52,8 @@ impl StaticControlPlane {
                 changes: Some(watch::Sender::new(0)),
                 generation: 0,
                 paused: None,
+                cancelled: Vec::new(),
+                unblocked: Vec::new(),
             }),
             state_calls: AtomicUsize::new(0),
             issue_calls: AtomicUsize::new(0),
@@ -109,6 +114,16 @@ impl StaticControlPlane {
     /// Workspace root returned by [`ControlPlane::workspace_root`].
     pub fn set_workspace_root(&self, root: impl Into<String>) {
         self.lock().workspace_root = root.into();
+    }
+
+    /// Task ids cancelled through the control plane so far.
+    pub fn cancelled_tasks(&self) -> Vec<i64> {
+        self.lock().cancelled.clone()
+    }
+
+    /// Task ids unblocked through the control plane so far.
+    pub fn unblocked_tasks(&self) -> Vec<i64> {
+        self.lock().unblocked.clone()
     }
 
     /// The kill switch reason, `None` while released.
@@ -185,6 +200,24 @@ impl ControlPlane for StaticControlPlane {
         drop(inner);
         self.notify();
         Ok(state)
+    }
+
+    async fn cancel_task(&self, id: i64) -> Result<bool, Unavailable> {
+        let mut inner = self.lock();
+        inner.refresh?;
+        inner.cancelled.push(id);
+        Ok(false)
+    }
+
+    async fn unblock_task(&self, id: i64) -> Result<(), Unavailable> {
+        let mut inner = self.lock();
+        inner.refresh?;
+        inner.unblocked.push(id);
+        Ok(())
+    }
+
+    fn backend_names(&self) -> Option<Vec<String>> {
+        Some(vec!["codex".to_owned(), "local".to_owned()])
     }
 
     async fn issue(&self, identifier: &str) -> Option<IssueView> {

@@ -1,0 +1,59 @@
+name: real-provider
+
+# Manual: one tiny real turn of the built-in API agent loop per provider whose key is configured
+# as a repository secret (ANTHROPIC_API_KEY, OPENAI_API_KEY). Without secrets the job only
+# reports that it skipped. Optional repository variables pick models and the OpenAI-compatible
+# endpoint: REAL_ANTHROPIC_MODEL, REAL_OPENAI_MODEL, REAL_OPENAI_BASE_URL.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-provider
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  api-loop:
+    name: api agent loop (real providers)
+    runs-on: ubuntu-24.04
+    env:
+      HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+      HAS_OPENAI: ${{ secrets.OPENAI_API_KEY != '' }}
+    steps:
+      - name: Report configured providers
+        run: |
+          echo "Anthropic key configured: ${HAS_ANTHROPIC}"
+          echo "OpenAI-compatible key configured: ${HAS_OPENAI}"
+          if [ "${HAS_ANTHROPIC}" != "true" ] && [ "${HAS_OPENAI}" != "true" ]; then
+            echo "::notice::No provider secrets configured; nothing to run."
+          fi
+
+      - name: Checkout
+        if: env.HAS_ANTHROPIC == 'true' || env.HAS_OPENAI == 'true'
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install Rust 1.99.0
+        if: env.HAS_ANTHROPIC == 'true' || env.HAS_OPENAI == 'true'
+        uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
+
+      - name: Cache cargo
+        if: env.HAS_ANTHROPIC == 'true' || env.HAS_OPENAI == 'true'
+        uses: Swatinem/rust-cache@v2 # v2.9.2
+        with:
+          shared-key: test
+
+      - name: cargo test real_provider -- --ignored
+        if: env.HAS_ANTHROPIC == 'true' || env.HAS_OPENAI == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          REAL_ANTHROPIC_MODEL: ${{ vars.REAL_ANTHROPIC_MODEL }}
+          REAL_OPENAI_MODEL: ${{ vars.REAL_OPENAI_MODEL }}
+          REAL_OPENAI_BASE_URL: ${{ vars.REAL_OPENAI_BASE_URL }}
+        run: cargo test --locked -p symphony-agents --test real_provider -- --ignored --nocapture

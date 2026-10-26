@@ -4,7 +4,9 @@
 //! [`validate_settings`] is the dispatch preflight (tracker kind + adapter checks). Both run on every
 //! (re)load inside [`crate::WorkflowStore`].
 
+pub mod backend;
 mod cast;
+pub mod llm;
 pub mod schema;
 pub mod tracker;
 pub mod value;
@@ -13,7 +15,12 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+pub use backend::{
+    ApiBackendSettings, ApiProvider, BackendKind, BackendPricing, BackendSettings,
+    ClaudeCodeSettings, SandboxMode,
+};
 pub use cast::{cast_boolean, cast_integer, cast_number, cast_string_list};
+pub use llm::{LlmConnection, LlmGateway, LlmProvider, SecretSource};
 pub use schema::{
     AgentSettings, BudgetSettings, CodexProvider, CodexSettings, HooksSettings,
     ObservabilitySettings, PollingSettings, ServerSettings, Settings, StringOrMap, TrackerSettings,
@@ -167,13 +174,28 @@ impl Settings {
         })
     }
 
-    /// Env var names to strip from agent children: the tracker's secrets and the HTTP API token.
+    /// Env var names to strip from agent children: the tracker's secrets, the HTTP API token,
+    /// backend keys and the LLM contract's secrets (also while the contract is off, so a stray
+    /// `LLM_API_KEY` from a shared environment does not reach agents).
     pub fn secret_environment_names(&self) -> Vec<String> {
         crate::env::uniq(
             tracker::secret_environment_names(&self.tracker)
                 .into_iter()
-                .chain(self.server.secret_environment_names.iter().cloned()),
+                .chain(self.server.secret_environment_names.iter().cloned())
+                .chain(backend::backend_secret_environment_names(&self.backends))
+                .chain(llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)),
         )
+    }
+
+    /// The backend named `name`, else `agent.backend` (`None` for an unknown name). `codex` is
+    /// always known, also in settings that were not parsed (`Settings::default()`).
+    pub fn backend(&self, name: Option<&str>) -> Option<BackendSettings> {
+        let name = name.unwrap_or(&self.agent.backend);
+        match self.backends.get(name) {
+            Some(backend) => Some(backend.clone()),
+            None if name == backend::CODEX_BACKEND => Some(BackendSettings::codex()),
+            None => None,
+        }
     }
 
     /// Active states, or an empty list when unset.

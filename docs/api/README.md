@@ -36,11 +36,20 @@ export SYMPHONY=http://127.0.0.1:4000
 | GET | `/api/v1/runs/{id}` | 200 | 400, 404 `run_not_found`, 405, 503 |
 | GET | `/api/v1/runs/{id}/events` | 200 | 400, 404, 405, 503 |
 | GET | `/api/v1/totals` | 200 | 405, 503 |
+| POST | `/api/v1/events/tickets` | 201 single-use SSE ticket | 401, 405 |
+| POST | `/api/v1/pause` / `/api/v1/resume` | 200 kill switch state | 401, 403, 405, 503 |
+| GET | `/api/v1/metrics` | 200 Prometheus text | 401, 405 |
+| POST / GET | `/api/v1/tasks` | 201 task / 200 page | 400, 401, 403, 503 `store_disabled` |
+| GET | `/api/v1/tasks/{id}` | 200 | 400, 404 `task_not_found`, 503 |
+| POST | `/api/v1/tasks/{id}/cancel` | 200 | 400, 404, 503 |
+| POST | `/api/v1/tasks/{id}/unblock` | 200 | 400, 404, 409 `task_conflict`, 503 |
+| GET | `/api/v1/tasks/{id}/events` | 200 `text/event-stream` | 404, 503 |
 | GET | `/api/openapi.json` | 200 | 405 |
 | any | anything else | — | 404 `not_found` |
 
-Because literal routes match first, the identifiers `state`, `refresh`, `health`, `events`, `runs`
-and `totals` are reserved and cannot be looked up as issues. A single trailing slash is ignored.
+Because literal routes match first, the identifiers `state`, `refresh`, `health`, `events`, `runs`,
+`totals`, `pause`, `resume`, `metrics` and `tasks` are reserved and cannot be looked up as issues.
+The task API is described in [`../tasks.md`](../tasks.md). A single trailing slash is ignored.
 `HEAD` works on every `GET` route.
 
 ## Live state

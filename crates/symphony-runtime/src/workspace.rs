@@ -166,6 +166,19 @@ pub struct IssueContext {
     pub identifier: Option<String>,
 }
 
+/// Directory under `workspace.root` that holds task workspaces (`.tasks/<id>`). No tracker
+/// identifier maps there: `workspace_key` never yields a `/`.
+pub const TASK_WORKSPACES: &str = ".tasks";
+
+/// `<id>` of a task run's issue id `task:<id>` (digits only).
+fn task_workspace_key(issue: &IssueContext) -> Option<&str> {
+    issue
+        .issue_id
+        .as_deref()?
+        .strip_prefix("task:")
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
 impl IssueContext {
     /// Context for a bare identifier.
     pub fn identifier(identifier: impl Into<String>) -> Self {
@@ -402,7 +415,18 @@ impl WorkspaceManager {
         issue: &IssueContext,
         worker_host: Option<&str>,
     ) -> Result<String, WorkspaceError> {
-        let workspace = self.workspace_path(issue.identifier.as_deref(), worker_host)?;
+        let workspace = match task_workspace_key(issue) {
+            Some(key) if worker_host.is_none() => {
+                let tasks = self.local_root().join(TASK_WORKSPACES);
+                tokio::fs::create_dir_all(&tasks)
+                    .await
+                    .map_err(|err| io_error("mkdir_p", &tasks, &err))?;
+                path_safety::canonicalize(tasks.join(key))
+                    .map(|p| lossy(&p))
+                    .map_err(WorkspaceError::Path)?
+            }
+            _ => self.workspace_path(issue.identifier.as_deref(), worker_host)?,
+        };
         let (workspace, created) = match worker_host {
             None => {
                 validate_local_workspace_path(Path::new(&workspace), &self.local_root())?;

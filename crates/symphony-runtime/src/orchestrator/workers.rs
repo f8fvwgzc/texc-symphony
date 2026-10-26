@@ -30,6 +30,17 @@ impl Orchestrator<'_> {
                 );
                 self.notify();
             }
+            WorkerMessage::TaskResult { run_id, result } => {
+                if let Some(task) = self
+                    .state
+                    .running
+                    .values_mut()
+                    .find(|entry| entry.run_id == run_id)
+                    .and_then(|entry| entry.task.as_mut())
+                {
+                    task.result = Some(result);
+                }
+            }
         }
     }
 
@@ -149,7 +160,28 @@ impl Orchestrator<'_> {
     ) {
         let session_id = entry.session_id.clone().unwrap_or_else(|| "n/a".into());
         let outcome_blocker = result.as_ref().err().and_then(RunError::blocker);
-        if entry.is_blocker() || outcome_blocker.is_some() {
+        let blocked = entry.is_blocker() || outcome_blocker.is_some();
+        if !blocked && let Some(task) = entry.task.clone() {
+            // Tasks run once: no continuation or retry; the outcome goes to the task record.
+            let (run_status, task_status, error) = match &result {
+                Ok(()) => (RunStatus::Succeeded, TaskStatus::Succeeded, None),
+                Err(err) => (
+                    RunStatus::Failed,
+                    TaskStatus::Failed,
+                    Some(format!("agent exited: {err}")),
+                ),
+            };
+            tracing::info!(
+                "Task run finished for issue_id={issue_id} session_id={session_id} status={task_status}"
+            );
+            entry.recorder.finish(run_status, error.clone());
+            self.task_finish(task.id, task_status, task.result, error);
+            self.release_issue_claim(issue_id);
+            // Final: the clone is not needed any more (unblocking a failed task clones again).
+            self.remove_task_workspace(task.id);
+            return;
+        }
+        if blocked {
             let fallback = match (&result, outcome_blocker) {
                 (_, Some(blocker)) => blocker.message().to_owned(),
                 (Ok(()), None) => "agent exited: normal".to_owned(),
@@ -224,6 +256,9 @@ impl Orchestrator<'_> {
         error: String,
     ) {
         self.remove_retry_entry(issue_id);
+        if let Some(task) = task_id(issue_id) {
+            self.task_finish(task, TaskStatus::Blocked, None, Some(error.clone()));
+        }
         self.state.claimed.insert(issue_id.to_owned());
         self.state.blocked.insert(
             issue_id.to_owned(),
@@ -285,6 +320,11 @@ impl Orchestrator<'_> {
         entry
             .recorder
             .finish(RunStatus::Cancelled, Some(reason.to_owned()));
+        if let Some(task) = &entry.task {
+            // Stopped from outside (kill switch, daily budget): queued again. A task that was
+            // finished first (cancel, failure) is not running any more and stays as it is.
+            self.task_release(task.id, reason);
+        }
         if cleanup {
             self.cleanup_issue_workspace(
                 Some(&entry.identifier),

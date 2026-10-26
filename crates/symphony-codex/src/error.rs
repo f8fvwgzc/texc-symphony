@@ -133,6 +133,15 @@ pub enum CodexError {
     /// Codex requested an approval that the policy does not auto-grant (the whole message).
     #[error("approval_required: {0}")]
     ApprovalRequired(Value),
+    /// A non-Codex agent backend failed (model API error, CLI exit, protocol error).
+    #[error("agent_backend_failed: {0}")]
+    Backend(String),
+    /// A backend limit stopped the turn (for example `max_steps` of the API agent loop).
+    #[error("agent_limit_exceeded: {0}")]
+    LimitExceeded(String),
+    /// The backend cannot run with this configuration (for example on an SSH worker).
+    #[error("agent_backend_unsupported: {0}")]
+    Unsupported(String),
 }
 
 impl CodexError {
@@ -155,6 +164,9 @@ impl CodexError {
             Self::TurnCancelled(_) => "turn_cancelled",
             Self::TurnInputRequired(_) => "turn_input_required",
             Self::ApprovalRequired(_) => "approval_required",
+            Self::Backend(_) => "agent_backend_failed",
+            Self::LimitExceeded(_) => "agent_limit_exceeded",
+            Self::Unsupported(_) => "agent_backend_unsupported",
         }
     }
 

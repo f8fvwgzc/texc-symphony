@@ -86,6 +86,22 @@ pub trait ControlPlane: Send + Sync + 'static {
         Err(Unavailable)
     }
 
+    /// Stops task `id` if it runs (`Ok(true)`) or releases it if it is blocked. The default
+    /// reports the orchestrator as unavailable.
+    async fn cancel_task(&self, _id: i64) -> Result<bool, Unavailable> {
+        Err(Unavailable)
+    }
+
+    /// Lets a re-queued blocked task run again (releases its claim and polls now).
+    async fn unblock_task(&self, _id: i64) -> Result<(), Unavailable> {
+        Err(Unavailable)
+    }
+
+    /// Names of the configured `backends` (task validation); `None` skips the check.
+    fn backend_names(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Change notifications: a receiver whose value is the orchestrator **generation**, a counter
     /// bumped (`send_modify(|g| *g += 1)`) on every state change the dashboard should see. It is
     /// the SSE `id:`. When the sender is dropped, live streams keep their heartbeats but stop

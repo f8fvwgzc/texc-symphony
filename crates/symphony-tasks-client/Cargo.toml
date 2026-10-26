@@ -1,0 +1,26 @@
+[package]
+name = "symphony-tasks-client"
+description = "Thin client for the Symphony task API: queue AI tasks, cancel, unblock and watch them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+symphony-server = { workspace = true }
+symphony-store = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[lints]
+workspace = true

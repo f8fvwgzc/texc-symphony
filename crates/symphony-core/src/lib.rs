@@ -8,6 +8,7 @@
 //! - [`prompt`]: strict Liquid prompt rendering and continuation guidance.
 //! - [`path_safety`]: Elixir `Path.expand` semantics and symlink-resolving canonicalization.
 //! - [`workspace_key`]: the per-issue workspace directory name.
+//! - [`task`]: validation rules for tasks from the task API.
 //! - [`error`]: typed errors whose `Display` keeps the Elixir snake_case reason tags.
 
 #![warn(missing_docs)]
@@ -18,6 +19,7 @@ pub mod error;
 pub mod issue;
 pub mod path_safety;
 pub mod prompt;
+pub mod task;
 pub mod workflow;
 pub mod workflow_store;
 pub mod workspace_key;

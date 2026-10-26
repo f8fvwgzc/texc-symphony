@@ -1,0 +1,17 @@
+{{- range $name, $volume := dict "data" .Values.persistence.data "workspaces" .Values.persistence.workspaces }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "symphony.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "symphony.labels" $ | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with $.Values.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $volume.size }}
+{{- end }}

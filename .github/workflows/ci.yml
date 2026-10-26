@@ -86,10 +86,21 @@ jobs:
         with:
           shared-key: test
 
+      # The api backend's sandbox tests must run, not skip: bubblewrap with unprivileged user
+      # namespaces (Ubuntu 24.04 restricts them through AppArmor by default).
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       # symphony-server embeds a placeholder page when web/dist is absent, so the Rust jobs do not
       # wait for the web build.
       - name: cargo test
         run: make test
+        env:
+          SYMPHONY_REQUIRE_SANDBOX: ${{ runner.os == 'Linux' && '1' || '' }}
 
   web:
     name: web (check + build)
@@ -126,6 +137,21 @@ jobs:
           path: web/dist
           if-no-files-found: error
           retention-days: 7
+
+  helm:
+    name: helm (lint + template)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # v7.0.1
+
+      - name: Install helm
+        uses: azure/setup-helm@v5 # v5.0.1
+        with:
+          version: v3.19.0
+
+      - name: Lint and render the chart
+        run: make helm-check
 
   docker:
     name: docker (linux/amd64 + linux/arm64)
@@ -169,6 +195,20 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha,format=short
+
+      # The shipped layout (entrypoint, user, PID 1) is tested before anything is pushed.
+      - name: Build linux/amd64 for the image test
+        uses: docker/build-push-action@v7 # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: symphony:test
+          cache-from: type=gha,scope=symphony-image
+
+      - name: Image test (PID 1 hides the secrets, forwards signals, reaps orphans)
+        run: docker/test.sh symphony:test
 
       - name: Build (and push on main)
         uses: docker/build-push-action@v7 # v7.4.0

@@ -1,8 +1,10 @@
 # texc-symphony
 
-texc-symphony is a Rust orchestrator for coding agents. It turns tracker issues (Linear, GitHub,
-GitLab, Jira, Asana) into isolated, autonomous implementation runs driven by Codex or Claude Code,
-so teams manage work instead of supervising agents.
+texc-symphony is a Rust orchestrator for AI agents: any task, assigned to an agent and handled to
+completion, on any model provider. It turns tracker issues (Linear, GitHub, GitLab, Jira, Asana)
+and tasks posted to its task API into isolated, autonomous runs driven by Codex, the Claude Code
+CLI, or its own agent loop over any Anthropic or OpenAI-compatible model API, so teams manage work
+instead of supervising agents.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
@@ -21,6 +23,20 @@ in it until the issue leaves those states. Everything is configured in one
 and Codex settings, and a Liquid template for the agent prompt. Agents reach the tracker through a
 tool that Symphony executes with host-side credentials, so tracker tokens never enter the agent's
 environment.
+
+**Agent backends.** `backends:` in `WORKFLOW.md` defines what runs the work
+([`docs/agents.md`](docs/agents.md)): `codex` (the Codex app-server, the default), `claude_code`
+(the Claude Code CLI, with the tracker tools bridged over MCP), and `api`, Symphony's own agent
+loop over Anthropic Messages or OpenAI-compatible Chat Completions with workspace tools (files, a
+sandboxed shell) and the scoped tracker tools. A new OpenAI-compatible provider (OpenAI, Ollama,
+vLLM, LM Studio, OpenRouter, Groq, Together, Gemini's OpenAI endpoint) is a few lines of config.
+On the platform, the shared `LLM_*` connection contract (including gateway mode) configures all
+three ([configuration](docs/configuration.md#llm-connection-contract)); a Helm chart is in
+[`deploy/helm/symphony`](deploy/helm/symphony).
+
+**Task API.** Products assign work without a tracker: `POST /api/v1/tasks` with a prompt and,
+optionally, a repository, backend and limits; then cancel, unblock or watch it over SSE
+([`docs/tasks.md`](docs/tasks.md)). The `symphony-tasks-client` crate wraps it for Rust products.
 
 Symphony works best in codebases that have adopted
 [harness engineering](https://openai.com/index/harness-engineering/).

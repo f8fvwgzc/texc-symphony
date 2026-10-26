@@ -34,6 +34,20 @@ impl Pricing {
         }
     }
 
+    /// The backend's own prices, else the `budget` prices.
+    pub(crate) fn for_backend(
+        backend: Option<&symphony_core::config::BackendSettings>,
+        budget: &BudgetSettings,
+    ) -> Self {
+        match backend.and_then(|b| b.pricing.as_ref()) {
+            Some(pricing) => Self {
+                input_usd_per_million_tokens: pricing.input_usd_per_million_tokens,
+                output_usd_per_million_tokens: pricing.output_usd_per_million_tokens,
+            },
+            None => Self::from_budget(budget),
+        }
+    }
+
     /// Cost in micro-USD of cumulative `input` / `output` token counts.
     pub(crate) fn cost_micro_usd(&self, input: u64, output: u64) -> u64 {
         BudgetSettings {

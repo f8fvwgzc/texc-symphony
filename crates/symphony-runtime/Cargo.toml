@@ -12,6 +12,7 @@ symphony-core = { workspace = true }
 symphony-trackers = { workspace = true }
 symphony-codex = { workspace = true }
 symphony-store = { workspace = true }
+symphony-agents = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

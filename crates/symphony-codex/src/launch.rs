@@ -87,6 +87,12 @@ pub fn codex_command(codex: &CodexSettings) -> String {
         if let Some(env_key) = &provider.api_key_env {
             overrides.push(format!("{key}.env_key={}", toml_string(env_key)));
         }
+        if let Some(retries) = provider.request_max_retries {
+            overrides.push(format!("{key}.request_max_retries={retries}"));
+        }
+        if let Some(ms) = provider.stream_idle_timeout_ms {
+            overrides.push(format!("{key}.stream_idle_timeout_ms={ms}"));
+        }
     }
     overrides
         .iter()
@@ -219,6 +225,8 @@ mod tests {
             name: "ollama".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             api_key_env: Some("OLLAMA_API_KEY".into()),
+            request_max_retries: None,
+            stream_idle_timeout_ms: None,
         });
         assert_eq!(
             codex_command(&codex),

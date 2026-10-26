@@ -1,0 +1,7 @@
+apiVersion: v2
+name: symphony
+description: texc-symphony, the AI task executor (tracker issues and the task API, any model provider).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/f8fvwgzc/texc-symphony

@@ -177,6 +177,23 @@ impl ControlPlane for RuntimeControlPlane {
         self.workflow.settings().workspace.root.clone()
     }
 
+    async fn cancel_task(&self, id: i64) -> Result<bool, Unavailable> {
+        self.handle.cancel_task(id).await.map_err(|_| Unavailable)
+    }
+
+    async fn unblock_task(&self, id: i64) -> Result<(), Unavailable> {
+        self.handle.unblock_task(id).await.map_err(|_| Unavailable)
+    }
+
+    fn backend_names(&self) -> Option<Vec<String>> {
+        let settings = self.workflow.settings();
+        let mut names: Vec<String> = settings.backends.keys().cloned().collect();
+        if !names.iter().any(|n| n == "codex") {
+            names.push("codex".to_owned());
+        }
+        Some(names)
+    }
+
     async fn set_paused(
         &self,
         paused: bool,

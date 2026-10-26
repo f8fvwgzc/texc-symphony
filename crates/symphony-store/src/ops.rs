@@ -270,6 +270,10 @@ pub(crate) fn list_runs(conn: &Connection, query: &RunQuery) -> Result<RunPage> 
         clauses.push("issue_identifier = ?");
         values.push(Value::Text(identifier.clone()));
     }
+    if let Some(issue_id) = &query.issue_id {
+        clauses.push("issue_id = ?");
+        values.push(Value::Text(issue_id.clone()));
+    }
     if let Some(status) = query.status {
         clauses.push("status = ?");
         values.push(Value::Text(status.as_str().to_string()));

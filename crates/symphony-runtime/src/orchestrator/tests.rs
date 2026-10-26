@@ -187,6 +187,7 @@ fn fake_entry(identifier: &str, issue: Issue, worker_host: Option<&str>) -> Runn
         recorder: RunRecorder::default(),
         pricing: Default::default(),
         cost_micro_usd: 0,
+        task: None,
     }
 }
 
@@ -1574,7 +1575,8 @@ async fn the_kill_switch_stops_everything_survives_a_restart_and_resumes() {
         paused: true,
         reason: Some("runaway spend".into()),
         reply,
-    });
+    })
+    .await;
     assert_eq!(
         ack.await.unwrap(),
         PauseAck {
@@ -1652,6 +1654,245 @@ async fn released_claims_drop_the_completed_bookkeeping() {
     assert!(!orch.state.completed.contains("i-1"));
 }
 
+// ----- tasks (task API) ------------------------------------------------------------------------
+
+async fn task_store() -> (Store, i64) {
+    let store = Store::open_in_memory().unwrap();
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "Write a haiku about Rust".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    (store, task.id)
+}
+
+async fn task_status(
+    store: &Store,
+    id: i64,
+    want: symphony_store::TaskStatus,
+) -> symphony_store::TaskRecord {
+    for _ in 0..200 {
+        let task = store.get_task(id).await.unwrap().unwrap();
+        if task.status == want {
+            return task;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    panic!("task {id} never reached {want}");
+}
+
+/// `(task, backend)` of every started worker.
+type SeenTasks = Arc<Mutex<Vec<(Option<crate::worker::TaskSpec>, Option<String>)>>>;
+
+/// Worker that records its context's task and backend, reports a result and ends with `result`.
+fn task_factory(seen: SeenTasks, result: fn() -> WorkerResult) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        seen.lock()
+            .unwrap()
+            .push((ctx.task.clone(), ctx.backend.clone()));
+        async move {
+            ctx.reporter.task_result("five seven five");
+            result()
+        }
+    }))
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_tasks_run_once_and_record_their_result() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::clone(&seen), || Ok(())),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let issue_id = format!("task:{id}");
+    assert!(orch.state.running.contains_key(&issue_id));
+    assert_eq!(
+        orch.state.running[&issue_id].identifier,
+        format!("task-{id}")
+    );
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let task = task_status(&store, id, TaskStatus::Succeeded).await;
+    assert_eq!(task.result.as_deref(), Some("five seven five"));
+    assert_eq!(task.attempts, 1);
+    assert!(
+        orch.state.retry_attempts.is_empty(),
+        "tasks are never retried"
+    );
+    assert!(!orch.state.claimed.contains(&issue_id));
+    let (spec, backend) = seen.lock().unwrap()[0].clone();
+    let spec = spec.unwrap();
+    assert_eq!(spec.prompt, "Write a haiku about Rust");
+    assert_eq!(backend, None);
+    // Nothing is left to dispatch.
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty());
+    let runs = store.list_runs(RunQuery::default()).await.unwrap().runs;
+    assert_eq!(runs[0].issue_identifier, format!("task-{id}"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_tasks_and_unknown_backends_end_failed() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let other = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            backend: Some("nope".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::default(), || Err(RunError::Other("boom".into()))),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let refused = task_status(&store, other.id, TaskStatus::Failed).await;
+    assert_eq!(refused.error.as_deref(), Some("unknown backend \"nope\""));
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let failed = task_status(&store, id, TaskStatus::Failed).await;
+    assert_eq!(failed.error.as_deref(), Some("agent exited: boom"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_tasks_wait_for_unblock_and_then_run_again() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    // The agent asks for input and its session ends with the blocker, like a Codex turn does.
+    let factory: Arc<dyn WorkerFactory> =
+        Arc::new(FnWorkerFactory(|ctx: WorkerContext| async move {
+            ctx.events.emit(input_required());
+            Err(RunError::Codex(CodexError::TurnInputRequired(json!({}))))
+        }));
+    let mut h = Harness::with_store(json!({"tracker": {"kind": "none"}}), factory, store.clone());
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let issue_id = format!("task:{id}");
+    run_until(&mut orch, |o| o.state.blocked.contains_key(&issue_id)).await;
+    let blocked = task_status(&store, id, TaskStatus::Blocked).await;
+    assert!(blocked.error.is_some());
+    // Tracker reconciliation leaves blocked tasks alone.
+    orch.reconcile_blocked_issues().await;
+    assert!(orch.state.blocked.contains_key(&issue_id));
+
+    store
+        .requeue_task(id, Some("Use 5-7-5.".into()))
+        .await
+        .unwrap();
+    let (reply, ack) = tokio::sync::oneshot::channel();
+    orch.handle_command(RuntimeCommand::UnblockTask { id, reply })
+        .await;
+    ack.await.unwrap();
+    assert!(!orch.state.blocked.contains_key(&issue_id));
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&issue_id));
+    let task = store.get_task(id).await.unwrap().unwrap();
+    assert_eq!(task.attempts, 2);
+    assert!(task.prompt.ends_with("Operator reply:\nUse 5-7-5."));
+    run_until(&mut orch, |o| o.state.blocked.contains_key(&issue_id)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn running_tasks_can_be_cancelled_and_survive_tracker_reconciliation() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "memory"}}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let issue_id = format!("task:{id}");
+    assert!(orch.state.running.contains_key(&issue_id));
+    // The tracker has never heard of task:N; reconciliation must not stop the run.
+    orch.reconcile_running_issues().await;
+    assert!(orch.state.running.contains_key(&issue_id));
+
+    let (reply, ack) = tokio::sync::oneshot::channel();
+    orch.handle_command(RuntimeCommand::CancelTask { id, reply })
+        .await;
+    assert!(ack.await.unwrap(), "it was running");
+    assert!(orch.state.running.is_empty());
+    let task = task_status(&store, id, TaskStatus::Cancelled).await;
+    assert_eq!(task.error.as_deref(), Some("cancelled by client"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_puts_running_tasks_back_in_the_queue_and_restarts_requeue_them() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let _ = orch.set_paused(true, Some("maintenance".into()));
+    orch.enforce_spend().await;
+    assert!(orch.state.running.is_empty());
+    let task = task_status(&store, id, TaskStatus::Queued).await;
+    assert!(task.error.unwrap().contains("dispatch paused"));
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty(), "held while paused");
+    let _ = orch.set_paused(false, None);
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&format!("task:{id}")));
+    // A process that dies mid-run leaves the task running; the next start queues it again.
+    drop(orch);
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
+    task_status(&store, id, TaskStatus::Queued).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_task_over_its_token_limit_fails() {
+    use symphony_store::TaskStatus;
+    let store = Store::open_in_memory().unwrap();
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            limits: symphony_store::TaskLimits {
+                max_tokens: Some(50),
+                timeout_ms: None,
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        emitting_factory(vec![usage_event(40, 20)]),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let failed = task_status(&store, task.id, TaskStatus::Failed).await;
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("task token limit exhausted: 60 of 50 tokens used")
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn raising_the_issue_budget_releases_budget_blocked_issues() {
     let store = Store::open_in_memory().unwrap();
@@ -1695,4 +1936,62 @@ async fn raising_the_issue_budget_releases_budget_blocked_issues() {
         .await;
     assert!(orch.state.running.contains_key("i-1"));
     orch.terminate_running_issue("i-1", false, "test").await;
+}
+
+#[tokio::test]
+async fn task_workspaces_are_separate_from_tracker_issues_and_removed_when_final() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    // A tracker issue whose identifier looks like a task's must not share anything with it.
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "memory"}}),
+        task_factory(Arc::default(), || Ok(())),
+        store.clone(),
+    );
+    h.memory
+        .set(vec![issue("lin-1", &format!("task-{id}"), "In Progress")]);
+    let _ = started;
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let workspace = orch.task_workspace(id);
+    assert!(
+        workspace.ends_with(format!(".tasks/{id}")),
+        "{}",
+        workspace.display()
+    );
+    std::fs::create_dir_all(workspace.join("clone")).unwrap();
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    task_status(&store, id, TaskStatus::Succeeded).await;
+    let mut removed = false;
+    for _ in 0..200 {
+        if !workspace.exists() {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(removed, "the workspace of a final task is removed");
+
+    // A stale workspace of a finished task is swept at startup; a queued task keeps its own.
+    std::fs::create_dir_all(&workspace).unwrap();
+    let queued = store
+        .create_task(symphony_store::NewTask {
+            prompt: "later".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let kept = orch.task_workspace(queued.id);
+    std::fs::create_dir_all(&kept).unwrap();
+    orch.sweep_task_workspaces().await;
+    for _ in 0..200 {
+        if !workspace.exists() {
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(!workspace.exists());
+    assert!(kept.exists());
 }

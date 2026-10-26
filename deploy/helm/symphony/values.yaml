@@ -1,0 +1,86 @@
+# texc-symphony Helm values. See docs/deployment.md#option-3-kubernetes-helm.
+
+image:
+  repository: ghcr.io/f8fvwgzc/texc-symphony
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Symphony runs agents unattended and refuses to start without this acknowledgement. Review the
+# sandbox and budget settings in `workflow` before setting it to true.
+acknowledgeGuardrails: false
+
+# WORKFLOW.md, mounted read-only at /config/WORKFLOW.md (front matter + prompt).
+workflow: |
+  ---
+  tracker:
+    kind: none
+  server:
+    port: 4000
+  budget:
+    max_tokens_per_day: 20000000
+  ---
+  You are working on {{ issue.identifier }}: {{ issue.title }}
+
+# The API token (required: the pod binds 0.0.0.0). An existing Secret holding it under `key`.
+apiToken:
+  existingSecret: symphony-api-token
+  key: token
+
+# Extra environment (tracker credentials, ...), as Kubernetes `env` entries.
+extraEnv: []
+# Extra `envFrom` sources.
+extraEnvFrom: []
+
+# The platform LLM connection contract (LLM_*), shared by every core.
+global:
+  llm:
+    # Non-secret settings come from this ConfigMap (keys LLM_PROVIDER, LLM_BASE_URL, LLM_MODEL,
+    # LLM_MODEL_SMALL, LLM_TIMEOUT_SECS, LLM_MAX_RETRIES, LLM_GATEWAY_URL); optional.
+    configMap: llm-config
+    # Credentials come from this Secret, mounted read-only at /var/run/secrets/llm; optional.
+    secret: llm-credentials
+    # Secret keys: the provider key (LLM_API_KEY_FILE) and the gateway token
+    # (LLM_GATEWAY_TOKEN_FILE). Set a key to "" when it is not used (a keyless local server).
+    apiKeySecretKey: api-key
+    gatewayTokenSecretKey: gateway-token
+    # Explicit values win over the ConfigMap; "" leaves a variable to the ConfigMap.
+    provider: ""
+    baseUrl: ""
+    model: ""
+    modelSmall: ""
+    timeoutSecs: ""
+    maxRetries: ""
+    gatewayUrl: ""
+
+service:
+  type: ClusterIP
+  port: 4000
+
+persistence:
+  # Run history (SQLite) and logs.
+  data:
+    size: 5Gi
+  # Per-issue and per-task workspaces.
+  workspaces:
+    size: 20Gi
+  storageClass: ""
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 8Gi
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

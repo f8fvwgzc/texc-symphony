@@ -15,10 +15,13 @@
 //! event log, it does not make printing secrets safe.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::Value;
+use symphony_core::config::SecretSource;
+use symphony_core::config::llm::{LLM_API_KEY_FILE, LLM_GATEWAY_TOKEN_FILE};
 use symphony_core::{EnvSource, Settings};
 
 /// Replacement text for a redacted secret.
@@ -102,17 +105,28 @@ impl Redactor {
         Self { secrets }
     }
 
-    /// The secrets of `settings`: the resolved tracker key, the API token and the values of
-    /// every env var stripped from agent children.
+    /// The secrets of `settings`: the resolved tracker key, the API token, the LLM contract's
+    /// credential and the values of every env var stripped from agent children.
     pub fn from_settings(settings: &Settings, env: &dyn EnvSource) -> Self {
         let from_env = settings
             .secret_environment_names()
             .into_iter()
             .filter_map(|name| env.var(&name));
+        // The LLM contract's key files (read whether or not the contract is on) and `api` backend
+        // keys may live in files (mounted Secrets).
+        let llm_files = [LLM_API_KEY_FILE, LLM_GATEWAY_TOKEN_FILE]
+            .into_iter()
+            .filter_map(|name| env.var(name))
+            .map(|path| PathBuf::from(path.trim()));
+        let files = symphony_core::config::backend::backend_secret_files(&settings.backends)
+            .into_iter()
+            .chain(llm_files)
+            .filter_map(|path| SecretSource::File(path).read(env).ok());
         Self::new(
             from_env
                 .chain(settings.tracker.api_key.clone())
-                .chain(settings.server.api_token.clone()),
+                .chain(settings.server.api_token.clone())
+                .chain(files),
         )
     }
 
@@ -270,6 +284,59 @@ mod tests {
         let redactor = Redactor::from_settings(&settings, &env);
         assert_eq!(
             redactor.redact_str("plain-gh-token-value api-token-for-symphony"),
+            "[REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn backend_keys_are_stripped_and_redacted() {
+        use symphony_core::config;
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("api-key");
+        std::fs::write(&key_file, "file-key-0123456789\n").unwrap();
+        let serde_json::Value::Object(map) = serde_json::json!({"backends": {
+            "cc": {"kind": "claude_code", "api_key_env": "MY_CLAUDE_KEY"},
+            "api": {"kind": "api", "provider": "openai", "model": "m",
+                "api_key_file": key_file.display().to_string()},
+        }}) else {
+            unreachable!("an object")
+        };
+        let env = MapEnv::new().with("MY_CLAUDE_KEY", "claude-key-0123456789");
+        let settings = config::parse(&map, &env).unwrap();
+        assert!(
+            settings
+                .secret_environment_names()
+                .contains(&"MY_CLAUDE_KEY".to_owned()),
+            "removed from hooks, Codex and the api shell"
+        );
+        let redactor = Redactor::from_settings(&settings, &env);
+        assert_eq!(
+            redactor.redact_str("claude-key-0123456789 file-key-0123456789"),
+            "[REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn stray_llm_keys_are_stripped_and_redacted_while_the_contract_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("gateway-token");
+        std::fs::write(&token_file, "stray-gateway-token-0123\n").unwrap();
+        // No LLM_PROVIDER or LLM_GATEWAY_URL: the contract is off.
+        let env = MapEnv::new()
+            .with("LLM_API_KEY", "stray-llm-key-0123456789")
+            .with("LLM_GATEWAY_TOKEN_FILE", token_file.display().to_string());
+        let settings = symphony_core::config::parse(&serde_json::Map::new(), &env).unwrap();
+        assert!(settings.llm.is_none());
+        let names = settings.secret_environment_names();
+        for name in ["LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_GATEWAY_TOKEN_FILE"] {
+            assert!(
+                names.contains(&name.to_owned()),
+                "{name} stripped: {names:?}"
+            );
+        }
+        let redactor = Redactor::from_settings(&settings, &env);
+        assert_eq!(
+            redactor.redact_str("stray-llm-key-0123456789 stray-gateway-token-0123"),
             "[REDACTED] [REDACTED]"
         );
     }

@@ -23,6 +23,20 @@ pub enum RuntimeCommand {
     Snapshot(oneshot::Sender<Snapshot>),
     /// Queue an immediate poll + reconcile and reply with the acknowledgement.
     RequestRefresh(oneshot::Sender<RefreshAck>),
+    /// Stop a running task (`reply`: whether it was running) or release a blocked one.
+    CancelTask {
+        /// Task id.
+        id: i64,
+        /// `true` when a run was stopped.
+        reply: oneshot::Sender<bool>,
+    },
+    /// Release a blocked task's claim so its re-queued record is dispatched again.
+    UnblockTask {
+        /// Task id.
+        id: i64,
+        /// Acknowledgement.
+        reply: oneshot::Sender<()>,
+    },
     /// Engage (`paused: true`) or release the kill switch.
     SetPaused {
         /// Engage or release.
@@ -126,6 +140,12 @@ impl RuntimeHandle {
                             operations: vec!["poll".into(), "reconcile".into()],
                         });
                     }
+                    RuntimeCommand::CancelTask { reply, .. } => {
+                        let _ = reply.send(false);
+                    }
+                    RuntimeCommand::UnblockTask { reply, .. } => {
+                        let _ = reply.send(());
+                    }
                     RuntimeCommand::SetPaused {
                         paused,
                         reason,
@@ -194,6 +214,38 @@ impl RuntimeHandle {
         let (reply, response) = oneshot::channel();
         let call = async {
             if !self.send(RuntimeCommand::RequestRefresh(reply)).await {
+                return Err(RefreshError::Unavailable);
+            }
+            response.await.map_err(|_| RefreshError::Unavailable)
+        };
+        tokio::time::timeout(self.shared.refresh_timeout, call)
+            .await
+            .unwrap_or(Err(RefreshError::Timeout))
+    }
+
+    /// Stops task `id` if it is running (`Ok(true)`) and releases it if it is blocked. The task
+    /// record itself is updated by the orchestrator (running) or by the caller (queued/blocked).
+    pub async fn cancel_task(&self, id: i64) -> Result<bool, RefreshError> {
+        self.call(|reply| RuntimeCommand::CancelTask { id, reply })
+            .await
+    }
+
+    /// Releases blocked task `id` so its re-queued record runs again, and schedules a poll.
+    pub async fn unblock_task(&self, id: i64) -> Result<(), RefreshError> {
+        self.call(|reply| RuntimeCommand::UnblockTask { id, reply })
+            .await
+    }
+
+    async fn call<T>(
+        &self,
+        command: impl FnOnce(oneshot::Sender<T>) -> RuntimeCommand,
+    ) -> Result<T, RefreshError> {
+        if !self.is_available() {
+            return Err(RefreshError::Unavailable);
+        }
+        let (reply, response) = oneshot::channel();
+        let call = async {
+            if !self.send(command(reply)).await {
                 return Err(RefreshError::Unavailable);
             }
             response.await.map_err(|_| RefreshError::Unavailable)

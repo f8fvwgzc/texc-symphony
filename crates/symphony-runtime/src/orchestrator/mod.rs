@@ -28,7 +28,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
 use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
-use symphony_store::{NewRun, RetryRecord, RunStatus};
+use symphony_store::{NewRun, RetryRecord, RunStatus, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -41,8 +41,9 @@ use tracing::Instrument;
 pub use spend::PAUSED_CONTROL_KEY;
 pub(crate) use spend::{Pricing, SpendStop, Usage};
 pub(crate) use state::{
-    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, WorkerHandle,
-    blocker_error, candidate_issue, next_retry_attempt_from_running,
+    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, TaskRun,
+    WorkerHandle, blocker_error, candidate_issue, next_retry_attempt_from_running, task_id,
+    task_issue_id,
 };
 pub use state::{
     DelayType, FAILURE_RETRY_BASE_MS, HostChoice, POLL_TRANSITION_RENDER_DELAY, retry_delay,
@@ -59,7 +60,7 @@ use crate::snapshot::{
     SpendSnapshot, TrackerInfo,
 };
 use crate::tracker::FetchError;
-use crate::worker::{RunError, WorkerContext, WorkerMessage, WorkerResult};
+use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerMessage, WorkerResult};
 use crate::workspace::{WorkspaceManager, worker_hosts};
 
 /// Writes kill-switch changes to the store from one task, in order, retrying while the store is
@@ -135,8 +136,65 @@ pub(crate) struct Orchestrator<'w> {
     codex_streams: StreamMap<u64, UnboundedReceiverStream<CodexEvent>>,
     shutdown: CancellationToken,
     tokens: Counter,
+    /// Task status writes, applied in order (and retried while the store is busy).
+    task_writes: mpsc::UnboundedSender<TaskWrite>,
     /// Kill-switch changes, persisted in order by [`spawn_pause_writer`].
     pause_writes: mpsc::UnboundedSender<Option<String>>,
+}
+
+/// A task status change for the store.
+#[derive(Debug)]
+pub(crate) enum TaskWrite {
+    Finish {
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    },
+    Release {
+        id: i64,
+        reason: String,
+    },
+}
+
+/// Applies task writes one after another, so a finish always lands before a later release of the
+/// same task, and retries a write the store refused as busy instead of dropping it (a dropped
+/// finish would leave the task `running` forever).
+fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<TaskWrite> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
+    tokio::spawn(async move {
+        while let Some(write) = rx.recv().await {
+            let mut delay = Duration::from_millis(20);
+            for _ in 0..12 {
+                let result = match &write {
+                    TaskWrite::Finish {
+                        id,
+                        status,
+                        result,
+                        error,
+                    } => store
+                        .finish_task(*id, *status, result.clone(), error.clone())
+                        .await
+                        .map(drop),
+                    TaskWrite::Release { id, reason } => {
+                        store.release_task(*id, reason.clone()).await.map(drop)
+                    }
+                };
+                match result {
+                    Err(symphony_store::StoreError::Busy) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to record a task status change: {err}");
+                        break;
+                    }
+                    Ok(()) => break,
+                }
+            }
+        }
+    });
+    tx
 }
 
 impl<'w> Orchestrator<'w> {
@@ -147,6 +205,7 @@ impl<'w> Orchestrator<'w> {
         shutdown: CancellationToken,
     ) -> Self {
         let settings = ctx.workflow.settings();
+        let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         let pause_writes = spawn_pause_writer(ctx.store.clone());
@@ -162,12 +221,89 @@ impl<'w> Orchestrator<'w> {
             codex_streams: StreamMap::new(),
             shutdown,
             tokens: Counter::default(),
+            task_writes: spawn_task_writer(ctx_store),
             pause_writes,
         }
     }
 
     pub(crate) fn settings(&self) -> Arc<Settings> {
         self.ctx.workflow.settings()
+    }
+
+    /// Records the end of a task's run (`status` final or `blocked`).
+    pub(crate) fn task_finish(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    ) {
+        let _ = self.task_writes.send(TaskWrite::Finish {
+            id,
+            status,
+            result,
+            error,
+        });
+    }
+
+    /// Puts a running task back to `queued` (stopped from outside).
+    pub(crate) fn task_release(&self, id: i64, reason: &str) {
+        let _ = self.task_writes.send(TaskWrite::Release {
+            id,
+            reason: reason.to_owned(),
+        });
+    }
+
+    /// `<workspace.root>/.tasks/<id>`, the workspace of task `id` (see `workspace::TASK_WORKSPACES`).
+    pub(crate) fn task_workspace(&self, id: i64) -> std::path::PathBuf {
+        self.task_workspaces().join(id.to_string())
+    }
+
+    fn task_workspaces(&self) -> std::path::PathBuf {
+        self.settings()
+            .local_workspace_root(&self.ctx.workflow.workflow_file_path())
+            .join(crate::workspace::TASK_WORKSPACES)
+    }
+
+    /// Removes task `id`'s workspace in the background (its agent is already stopped). Task
+    /// workspaces run no workflow hooks.
+    pub(crate) fn remove_task_workspace(&self, id: i64) {
+        let path = self.task_workspace(id);
+        tokio::spawn(async move {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => tracing::debug!("Removed task workspace path={}", path.display()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(
+                    "Failed to remove task workspace path={}: {err}",
+                    path.display()
+                ),
+            }
+        });
+    }
+
+    /// Startup: removes the workspaces of tasks that are final or unknown (a previous process
+    /// stopped before cleaning them up).
+    pub(crate) async fn sweep_task_workspaces(&self) {
+        if !self.ctx.store.is_enabled() {
+            return;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(self.task_workspaces()).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            match self.ctx.store.get_task(id).await {
+                Ok(Some(task)) if !task.status.is_final() => {}
+                Ok(_) => self.remove_task_workspace(id),
+                Err(err) => tracing::warn!("Failed to read task {id}: {err}"),
+            }
+        }
     }
 
     pub(crate) fn workspace_manager(&self, settings: &Arc<Settings>) -> WorkspaceManager {
@@ -201,6 +337,12 @@ impl<'w> Orchestrator<'w> {
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
         self.restore_spend().await;
+        match self.ctx.store.requeue_interrupted_tasks().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Queued {count} tasks interrupted by the previous process"),
+            Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
+        }
+        self.sweep_task_workspaces().await;
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -212,7 +354,7 @@ impl<'w> Orchestrator<'w> {
             biased;
             () = self.shutdown.cancelled() => false,
             Some(command) = self.cmd_rx.recv() => {
-                self.handle_command(command);
+                self.handle_command(command).await;
                 self.enforce_spend().await;
                 true
             }
@@ -236,7 +378,7 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, command: RuntimeCommand) {
+    pub(crate) async fn handle_command(&mut self, command: RuntimeCommand) {
         match command {
             RuntimeCommand::Snapshot(reply) => {
                 let snapshot = self.snapshot();
@@ -245,6 +387,33 @@ impl<'w> Orchestrator<'w> {
             RuntimeCommand::RequestRefresh(reply) => {
                 let ack = self.request_refresh();
                 let _ = reply.send(ack);
+            }
+            RuntimeCommand::CancelTask { id, reply } => {
+                let issue_id = task_issue_id(id);
+                let running = self.state.running.contains_key(&issue_id);
+                if running {
+                    tracing::info!("Cancelling task run issue_id={issue_id}");
+                    self.task_finish(
+                        id,
+                        TaskStatus::Cancelled,
+                        None,
+                        Some("cancelled by client".into()),
+                    );
+                    self.terminate_running_issue(&issue_id, false, "cancelled by client")
+                        .await;
+                } else {
+                    self.release_issue_claim(&issue_id);
+                }
+                // A cancelled task never runs again (a blocked one leaves its workspace here).
+                self.remove_task_workspace(id);
+                self.notify();
+                let _ = reply.send(running);
+            }
+            RuntimeCommand::UnblockTask { id, reply } => {
+                self.release_issue_claim(&task_issue_id(id));
+                self.schedule_tick(Duration::ZERO);
+                self.notify();
+                let _ = reply.send(());
             }
             RuntimeCommand::SetPaused {
                 paused,
@@ -430,6 +599,29 @@ impl<'w> Orchestrator<'w> {
             .collect();
         for (issue_id, reason) in over {
             self.stop_and_block(&issue_id, reason).await;
+        }
+        let over_task_limit: Vec<(String, i64, String)> = self
+            .state
+            .running
+            .iter()
+            .filter_map(|(issue_id, entry)| {
+                let task = entry.task.as_ref()?;
+                let limit = task.max_tokens?;
+                let used = self.state.spend.issue(issue_id).tokens;
+                (used >= limit).then(|| {
+                    (
+                        issue_id.clone(),
+                        task.id,
+                        format!("task token limit exhausted: {used} of {limit} tokens used"),
+                    )
+                })
+            })
+            .collect();
+        for (issue_id, task, reason) in over_task_limit {
+            tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
+            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()));
+            self.terminate_running_issue(&issue_id, false, &reason)
+                .await;
         }
     }
 

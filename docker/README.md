@@ -1,8 +1,10 @@
 # Running Symphony in Docker
 
 The image holds one static-ish `symphony` binary with the web dashboard embedded, the tools that
-workspace hooks and agents need (`git`, `bash`, `openssh-client`, CA certificates), `tini` as
-PID 1, and, by default, Node.js 22 plus the Codex CLI (`@openai/codex`).
+workspace hooks and agents need (`git`, `bash`, `openssh-client`, CA certificates), and, by
+default, Node.js 22 plus the Codex CLI (`@openai/codex`). PID 1 is Symphony's own init
+([`symphony init`](../docs/cli.md#symphony-init)): it reaps orphaned processes, forwards signals and,
+unlike `tini`, keeps the container's environment (every secret in it) unreadable to agents.
 
 | | |
 |---|---|
@@ -12,7 +14,7 @@ PID 1, and, by default, Node.js 22 plus the Codex CLI (`@openai/codex`).
 | Port | `4000`: dashboard at `/`, API under `/api/v1`, health at `/api/v1/health` |
 | Volumes | `/data` (SQLite run history + logs), `/workspaces` (per-issue workspaces) |
 | Config | `/config/WORKFLOW.md` (mount read-only) |
-| Entrypoint | `tini -- symphony`; default command `/config/WORKFLOW.md` (the guardrails acknowledgement is yours to add, see below) |
+| Entrypoint | `symphony init -- symphony`; default command `/config/WORKFLOW.md` (the guardrails acknowledgement is yours to add, see below). Do not add Docker's `--init`. |
 
 Environment set by the image: `SYMPHONY_HOST=0.0.0.0`, `SYMPHONY_PORT=4000`,
 `SYMPHONY_DB_PATH=/data/symphony.db`, `SYMPHONY_LOGS_ROOT=/data/logs`. Everything else
@@ -118,10 +120,10 @@ the client config and keys (for example `./ssh:/home/symphony/.ssh:ro`) and poin
 
 Codex's Linux sandbox (`thread_sandbox: workspace-write`) relies on kernel features (Landlock,
 seccomp, user namespaces) that Docker's default seccomp/AppArmor profiles may block. If turns
-fail with sandbox errors, either treat the container as the sandbox and use
-`thread_sandbox: danger-full-access` in `WORKFLOW.md` (keep the container unprivileged, as here),
-or run the container with a seccomp profile that allows the calls Codex needs. Never add
-`--privileged`.
+fail with sandbox errors, run the container with a seccomp profile that allows the calls Codex
+needs. Never add `--privileged`, and do not fall back to `thread_sandbox: danger-full-access`:
+the container is no sandbox for agents, because Symphony runs in it with its run history,
+mounted secret files and other workspaces, all readable to Codex's commands as the same user.
 
 ## Platforms
 
@@ -245,6 +247,12 @@ docker buildx build -f docker/Dockerfile \
 
 `make docker` and `make docker-multiarch` wrap the first and last commands.
 
+`docker/test.sh symphony:dev` tests a built image as it ships (CI runs it before every push). It
+starts the image with a marker API token and, as the image's user outside any sandbox, checks
+that PID 1 is `symphony init`, that neither its environment nor Symphony's is readable while an
+ordinary process's is, that no other process (the health probe included) has the token in a
+readable environment, that orphans are reaped, and that `docker stop` stops Symphony with exit 0.
+
 Build arguments:
 
 | Arg | Default | Meaning |
@@ -268,7 +276,8 @@ How the build is laid out:
 3. `codex-npm`: `npm install --os=linux --cpu=<target>` of `@openai/codex`, on the build
    platform; only the target-platform `node` binary is copied from the target image.
 4. `runtime`: `debian:bookworm-slim` with the packages above, non-root user, health check
-   (`wget` against `/api/v1/health`).
+   (`wget` against `/api/v1/health`, started with an empty environment: Docker gives probes the
+   container's secrets). A healthcheck of your own should also clear it (`env -i`).
 
 Rebuilds after a source change only recompile the changed crates (the cache mounts keep
 `target/`). `docker buildx prune --filter type=exec.cachemount` clears those caches.

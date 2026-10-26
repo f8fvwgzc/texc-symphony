@@ -70,6 +70,10 @@ pub(crate) enum ApiError {
     HostNotAllowed,
     /// 403 `origin_not_allowed`: a browser write from another origin.
     OriginNotAllowed,
+    /// 404 `task_not_found`.
+    TaskNotFound,
+    /// 409 `task_conflict`: the task is not in a state that allows the action.
+    Conflict(String),
 }
 
 impl ApiError {
@@ -86,9 +90,11 @@ impl ApiError {
 
     pub(crate) fn status(&self) -> StatusCode {
         match self {
-            ApiError::NotFound | ApiError::IssueNotFound | ApiError::RunNotFound => {
-                StatusCode::NOT_FOUND
-            }
+            ApiError::NotFound
+            | ApiError::IssueNotFound
+            | ApiError::RunNotFound
+            | ApiError::TaskNotFound => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::OrchestratorUnavailable | ApiError::StoreDisabled => {
                 StatusCode::SERVICE_UNAVAILABLE
@@ -129,6 +135,8 @@ impl ApiError {
             ApiError::OriginNotAllowed => {
                 ErrorEnvelope::new("origin_not_allowed", "Cross-origin request refused")
             }
+            ApiError::TaskNotFound => ErrorEnvelope::new("task_not_found", "Task not found"),
+            ApiError::Conflict(message) => ErrorEnvelope::new("task_conflict", message.clone()),
         }
     }
 }

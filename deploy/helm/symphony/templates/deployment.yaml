@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "symphony.fullname" . }}
+  labels:
+    {{- include "symphony.labels" . | nindent 4 }}
+spec:
+  # SQLite run history and local workspaces: one replica (see docs/deployment.md).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "symphony.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "symphony.selector" . | nindent 8 }}
+      annotations:
+        checksum/workflow: {{ .Values.workflow | sha256sum }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: symphony
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if .Values.acknowledgeGuardrails }}
+            - --i-understand-that-this-will-be-running-without-the-usual-guardrails
+            {{- end }}
+            - /config/WORKFLOW.md
+          ports:
+            - name: http
+              containerPort: 4000
+          envFrom:
+            {{- with .Values.global.llm.configMap }}
+            - configMapRef:
+                name: {{ . }}
+                optional: true
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: SYMPHONY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiToken.existingSecret }}
+                  key: {{ .Values.apiToken.key }}
+            {{- include "symphony.llmEnv" . | trim | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: workflow
+              mountPath: /config
+              readOnly: true
+            - name: data
+              mountPath: /data
+            - name: workspaces
+              mountPath: /workspaces
+            {{- if .Values.global.llm.secret }}
+            - name: llm-credentials
+              mountPath: /var/run/secrets/llm
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: workflow
+          configMap:
+            name: {{ include "symphony.fullname" . }}-workflow
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "symphony.fullname" . }}-data
+        - name: workspaces
+          persistentVolumeClaim:
+            claimName: {{ include "symphony.fullname" . }}-workspaces
+        {{- with .Values.global.llm.secret }}
+        - name: llm-credentials
+          secret:
+            secretName: {{ . }}
+            # The Secret and each key are optional; only the keys Symphony uses are mounted.
+            optional: true
+            defaultMode: 0440
+            items:
+              {{- range splitList "," (include "symphony.llmSecretKeys" $) }}
+              {{- if . }}
+              - key: {{ . }}
+                path: {{ . }}
+              {{- end }}
+              {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

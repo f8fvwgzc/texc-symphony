@@ -19,6 +19,7 @@ symphony-codex = { path = "crates/symphony-codex" }
 symphony-runtime = { path = "crates/symphony-runtime" }
 symphony-store = { path = "crates/symphony-store" }
 symphony-server = { path = "crates/symphony-server" }
+symphony-agents = { path = "crates/symphony-agents" }
 
 # shared third-party versions (crates opt in with `workspace = true`)
 anyhow = "1.0.104"

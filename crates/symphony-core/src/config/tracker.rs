@@ -14,8 +14,9 @@ use crate::error::{ConfigError, TrackerConfigError as E};
 use crate::issue::{normalize_state, present_string};
 
 /// Supported `tracker.kind` values (exact, case-sensitive).
-pub const SUPPORTED_TRACKER_KINDS: [&str; 6] =
-    ["asana", "github", "gitlab", "jira", "linear", "memory"];
+pub const SUPPORTED_TRACKER_KINDS: [&str; 7] = [
+    "asana", "github", "gitlab", "jira", "linear", "memory", "none",
+];
 /// Default GitHub REST API base URL.
 pub const GITHUB_DEFAULT_API_URL: &str = "https://api.github.com";
 /// Default GitLab REST API base URL.
@@ -377,7 +378,8 @@ pub fn validate_tracker(tracker: &TrackerSettings, env: &dyn EnvSource) -> Resul
         .as_deref()
         .ok_or(ConfigError::MissingTrackerKind)?;
     match kind {
-        "memory" => Ok(()),
+        // `none`: no tracker; work arrives through the task API only.
+        "memory" | "none" => Ok(()),
         "linear" => resolve_linear(tracker).map(drop).map_err(Into::into),
         "github" => {
             validate_exact_states(

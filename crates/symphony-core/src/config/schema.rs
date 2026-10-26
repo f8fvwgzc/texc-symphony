@@ -270,6 +270,9 @@ pub struct AgentSettings {
     pub continuation_delay_ms: u64,
     /// Per-state concurrency caps keyed by normalized (trim + lowercase) state name.
     pub max_concurrent_agents_by_state: BTreeMap<String, u32>,
+    /// Name of the `backends` entry that runs tracker issues and tasks without their own
+    /// (default `codex`).
+    pub backend: String,
 }
 
 impl Default for AgentSettings {
@@ -280,6 +283,7 @@ impl Default for AgentSettings {
             max_retry_backoff_ms: 300_000,
             continuation_delay_ms: 1_000,
             max_concurrent_agents_by_state: BTreeMap::new(),
+            backend: super::backend::CODEX_BACKEND.into(),
         }
     }
 }
@@ -296,6 +300,10 @@ pub struct CodexProvider {
     pub base_url: String,
     /// Name of the env var holding the API key; Codex reads the value itself, Symphony never does.
     pub api_key_env: Option<String>,
+    /// Codex `request_max_retries` (from `LLM_MAX_RETRIES`).
+    pub request_max_retries: Option<u32>,
+    /// Codex `stream_idle_timeout_ms` (from `LLM_TIMEOUT_SECS`).
+    pub stream_idle_timeout_ms: Option<u64>,
 }
 
 /// `codex:` section.
@@ -486,6 +494,10 @@ pub struct Settings {
     pub server: ServerSettings,
     /// `budget:`
     pub budget: BudgetSettings,
+    /// `backends:` by name (always contains `codex`; `llm` too with the LLM contract).
+    pub backends: BTreeMap<String, super::backend::BackendSettings>,
+    /// The platform LLM connection contract (`LLM_*` environment), when set.
+    pub llm: Option<super::llm::LlmConnection>,
 }
 
 /// `Schema.normalize_state_limits/1`: keys become `trim + downcase`; values are untouched.
@@ -538,7 +550,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     );
     let worker = cast_worker(&Section::new(root, "worker", &mut errors), &mut errors);
     let agent = cast_agent(&Section::new(root, "agent", &mut errors), &mut errors);
-    let codex = cast_codex(&Section::new(root, "codex", &mut errors), &mut errors);
+    let mut codex = cast_codex(&Section::new(root, "codex", &mut errors), &mut errors);
     let hooks = cast_hooks(&Section::new(root, "hooks", &mut errors), &mut errors);
     let observability = cast_observability(
         &Section::new(root, "observability", &mut errors),
@@ -546,6 +558,14 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     );
     let server = cast_server(&Section::new(root, "server", &mut errors), &mut errors);
     let budget = cast_budget(&Section::new(root, "budget", &mut errors), &mut errors);
+    let llm = super::llm::from_env(env, &mut errors);
+    if let Some(llm) = &llm {
+        apply_llm_contract(llm, &mut codex);
+    }
+    let backends = super::backend::cast_backends(root, llm.as_ref(), &mut errors);
+    if !backends.contains_key(&agent.backend) {
+        errors.push("agent.backend", "must name an entry of backends");
+    }
 
     if !errors.is_empty() {
         return Err(ConfigError::InvalidWorkflowConfig(errors.join()));
@@ -562,8 +582,31 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         observability,
         server,
         budget,
+        backends,
+        llm,
     };
     Ok(finalize(settings, env))
+}
+
+/// The contract's defaults outside `backends:`: Codex gets the contract as its model provider (it
+/// speaks the OpenAI Responses API, so only for OpenAI-compatible providers and gateway mode)
+/// unless `codex.provider` is set. `agent.backend` is not changed: the built-in `llm` backend is
+/// used only where the workflow (or a task) names it.
+fn apply_llm_contract(llm: &super::llm::LlmConnection, codex: &mut CodexSettings) {
+    if codex.provider.is_none() && llm.serves_openai() {
+        codex.provider = Some(CodexProvider {
+            name: super::llm::CODEX_LLM_PROVIDER.into(),
+            base_url: llm.openai_base_url(),
+            api_key_env: llm
+                .credential()
+                .map(|_| super::llm::CODEX_LLM_KEY_ENV.to_owned()),
+            request_max_retries: llm.max_retries,
+            stream_idle_timeout_ms: llm.timeout_secs.map(|s| s.saturating_mul(1000)),
+        });
+        if codex.model.is_none() {
+            codex.model = Some(llm.model.clone());
+        }
+    }
 }
 
 fn cast_tracker(s: &Section<'_>, errors: &mut Errors) -> TrackerSettings {
@@ -699,6 +742,14 @@ fn cast_agent(s: &Section<'_>, errors: &mut Errors) -> AgentSettings {
         out.continuation_delay_ms = v;
     }
 
+    if let Some(backend) = s.string("backend", errors) {
+        if backend.is_empty() {
+            errors.push(&s.path("backend"), "can't be blank");
+        } else {
+            out.backend = backend;
+        }
+    }
+
     let field = "max_concurrent_agents_by_state";
     if let Some(raw) = s.map(field, errors) {
         let limits = normalize_state_limits(&raw);
@@ -807,6 +858,8 @@ fn cast_codex_provider(
         name: name?,
         base_url: base_url?,
         api_key_env,
+        request_max_retries: None,
+        stream_idle_timeout_ms: None,
     })
 }
 
