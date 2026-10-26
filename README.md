@@ -65,8 +65,14 @@ the server shows a placeholder page. `make build` (below) does both.
 **C. Docker** (amd64 and arm64; the image is published with each release, so `latest` exists from the first one):
 
 ```sh
-docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" -e LINEAR_API_KEY ghcr.io/f8fvwgzc/texc-symphony:latest
+export SYMPHONY_API_TOKEN="$(openssl rand -hex 32)"   # the container binds 0.0.0.0: a token is required
+docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" \
+  -e LINEAR_API_KEY -e SYMPHONY_API_TOKEN ghcr.io/f8fvwgzc/texc-symphony:latest \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md
 ```
+
+Pass the acknowledgement flag only after reviewing the sandbox settings in your `WORKFLOW.md`; the
+image does not pass it for you.
 
 The image includes git and the Codex CLI. For Compose, persistent volumes, Codex login inside the
 container and reverse proxies, see [`docker/README.md`](docker/README.md).
@@ -140,8 +146,10 @@ How the crates fit together: [`docs/architecture.md`](docs/architecture.md).
 
 The API is documented in [`docs/api/README.md`](docs/api/README.md), with the OpenAPI 3.1 contract
 in [`docs/api/openapi.yaml`](docs/api/openapi.yaml); a running server also serves it at
-`GET /api/openapi.json`. The HTTP API has no authentication: keep it on loopback or behind an
-authenticating proxy.
+`GET /api/openapi.json`. With `server.api_token` (or `SYMPHONY_API_TOKEN`) set, every API call
+needs `Authorization: Bearer <token>`; without one Symphony serves the API on loopback only. It
+also refuses foreign `Host` headers and cross-origin writes, redacts credentials in recorded
+events, and enforces the `budget:` limits and the `POST /api/v1/pause` kill switch.
 
 ## Development
 

@@ -139,7 +139,7 @@ impl std::fmt::Debug for ToolBinding {
 impl ToolBinding {
     /// Snapshots `tracker` with `settings`.
     pub fn bind(tracker: Arc<dyn Tracker>, settings: TrackerSettings) -> Self {
-        let tool_specs = tracker.agent_tool_specs();
+        let tool_specs = tracker.agent_tool_specs(&settings);
         let secret_environment_names = tracker.secret_environment_names(&settings);
         Self {
             tracker,

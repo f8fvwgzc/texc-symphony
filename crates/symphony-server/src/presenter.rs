@@ -82,6 +82,79 @@ pub fn state_payload(
     }
 }
 
+/// Prometheus text exposition (format 0.0.4) of `view`: queue sizes, process token totals and,
+/// when reported, the spend controls.
+pub fn prometheus(view: &StateView) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, value: String| {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+        );
+    };
+    gauge(
+        "symphony_up",
+        "1 while the orchestrator answers.",
+        "1".into(),
+    );
+    let counts = counts(view);
+    gauge(
+        "symphony_running_agents",
+        "Agents running now.",
+        counts.running.to_string(),
+    );
+    gauge(
+        "symphony_retrying_issues",
+        "Issues waiting for a retry.",
+        counts.retrying.to_string(),
+    );
+    gauge(
+        "symphony_blocked_issues",
+        "Issues blocked on an operator or a budget.",
+        counts.blocked.to_string(),
+    );
+    let totals = &view.codex_totals;
+    gauge(
+        "symphony_input_tokens",
+        "Input tokens used by this process.",
+        totals.input_tokens.to_string(),
+    );
+    gauge(
+        "symphony_output_tokens",
+        "Output tokens used by this process.",
+        totals.output_tokens.to_string(),
+    );
+    if let Some(spend) = &view.spend {
+        gauge(
+            "symphony_cost_usd",
+            "Cost of all runs of this process in USD.",
+            spend.total_cost_usd.to_string(),
+        );
+        gauge(
+            "symphony_day_tokens",
+            "Tokens used today (UTC).",
+            spend.day_tokens.to_string(),
+        );
+        gauge(
+            "symphony_day_cost_usd",
+            "Cost today (UTC) in USD.",
+            spend.day_cost_usd.to_string(),
+        );
+        gauge(
+            "symphony_dispatch_paused",
+            "1 while the kill switch is engaged.",
+            u8::from(spend.paused).to_string(),
+        );
+        gauge(
+            "symphony_dispatch_stopped",
+            "1 while dispatch is held (kill switch or exhausted daily budget).",
+            u8::from(spend.stopped_reason.is_some()).to_string(),
+        );
+    }
+    out
+}
+
 /// Fallback workspace path: `Path.join(workspace_root, workspace_key(identifier))`. Uses the
 /// configured `workspace.root` verbatim (not the expanded root), like Elixir.
 pub fn workspace_fallback_path(workspace_root: &str, identifier: &str) -> String {
@@ -284,6 +357,7 @@ mod tests {
             blocked: vec![],
             codex_totals: CodexTotals::default(),
             rate_limits: None,
+            spend: None,
         };
         let now = at("2026-02-24T20:15:30.5Z");
         let payload = serde_json::to_value(state_payload(now, Ok(view))).unwrap();

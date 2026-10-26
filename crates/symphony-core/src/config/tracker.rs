@@ -59,8 +59,11 @@ pub struct GitHubSettings {
     pub repo: String,
     /// Bearer token.
     pub token: String,
+    /// `provider.allowed_authors`, lowercased: when non-empty, issues opened by anyone else are not
+    /// dispatchable.
+    pub allowed_authors: Vec<String>,
 }
-redacted_debug!(GitHubSettings { api_url, repo ; token });
+redacted_debug!(GitHubSettings { api_url, repo, allowed_authors ; token });
 
 /// Resolved GitLab settings.
 #[derive(Clone, PartialEq, Eq)]
@@ -71,8 +74,11 @@ pub struct GitLabSettings {
     pub api_key: String,
     /// `group/project` path.
     pub project_path: String,
+    /// `provider.allowed_authors`, lowercased: when non-empty, issues opened by anyone else are not
+    /// dispatchable.
+    pub allowed_authors: Vec<String>,
 }
-redacted_debug!(GitLabSettings { api_url, project_path ; api_key });
+redacted_debug!(GitLabSettings { api_url, project_path, allowed_authors ; api_key });
 
 /// Resolved Jira Cloud settings.
 #[derive(Clone, PartialEq, Eq)]
@@ -135,6 +141,31 @@ pub fn is_https_url(value: &str, forbid_query_and_fragment: bool) -> bool {
         host_port.split(':').next().unwrap_or_default()
     };
     !host.is_empty()
+}
+
+/// `provider.allowed_authors`: absent means "no author filter" (empty list); otherwise a list of
+/// non-blank strings, trimmed, lowercased (GitHub logins and GitLab usernames are
+/// case-insensitive) and deduplicated. `None` when the value is malformed.
+fn allowed_authors(provider: &Map<String, Value>) -> Option<Vec<String>> {
+    match provider.get("allowed_authors") {
+        None | Some(Value::Null) => Some(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let name = item.as_str()?.trim();
+                (!name.is_empty()).then(|| name.to_lowercase())
+            })
+            .collect::<Option<Vec<String>>>()
+            .map(env::uniq),
+        Some(_) => None,
+    }
+}
+
+/// The routing guard for trackers where anyone may open an issue (GitHub, GitLab): at least one
+/// non-blank required label or a non-empty `allowed_authors` list, so an outsider cannot hand an
+/// agent holding the operator's token a prompt.
+fn has_routing_guard(tracker: &TrackerSettings, authors: &[String]) -> bool {
+    !authors.is_empty() || tracker.required_labels.iter().any(|l| !l.trim().is_empty())
 }
 
 fn trim_trailing_slashes(value: &str) -> String {
@@ -239,10 +270,12 @@ pub fn resolve_github(tracker: &TrackerSettings, env: &dyn EnvSource) -> Result<
     let Some(token) = token else {
         return Err(E::MissingGithubToken);
     };
+    let allowed_authors = allowed_authors(provider).ok_or(E::InvalidGithubAllowedAuthors)?;
     Ok(GitHubSettings {
         api_url: trim_trailing_slashes(api_url),
         repo,
         token,
+        allowed_authors,
     })
 }
 
@@ -269,10 +302,12 @@ pub fn resolve_gitlab(tracker: &TrackerSettings, env: &dyn EnvSource) -> Result<
     let Some(api_key) = api_key else {
         return Err(E::MissingGitlabApiKey);
     };
+    let allowed_authors = allowed_authors(provider).ok_or(E::InvalidGitlabAllowedAuthors)?;
     Ok(GitLabSettings {
         api_url: trim_trailing_slashes(api_url),
         api_key,
         project_path,
+        allowed_authors,
     })
 }
 
@@ -357,7 +392,11 @@ pub fn validate_tracker(tracker: &TrackerSettings, env: &dyn EnvSource) -> Resul
                 E::MissingGithubTerminalStates,
                 E::InvalidGithubStates,
             )?;
-            resolve_github(tracker, env).map(drop).map_err(Into::into)
+            let resolved = resolve_github(tracker, env)?;
+            if !has_routing_guard(tracker, &resolved.allowed_authors) {
+                return Err(E::MissingGithubRoutingGuard.into());
+            }
+            Ok(())
         }
         "gitlab" => {
             validate_exact_states(
@@ -372,7 +411,11 @@ pub fn validate_tracker(tracker: &TrackerSettings, env: &dyn EnvSource) -> Resul
                 E::MissingGitlabTerminalStates,
                 E::InvalidGitlabStates,
             )?;
-            resolve_gitlab(tracker, env).map(drop).map_err(Into::into)
+            let resolved = resolve_gitlab(tracker, env)?;
+            if !has_routing_guard(tracker, &resolved.allowed_authors) {
+                return Err(E::MissingGitlabRoutingGuard.into());
+            }
+            Ok(())
         }
         "jira" => {
             validate_present_states(

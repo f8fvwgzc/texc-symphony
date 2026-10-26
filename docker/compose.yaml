@@ -21,6 +21,9 @@ services:
         CODEX_VERSION: ${CODEX_VERSION:-0.160.0}
     # missing: use a local image if present, otherwise pull, otherwise build.
     pull_policy: ${SYMPHONY_PULL_POLICY:-missing}
+    # The image does not acknowledge the guardrails banner for you. After reviewing the sandbox
+    # settings in config/WORKFLOW.md, acknowledge it in compose.override.yaml (see README.md):
+    #   command: ["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "/config/WORKFLOW.md"]
     restart: unless-stopped
     init: false # the image already runs tini as PID 1
     env_file:
@@ -32,8 +35,9 @@ services:
       SYMPHONY_HOST: 0.0.0.0
       SYMPHONY_PORT: "4000"
     ports:
-      # SYMPHONY_PUBLISH=127.0.0.1 (default) keeps the unauthenticated API on this machine.
-      # Use 0.0.0.0 only behind a firewall or an authenticating reverse proxy.
+      # SYMPHONY_PUBLISH=127.0.0.1 (default) keeps the API on this machine. The API always needs
+      # SYMPHONY_API_TOKEN here (the container binds 0.0.0.0); publish on 0.0.0.0 only behind a
+      # firewall and add your host name to server.allowed_hosts.
       - "${SYMPHONY_PUBLISH:-127.0.0.1}:${SYMPHONY_HOST_PORT:-4000}:4000"
     volumes:
       # SQLite run history (+ WAL files) and log files.

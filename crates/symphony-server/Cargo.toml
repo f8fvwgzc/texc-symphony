@@ -16,8 +16,11 @@ axum = { workspace = true }
 chrono = { workspace = true }
 form_urlencoded = "1.2.2"
 futures = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

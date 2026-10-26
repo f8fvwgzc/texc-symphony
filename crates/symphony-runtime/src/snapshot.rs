@@ -134,6 +134,41 @@ pub struct CodexTotals {
     /// Runtime of **ended** sessions only (Elixir parity, B.14 D6); see
     /// [`Snapshot::total_runtime_seconds`] for a live total.
     pub seconds_running: u64,
+    /// Cost of all runs of this runtime process in micro-USD (`budget` prices).
+    #[serde(default)]
+    pub cost_micro_usd: u64,
+}
+
+/// Reply to [`crate::RuntimeHandle::set_paused`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseAck {
+    /// `true` while the kill switch is engaged.
+    pub paused: bool,
+    /// The kill switch reason.
+    pub reason: Option<String>,
+}
+
+/// Spend controls (`spend`): the kill switch and today's usage against the budgets.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpendSnapshot {
+    /// `true` while the kill switch holds dispatch.
+    pub paused: bool,
+    /// Why dispatch is held (kill switch or exhausted daily budget), if it is.
+    pub stopped_reason: Option<String>,
+    /// UTC day the `day_*` counters belong to (`YYYY-MM-DD`).
+    pub day: String,
+    /// Tokens used today (UTC) by all runs.
+    pub day_tokens: u64,
+    /// Cost today (UTC) of all runs, in micro-USD.
+    pub day_cost_micro_usd: u64,
+    /// `budget.max_tokens_per_day`.
+    pub max_tokens_per_day: Option<u64>,
+    /// `budget.max_cost_usd_per_day`.
+    pub max_cost_usd_per_day: Option<f64>,
+    /// `budget.max_tokens_per_issue`.
+    pub max_tokens_per_issue: Option<u64>,
+    /// `budget.max_cost_usd_per_issue`.
+    pub max_cost_usd_per_issue: Option<f64>,
 }
 
 /// Poll loop status (`polling`).
@@ -181,6 +216,9 @@ pub struct Snapshot {
     pub workspace_root: String,
     /// Tracker kind and project.
     pub tracker: TrackerInfo,
+    /// Kill switch and budget usage.
+    #[serde(default)]
+    pub spend: SpendSnapshot,
 }
 
 /// Where an issue currently is.
@@ -357,6 +395,7 @@ mod tests {
             max_concurrent_agents: 10,
             workspace_root: "/tmp/symphony_workspaces/".into(),
             tracker: TrackerInfo::default(),
+            spend: SpendSnapshot::default(),
         }
     }
 

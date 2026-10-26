@@ -1,5 +1,7 @@
 //! Worker lifecycle: runtime info, Codex events, completions (`DOWN`), termination and blocking.
 
+// Modified 2026-10-25: cost accounting per event (audit A4).
+
 use super::*;
 
 impl Orchestrator<'_> {
@@ -46,10 +48,25 @@ impl Orchestrator<'_> {
         if new_turn {
             entry.recorder.turn();
         }
-        if !delta.is_zero() {
-            entry.recorder.tokens(entry.tokens.totals);
+        let cost_delta = entry.reprice();
+        if !delta.is_zero() || cost_delta > 0 {
+            entry
+                .recorder
+                .usage(entry.tokens.totals, entry.cost_micro_usd);
+            let issue_id = entry.issue.id.clone().unwrap_or_default();
+            self.state.spend.record(
+                &issue_id,
+                delta.input_tokens.saturating_add(delta.output_tokens),
+                cost_delta,
+                Utc::now(),
+            );
         }
         self.state.codex_totals.add_tokens(delta);
+        self.state.codex_totals.cost_micro_usd = self
+            .state
+            .codex_totals
+            .cost_micro_usd
+            .saturating_add(cost_delta);
         if let Some(rate_limits) = event.rate_limits {
             self.state.codex_rate_limits = Some(rate_limits);
         }

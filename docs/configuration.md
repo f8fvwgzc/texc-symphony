@@ -175,6 +175,9 @@ use (see [Reloading](#reloading)); **restart** values are read once at startup.
 | `tracker.active_states` | list of strings | Linear and memory: `[Todo, In Progress]`; other kinds: none | States that make an issue a dispatch candidate. Compared case-insensitively after trimming. Required for GitHub, GitLab, Jira and Asana. | live |
 | `tracker.terminal_states` | list of strings | Linear and memory: `[Closed, Cancelled, Canceled, Duplicate, Done]`; other kinds: none | States that end a run and remove the issue's workspace. Same comparison. Required for GitHub, GitLab, Jira and Asana. | live |
 | `tracker.endpoint`, `tracker.api_key`, `tracker.project_slug`, `tracker.assignee` | string | none | Legacy flat aliases for the Linear `provider` keys of the same name. A `provider` key wins over its alias. Ignored by the other kinds. | live |
+| `tracker.agent_tools.methods` | list of strings | `[GET, POST, PATCH, PUT]` | HTTP methods the REST tracker tools may use; any of `GET`, `POST`, `PATCH`, `PUT`, `DELETE` (case-insensitive), else `is invalid`. `DELETE` is allowed only when listed. See [Agent tool scope](#agent-tool-scope). | session start |
+| `tracker.agent_tools.allow_admin_paths` | boolean | `false` | Lets the tracker tools reach administrative endpoints (webhooks, keys, members, secrets, branch protection, the repository/project resource itself). | session start |
+| `tracker.agent_tools.linear_mutations` | list of strings | `[commentCreate, commentUpdate, issueUpdate, attachmentCreate, attachmentLinkURL, attachmentLinkGitHubPR, attachmentLinkGitHubIssue, issueRelationCreate]` | Root mutation fields `linear_graphql` may run; GraphQL names, else `is invalid`. `[]` allows no mutations. | session start |
 
 An issue whose state is neither active nor terminal is left alone; if it was running, the run is
 stopped but its workspace is kept.
@@ -308,23 +311,82 @@ Settings for the terminal status dashboard (see [`cli.md`](cli.md#terminal-statu
 ### `server`
 
 The HTTP server serves the web dashboard, the JSON API and the event stream
-([`api/README.md`](api/README.md)). It has no authentication.
+([`api/README.md`](api/README.md)).
 
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
 | `server.port` | integer | none: no HTTP server | `0..65535` (`must be greater than or equal to 0`, `must be less than or equal to 65535`). `0` binds a free port. `--port` and `SYMPHONY_PORT` override it. | restart |
-| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. Use `0.0.0.0` only inside a container or behind a firewall or authenticating proxy. | restart |
+| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. A non-loopback address needs `server.api_token`: without one Symphony refuses to start (`auth_required`). | restart |
+| `server.api_token` | string | `$SYMPHONY_API_TOKEN` | Bearer token every `/api/*` request needs (except `GET /api/v1/health` and `GET /api/openapi.json`). Write `$NAME`; the value is compared in constant time, never logged, and removed from agent environments together with `SYMPHONY_API_TOKEN`. Unset: the API is open, which is allowed on loopback only. | restart |
+| `server.allowed_hosts` | list of strings | `[]` | Extra `Host` names the server answers besides `localhost`, `*.localhost`, `127.0.0.1`, `[::1]` and `server.host`. Other hosts get `403 host_not_allowed`, which stops DNS-rebinding pages from reading the API. `*` turns the check off. Names are lowercased. | restart |
+| `server.allowed_origins` | list of strings | `[]` | Origins (`https://dash.example.com`, `*`) allowed for CORS and for browser writes from another origin. Browser `POST`s from any other origin get `403 origin_not_allowed`. `is invalid` unless every entry is `*` or an `http(s)://` URL. | restart |
+
+Browsers cannot send headers on `EventSource`, so the dashboard first asks
+`POST /api/v1/events/tickets` for a single-use ticket (60 s) and opens the stream with
+`?ticket=`. Behind a reverse proxy, forward the `Host` header and list the public name in
+`server.allowed_hosts`; do not add HTTP basic auth in front (it uses the same `Authorization`
+header).
+
+### `budget`
+
+Spend controls. Every limit is optional; tokens count input + output across the issue's (or the
+day's) runs, and a day is a UTC calendar day. Costs come from the prices below, fixed per run when
+it starts, so cost limits only apply once prices are set.
+
+| Key | Type | Default | Validation and notes | Reload |
+|---|---|---|---|---|
+| `budget.max_tokens_per_issue` | integer | unlimited | `> 0`. An issue at or over it is stopped and **blocked** (`issue token budget exhausted: ...`); the history of earlier runs (and of earlier processes, from the store) counts. | live |
+| `budget.max_tokens_per_day` | integer | unlimited | `> 0`. When today's usage reaches it, every running agent is stopped (claims released) and dispatch, retries included, waits for the next UTC day. | live |
+| `budget.max_cost_usd_per_issue` | number | unlimited | `> 0`, USD. Same as the token limit, by cost. | live |
+| `budget.max_cost_usd_per_day` | number | unlimited | `> 0`, USD. Same as the daily token limit, by cost. | live |
+| `budget.input_usd_per_million_tokens` | number | `0` | `>= 0`. Price of one million input tokens. | new runs |
+| `budget.output_usd_per_million_tokens` | number | `0` | `>= 0`. Price of one million output tokens. | new runs |
+
+The **kill switch** is `POST /api/v1/pause` (optionally `?reason=...`): it stops every running agent
+and holds all dispatch until `POST /api/v1/resume`, also across restarts (it is kept in the
+run-history store). `GET /api/v1/state` reports usage and limits under `spend`, run records carry
+`cost_micro_usd`, and `GET /api/v1/metrics` exposes them for Prometheus.
 
 ## Tracker kinds
 
 `tracker.kind` selects an adapter. Adapter settings live under `tracker.provider`; the states and
-labels stay directly under `tracker`. Each adapter also gives the agent one **tracker tool**, a raw
-API passthrough that Symphony executes host-side with the configured credential (so the agent never
-needs the token). The tool can reach whatever the credential can reach, not only the configured
-project.
+labels stay directly under `tracker`. Each adapter also gives the agent one **tracker tool**, an API
+passthrough that Symphony executes host-side with the configured credential (so the agent never
+needs the token). The tool is limited to the configured repository or project; see
+[Agent tool scope](#agent-tool-scope).
 
 The checks run in the order listed; the first failure is reported. The error tags are explained in
 [Validation errors](#validation-errors).
+
+### Agent tool scope
+
+The credential behind a tracker tool usually reaches far more than one project, so Symphony checks
+every tool call before it sends anything. A refused call is a tool failure
+`{"error": {"message": ..., "rule": ...}}` and no request is made. The `rule` tags are:
+
+| Rule | Meaning |
+|---|---|
+| `method_not_allowed` | The method is not in `tracker.agent_tools.methods` (`DELETE` is off by default). |
+| `path_out_of_scope` | The path is outside the configured repository/project, or the task, section or issue it names belongs to another project. |
+| `admin_path` | An administrative endpoint while `tracker.agent_tools.allow_admin_paths` is `false`. Changing the repository or project resource itself (anything but `GET` on it) counts as one. |
+| `unsafe_path` | `.` or `..` segments (also percent-encoded), empty segments, an encoded `/` where none belongs, a backslash, NUL, a fragment or a bad percent escape. |
+| `body_out_of_scope` | A create call whose body does not file the new item in the configured project. |
+| `jql_out_of_scope` | A Jira search whose JQL does not name the configured project. |
+| `mutation_not_allowed` | A Linear mutation with a root field outside `tracker.agent_tools.linear_mutations`. |
+| `subscription_not_allowed` | A Linear subscription. |
+| `unparseable_document` | A Linear document Symphony cannot read, so its mutations cannot be checked. |
+
+The tool spec advertised to the agent lists only the allowed methods (and, for Linear, the allowed
+mutations). The per-kind scope is described with each kind below. Reads through `linear_graphql`
+queries are not narrowed: a query can read whatever the API key can read.
+
+```yaml
+tracker:
+  agent_tools:
+    methods: [GET, POST, PATCH, PUT, DELETE]   # opt in to DELETE
+    allow_admin_paths: false
+    linear_mutations: [commentCreate, issueUpdate]
+```
 
 ### Linear
 
@@ -352,7 +414,10 @@ tracker:
 - States default to `active_states: [Todo, In Progress]` and
   `terminal_states: [Closed, Cancelled, Canceled, Duplicate, Done]`. Workflows that use extra
   statuses (`Rework`, `Human Review`, `Merging`) must list them.
-- Tool: `linear_graphql` (a GraphQL query string, or `{query, variables}`).
+- Tool: `linear_graphql` (a GraphQL query string, or `{query, variables}`). Queries pass
+  through. Every root field of every `mutation` operation in the document (aliases, named fragment
+  spreads and inline fragments resolved) must be in `tracker.agent_tools.linear_mutations`;
+  `__typename` is always allowed. Subscriptions and documents Symphony cannot read are refused.
 
 ### GitHub Issues
 
@@ -361,6 +426,7 @@ tracker:
   kind: github
   active_states: [open]
   terminal_states: [closed]
+  required_labels: [symphony]        # or provider.allowed_authors; one of them is required
   provider:
     repo: your-org/your-repo
     token: $GITHUB_TOKEN
@@ -371,13 +437,26 @@ tracker:
 | `api_url` | `https://api.github.com` | no | `https://` with a host, else `invalid_github_api_url` |
 | `repo` | env `GITHUB_REPO` | yes | required, else `missing_github_repo`; `owner/name` without spaces, else `invalid_github_repo` |
 | `token` | env `GITHUB_TOKEN` | yes | required, else `missing_github_token` |
+| `allowed_authors` | none | no | list of non-blank GitHub logins, else `invalid_github_allowed_authors`. Issues opened by anyone else are not dispatched (compared case-insensitively). |
 
 - `active_states` and `terminal_states` are required (`missing_github_active_states`,
   `missing_github_terminal_states`); every active entry must be `open` and every terminal entry
   `closed` (case-insensitive), else `invalid_github_states`.
+- **Routing guard**: anyone who can open an issue could otherwise hand an agent that holds your
+  token a prompt, so a GitHub workflow needs at least one non-blank `tracker.required_labels` entry
+  (only people with triage access can label issues) or a non-empty `provider.allowed_authors`, else
+  `missing_github_routing_guard`.
 - `issue.identifier` is `GH-<number>`. Pull requests returned by the Issues API are never
   dispatched.
-- Tool: `github_api` (relative REST path, optional `params` and JSON `body`).
+- Tool: `github_api` (relative REST path, optional `params` and JSON `body`). Only paths under
+  `/repos/<owner>/<name>` of the configured repository (compared case-insensitively) are allowed;
+  `GET /repos/<owner>/<name>` itself is allowed, changing it is an admin call. Admin subpaths
+  (below the repository): `hooks`, `keys`, `collaborators`, `invitations`, `teams`,
+  `actions/secrets`, `actions/variables`, `actions/permissions`, `actions/runners`,
+  `actions/runner-groups`, `actions/oidc`, `dependabot/secrets`, `codespaces/secrets`,
+  `environments`, `branches/<branch>/protection`, `rulesets`, `transfer`, `vulnerability-alerts`,
+  `automated-security-fixes`, `private-vulnerability-reporting`, `code-security-configuration`,
+  `pages`, `autolinks`, `interaction-limits`, `properties`.
 
 ### GitLab
 
@@ -386,6 +465,7 @@ tracker:
   kind: gitlab
   active_states: [opened]
   terminal_states: [closed]
+  required_labels: [symphony]        # or provider.allowed_authors; one of them is required
   provider:
     project_path: your-group/your-project
     api_key: $GITLAB_PAT
@@ -396,11 +476,20 @@ tracker:
 | `api_url` | `https://gitlab.com/api/v4` | no | `https://` with a host, else `invalid_gitlab_api_url` |
 | `project_path` | env `GITLAB_PROJECT_PATH` | yes | required, else `missing_gitlab_project_path`; no spaces, tabs, line breaks or NUL, else `invalid_gitlab_project_path` |
 | `api_key` | env `GITLAB_PAT` | yes | required, else `missing_gitlab_api_key` |
+| `allowed_authors` | none | no | list of non-blank GitLab usernames, else `invalid_gitlab_allowed_authors`. Issues opened by anyone else are not dispatched (compared case-insensitively). |
 
 - States are required (`missing_gitlab_active_states`, `missing_gitlab_terminal_states`); active
   entries must be `opened` and terminal entries `closed`, else `invalid_gitlab_states`.
+- **Routing guard**: as for GitHub, a non-blank `tracker.required_labels` entry or a non-empty
+  `provider.allowed_authors` is required, else `missing_gitlab_routing_guard`.
 - `issue.identifier` is `GL-<iid>`.
-- Tool: `gitlab_api`.
+- Tool: `gitlab_api`. Only paths under `/projects/<project>` are allowed, where `<project>` is the
+  configured `project_path` URL-encoded (`group%2Fproject`, `%2F` in any case); `GET` of the project
+  itself is allowed, changing it is an admin call. Admin subpaths: `hooks`, `members`,
+  `invitations`, `access_requests`, `access_tokens`, `variables`, `deploy_keys`, `deploy_tokens`,
+  `protected_branches`, `protected_tags`, `protected_environments`, `approval_rules`, `share`,
+  `transfer`, `archive`, `unarchive`, `push_rule`, `integrations`, `services`, `remote_mirrors`,
+  `mirror`, `export`, `import`, `runners`, `job_token_scope`.
 
 ### Jira Cloud
 
@@ -427,7 +516,18 @@ tracker:
   `missing_jira_terminal_states`) and must not contain blank entries (`invalid_jira_states`).
 - `issue.identifier` is the issue key (`ENG-42`). Issues in Jira's "new" status category wait
   until their blockers reach a terminal state.
-- Tool: `jira_rest` (requests under `/rest/api/3/`).
+- Tool: `jira_rest` (requests under `/rest/api/3/`), limited to the configured project:
+  - `/rest/api/3/issue/<KEY>-<n>` and everything below it;
+  - `/rest/api/3/issue/<numeric id>...` after one `GET ...?fields=project` confirms the issue is in
+    the project;
+  - `POST /rest/api/3/issue` whose `fields.project.key` is the project key;
+  - `/rest/api/3/search` and `/rest/api/3/search/jql` when the JQL (`query.jql` for `GET`,
+    `body.jql` for `POST`) contains `project = <KEY>` or `project in (<KEY>, ...)`. Symphony then
+    sends `project = "<KEY>" AND (<your JQL>)` (a trailing `ORDER BY` stays outside), so `OR`
+    cannot reach other projects;
+  - `GET /rest/api/3/project/<KEY>...`.
+
+  Everything else (users, other projects, `issue/bulkfetch`, admin APIs) is `path_out_of_scope`.
 
 ### Asana
 
@@ -450,7 +550,16 @@ tracker:
 - States are the names of the project's sections. Both lists are required
   (`missing_asana_active_states`, `missing_asana_terminal_states`) and must not contain blank
   entries (`invalid_asana_states`). Completed tasks are never dispatched.
-- Tool: `asana_api`.
+- Tool: `asana_api`, limited to the configured project: `/projects/<project_gid>` and below,
+  `/tasks/<gid>...` and `/sections/<gid>...` after one `GET` confirms the task or section belongs
+  to the project, and `POST /tasks` whose `data.projects` is exactly the project. Every task the
+  body names (`data.task` of `addTask`, `data.parent`, `data.insert_before`/`insert_after`,
+  `data.dependencies`/`dependents`) must belong to the project too; `addProject` must target the
+  project, and `subtasks` may only name the project in `data.projects`/`memberships`. Changing the project
+  or a section itself is an admin call, as are the project subpaths `addMembers`, `removeMembers`,
+  `addFollowers`, `removeFollowers`, `project_memberships`, `duplicate`, `saveAsTemplate`,
+  `addCustomFieldSetting` and `removeCustomFieldSetting`. Other paths (users, workspaces, other
+  projects, stories by id) are refused.
 
 ### memory
 
@@ -503,6 +612,13 @@ Keep credentials out of the file itself: write `$NAME` and set the variable in S
 environment. A literal token in a `WORKFLOW.md` that is committed to the repository the agents
 clone is readable by the agents. Symphony redacts credentials in its own logs and error messages.
 
+Recorded run events (`GET /api/v1/runs/{id}/events`) and the `last_message` summaries in the live
+state are redacted too: the values of the variables above and of the API token are replaced by
+`[REDACTED]`, and so are strings shaped like common credentials (bearer headers, GitHub, GitLab,
+Linear, Slack, OpenAI, Anthropic, Google and AWS keys, JWTs, PEM private keys, `password=...`).
+Raw event payloads expire after `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` (default 7); kinds and
+summaries stay with the run.
+
 Agents that push code need their own git credentials (for example an SSH deploy key, or a
 `gh`/git credential helper); the tracker token is not passed on.
 
@@ -521,7 +637,7 @@ only affects dispatch (see [Reloading](#reloading)).
 | Wrong type or range | `Invalid WORKFLOW.md config: <key> <message>[, <key> <message>...]` |
 | `tracker.kind` absent | `Invalid WORKFLOW.md config: :missing_tracker_kind` |
 | Unsupported kind | `Invalid WORKFLOW.md config: {:unsupported_tracker_kind, "Linear"}` |
-| Adapter setting | `Invalid WORKFLOW.md config: :<tag>`, for example `:missing_linear_api_token` |
+| Adapter setting | `Invalid WORKFLOW.md config: :<tag>`, for example `:missing_linear_api_token`; the routing-guard and `allowed_authors` tags add a hint in parentheses |
 
 Type and range errors are collected for all keys and reported together, sections in the order of
 this page. The messages are:

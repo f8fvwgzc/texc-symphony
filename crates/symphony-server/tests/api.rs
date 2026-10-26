@@ -371,7 +371,7 @@ async fn health_reports_version_uptime_and_store_mode() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         health,
-        json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "uptime_seconds": 0, "store": "disabled"})
+        json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "uptime_seconds": 0, "store": "disabled", "auth_required": false})
     );
     assert_eq!(
         harness.control.state_calls(),

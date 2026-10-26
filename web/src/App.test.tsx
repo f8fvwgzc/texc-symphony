@@ -31,7 +31,8 @@ describe('App', () => {
   it('connects over SSE and renders live snapshots', async () => {
     const { api } = renderApp();
     expect(screen.getAllByRole('status')[0]).toHaveTextContent('Connecting');
-    expect(FakeEventSource.latest().url).toBe('/api/v1/events');
+    expect((await FakeEventSource.opened()).url).toBe('/api/v1/events?ticket=ticket-1');
+    expect(api.createStreamTicket).toHaveBeenCalledTimes(1);
 
     await act(() => FakeEventSource.latest().snapshot(makeSnapshot(), 3));
     expect(await screen.findByRole('table', { name: 'Running sessions' })).toBeInTheDocument();
@@ -47,6 +48,7 @@ describe('App', () => {
 
   it('falls back to polling when SSE keeps failing', async () => {
     const { api } = renderApp();
+    await FakeEventSource.opened();
     vi.useFakeTimers();
     await act(() => FakeEventSource.latest().fail());
     await act(async () => {
@@ -67,6 +69,7 @@ describe('App', () => {
 
   it('refresh button POSTs and re-reads the state', async () => {
     const { api } = renderApp();
+    await FakeEventSource.opened();
     await act(() => FakeEventSource.latest().snapshot(makeEmptySnapshot(), 1));
     fireEvent.click(screen.getByRole('button', { name: 'Refresh now' }));
     expect(await screen.findByText('Poll and reconcile queued.')).toBeInTheDocument();
@@ -80,6 +83,7 @@ describe('App', () => {
       getIssue: vi.fn<ApiClient['getIssue']>(() => Promise.resolve(makeIssueDetail())),
     });
     renderApp(api);
+    await FakeEventSource.opened();
     await act(() => FakeEventSource.latest().snapshot(makeSnapshot(), 1));
     const running = await screen.findByRole('table', { name: 'Running sessions' });
     fireEvent.click(within(running).getByRole('link', { name: 'Details for MT-HTTP' }));

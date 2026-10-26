@@ -708,3 +708,114 @@ async fn clones_share_one_database() {
     drop(store);
     assert!(other.get_run(id).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn usage_is_summed_per_issue_and_since_a_time_with_cost() {
+    let store = memory();
+    let now = Utc::now();
+    let old = store
+        .start_run(NewRun {
+            started_at: Some(now - ChronoDuration::days(2)),
+            ..new_run("MT-1")
+        })
+        .await
+        .unwrap();
+    let today = store.start_run(new_run("MT-1")).await.unwrap();
+    let other = store.start_run(new_run("MT-2")).await.unwrap();
+    let tokens = |n: u64| TokenUsage {
+        input: n,
+        output: n,
+        total: 2 * n,
+    };
+    store.update_usage(old, tokens(100), 1_000).await.unwrap();
+    store.update_usage(today, tokens(10), 50).await.unwrap();
+    store.update_usage(other, tokens(1), 5).await.unwrap();
+
+    let issue = store.issue_usage("id-MT-1").await.unwrap();
+    assert_eq!(issue.tokens.total, 220);
+    assert_eq!(issue.cost_micro_usd, 1_050);
+    let day = store
+        .usage_since(now - ChronoDuration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(day.tokens.total, 22);
+    assert_eq!(day.cost_micro_usd, 55);
+    let run = store.get_run(today).await.unwrap().unwrap();
+    assert_eq!(run.cost_micro_usd, 50);
+    assert_eq!(store.totals().await.unwrap().cost_micro_usd, 1_055);
+    assert!(matches!(
+        store.update_usage(RunId(999), tokens(1), 1).await,
+        Err(StoreError::RunNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn control_values_survive_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.control("paused").await.unwrap(), None);
+    store
+        .set_control("paused", Some("operator".into()))
+        .await
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.control("paused").await.unwrap().as_deref(),
+        Some("operator")
+    );
+    store.set_control("paused", None).await.unwrap();
+    assert_eq!(store.control("paused").await.unwrap(), None);
+    assert_eq!(Store::disabled().control("paused").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn payload_retention_clears_old_payloads_but_keeps_events() {
+    let store = memory();
+    let run = store.start_run(new_run("MT-1")).await.unwrap();
+    store
+        .append_event(
+            run,
+            "notification",
+            Some("cmd".into()),
+            Some(json!({"out": "x"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .prune_payloads(Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(store.prune_payloads(Duration::ZERO).await.unwrap(), 1);
+    let events = store.list_events(run, None, None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload, None);
+    assert_eq!(events[0].message.as_deref(), Some("cmd"));
+}
+
+#[test]
+fn a_full_queue_refuses_work_instead_of_growing() {
+    // No runtime is driving replies here; the database thread drains the queue as fast as it
+    // can, so flood it from many threads and expect either success or `Busy`, never a panic.
+    let store = memory();
+    let mut busy = 0;
+    let pending: Vec<_> = (0..symphony_store::STORE_QUEUE_CAPACITY * 3)
+        .map(|_| store.flush())
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for op in pending {
+        match runtime.block_on(op) {
+            Ok(()) => {}
+            Err(StoreError::Busy) => busy += 1,
+            Err(other) => panic!("unexpected {other}"),
+        }
+    }
+    assert!(busy <= symphony_store::STORE_QUEUE_CAPACITY * 2, "{busy}");
+}

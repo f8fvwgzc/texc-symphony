@@ -11,12 +11,18 @@
  *     exponentially too. While polling, SSE is re-probed every `sseProbeIntervalMs` and the
  *     source switches back to live as soon as a probe delivers a snapshot.
  *
+ * Each SSE connection may first resolve its URL through `connectUrl` (the dashboard fetches a
+ * single-use ticket there, because `EventSource` cannot send an `Authorization` header). The
+ * browser's own reconnect would reuse a spent ticket, so every reconnect goes through
+ * `connectUrl` again. When the ticket request or a poll is refused as unauthorized
+ * (`isUnauthorized`), the source stops retrying (`unauthorized`) until `restart()`.
+ *
  * Status: `connecting` (nothing received yet) -> `live` (SSE) | `polling` (fallback) |
- * `offline` (last attempt failed; retrying at `nextRetryAt`).
+ * `offline` (last attempt failed; retrying at `nextRetryAt`) | `unauthorized` (needs a token).
  */
 import type { StatePayload } from '../api/types';
 
-export type ConnectionStatus = 'connecting' | 'live' | 'polling' | 'offline';
+export type ConnectionStatus = 'connecting' | 'live' | 'polling' | 'offline' | 'unauthorized';
 
 /** The subset of `EventSource` this module uses (lets tests inject a fake). */
 export interface EventSourceLike {
@@ -48,6 +54,10 @@ export interface LiveSourceOptions {
   fetchState: () => Promise<StatePayload>;
   /** `null` = SSE unsupported (poll only). */
   createEventSource: EventSourceFactory | null;
+  /** Resolves the stream URL before each connection (e.g. with a fresh ticket); default `url`. */
+  connectUrl?: () => Promise<string>;
+  /** Recognizes "credentials refused" errors from `connectUrl` / `fetchState`. */
+  isUnauthorized?: (error: unknown) => boolean;
   pollIntervalMs?: number;
   maxSseFailures?: number;
   reconnectBaseMs?: number;
@@ -64,6 +74,8 @@ export interface LiveSource {
   stop(): void;
   /** Fetch `/api/v1/state` once now (e.g. after `POST /refresh`) regardless of mode. */
   refresh(): Promise<void>;
+  /** Drop the current connection and start over (e.g. after a new token was entered). */
+  restart(): void;
   getSnapshot(): LiveSnapshot;
   subscribe(listener: (snapshot: LiveSnapshot) => void): () => void;
 }
@@ -125,6 +137,7 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
   };
   const random = options.random ?? Math.random;
   const now = options.now ?? Date.now;
+  const isUnauthorized = options.isUnauthorized ?? (() => false);
 
   let snapshot: LiveSnapshot = {
     status: 'connecting',
@@ -137,7 +150,7 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
   };
   const listeners = new Set<(snapshot: LiveSnapshot) => void>();
 
-  let mode: 'idle' | 'sse' | 'poll' | 'stopped' = 'idle';
+  let mode: 'idle' | 'sse' | 'poll' | 'unauthorized' | 'stopped' = 'idle';
   // Read through a function so TypeScript does not narrow `mode` across `await`.
   const stopped = () => mode === 'stopped';
   let source: EventSourceLike | null = null;
@@ -145,6 +158,8 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
   let pollFailures = 0;
   // Bumped whenever an in-flight poll result must be ignored (mode change / stop).
   let pollEpoch = 0;
+  // Bumped whenever an in-flight `connectUrl` result must be ignored.
+  let connectEpoch = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let probeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -183,13 +198,49 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
 
   // ---- SSE ---------------------------------------------------------------
 
+  function clearTimers(): void {
+    reconnectTimer = clear(reconnectTimer);
+    pollTimer = clear(pollTimer);
+    probeTimer = clear(probeTimer);
+  }
+
+  /** Credentials were refused: stop every retry until `restart()`. */
+  function enterUnauthorized(): void {
+    closeSource();
+    clearTimers();
+    pollEpoch += 1;
+    connectEpoch += 1;
+    mode = 'unauthorized';
+    update({ status: 'unauthorized', lastError: 'API token required', nextRetryAt: null });
+  }
+
   function openSse(): void {
     const factory = options.createEventSource;
-    if (factory === null || mode === 'stopped') return;
+    if (factory === null || mode === 'stopped' || mode === 'unauthorized') return;
     closeSource();
+    const connectUrl = options.connectUrl;
+    if (connectUrl === undefined) {
+      connect(factory, cfg.url);
+      return;
+    }
+    connectEpoch += 1;
+    const epoch = connectEpoch;
+    connectUrl().then(
+      (url) => {
+        if (epoch === connectEpoch && !stopped()) connect(factory, url);
+      },
+      (error: unknown) => {
+        if (epoch !== connectEpoch || stopped()) return;
+        if (isUnauthorized(error)) enterUnauthorized();
+        else onSseError(describe(error));
+      },
+    );
+  }
+
+  function connect(factory: EventSourceFactory, url: string): void {
     let es: EventSourceLike;
     try {
-      es = factory(cfg.url);
+      es = factory(url);
     } catch (error) {
       onSseError(describe(error));
       return;
@@ -225,7 +276,7 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
   }
 
   function onSseError(reason: string): void {
-    if (mode === 'stopped') return;
+    if (mode === 'stopped' || mode === 'unauthorized') return;
     closeSource();
     sseFailures += 1;
 
@@ -276,6 +327,10 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
       pollTimer = setTimeout(() => void poll(), cfg.pollIntervalMs);
     } catch (error) {
       if (epoch !== pollEpoch || mode !== 'poll') return;
+      if (isUnauthorized(error)) {
+        enterUnauthorized();
+        return;
+      }
       pollFailures += 1;
       const delay = backoffDelay(
         pollFailures,
@@ -290,24 +345,37 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
 
   // ---- Public API ----------------------------------------------------------
 
+  function start(): void {
+    if (mode !== 'idle') return;
+    if (options.createEventSource === null) {
+      startPolling();
+    } else {
+      mode = 'sse';
+      openSse();
+    }
+  }
+
   return {
-    start() {
-      if (mode !== 'idle') return;
-      if (options.createEventSource === null) {
-        startPolling();
-      } else {
-        mode = 'sse';
-        openSse();
-      }
-    },
+    start,
     stop() {
       mode = 'stopped';
       pollEpoch += 1;
+      connectEpoch += 1;
       closeSource();
-      reconnectTimer = clear(reconnectTimer);
-      pollTimer = clear(pollTimer);
-      probeTimer = clear(probeTimer);
+      clearTimers();
       listeners.clear();
+    },
+    restart() {
+      if (mode === 'stopped') return;
+      closeSource();
+      clearTimers();
+      pollEpoch += 1;
+      connectEpoch += 1;
+      sseFailures = 0;
+      pollFailures = 0;
+      mode = 'idle';
+      update({ status: 'connecting', lastError: null, nextRetryAt: null });
+      start();
     },
     async refresh() {
       if (mode === 'stopped') return;
@@ -318,7 +386,9 @@ export function createLiveSource(options: LiveSourceOptions): LiveSource {
         if (stopped() || snapshot.revision !== revision) return;
         update({ state: payload, revision: revision + 1, updatedAt: now() });
       } catch (error) {
-        if (!stopped()) update({ lastError: describe(error) });
+        if (stopped()) return;
+        if (isUnauthorized(error)) enterUnauthorized();
+        else update({ lastError: describe(error) });
       }
     },
     getSnapshot: () => snapshot,

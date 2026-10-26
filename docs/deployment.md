@@ -5,9 +5,10 @@ Symphony is one self-contained binary (`symphony`) with the web dashboard embedd
 it as a plain binary, in Docker, and under systemd, plus reverse proxies, backups and upgrades.
 
 > [!WARNING]
-> Symphony runs coding agents unattended, and its HTTP API has no authentication. Run it in a
-> trusted environment, keep the HTTP port on loopback or behind an authenticating proxy, and give
-> agents only the credentials they need.
+> Symphony runs coding agents unattended. Run it in a trusted environment and give agents only the
+> credentials they need. The HTTP API needs a bearer token (`server.api_token` or
+> `SYMPHONY_API_TOKEN`) on any non-loopback bind; Symphony refuses to start without one. Do not put
+> an HTTP basic-auth proxy in front: it uses the same `Authorization` header as the token.
 
 ## Command line and environment
 
@@ -31,6 +32,8 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
 | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`) |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
+| `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
+| `SYMPHONY_API_TOKEN` | unset | API bearer token when `server.api_token` is not set; required for a non-loopback `SYMPHONY_HOST` |
 | `SYMPHONY_LOG_FORMAT` | `text` | `json` for one JSON object per line on stdout (the log file stays text) |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info` or `symphony=debug,info` |
 | `SYMPHONY_SSH_CONFIG` | | SSH client config for `worker.ssh_hosts` |
@@ -38,7 +41,16 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 
 The HTTP server serves the dashboard at `/`, the API under `/api/v1` (see
 [`api/README.md`](api/README.md)) and a liveness probe at `GET /api/v1/health`, which never touches
-the orchestrator.
+the orchestrator and needs no token. The `Host` allow-list still applies to it: a probe from
+outside the container must use a loopback name or one listed in `server.allowed_hosts` (a
+`0.0.0.0` bind host is not added to the list).
+
+**Exposure.** Symphony refuses to bind a non-loopback address unless an API token is configured
+(`server.api_token` or `SYMPHONY_API_TOKEN`). With a token, every other `/api/*` call needs
+`Authorization: Bearer <token>`; the dashboard asks for it. Requests whose `Host` is not loopback,
+the bind address or a `server.allowed_hosts` entry are refused, and browser writes from other
+origins are refused. Use `budget:` in `WORKFLOW.md` and the kill switch (`POST /api/v1/pause`) to
+cap spending.
 
 ## Runtime requirements
 

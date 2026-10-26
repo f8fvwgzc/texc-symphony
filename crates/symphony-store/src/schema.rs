@@ -14,6 +14,7 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_init.sql"),
     include_str!("migrations/0002_retry_queue.sql"),
+    include_str!("migrations/0003_spend_controls.sql"),
 ];
 
 /// Schema version this build creates and understands.

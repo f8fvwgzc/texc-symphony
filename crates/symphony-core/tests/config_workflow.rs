@@ -600,9 +600,14 @@ fn config_resolves_var_references_for_env_backed_secret_and_path_values() {
         config.tracker.secret_environment_names,
         strings(&["LINEAR_API_KEY", "SYMP_LINEAR_API_KEY_1"])
     );
+    // The HTTP API token (`SYMPHONY_API_TOKEN` by default) is stripped from agents too.
     assert_eq!(
         config.secret_environment_names(),
-        strings(&["LINEAR_API_KEY", "SYMP_LINEAR_API_KEY_1"])
+        strings(&[
+            "LINEAR_API_KEY",
+            "SYMP_LINEAR_API_KEY_1",
+            "SYMPHONY_API_TOKEN"
+        ])
     );
     assert_eq!(config.workspace.root, "/tmp/symphony-workspace-root");
     assert_eq!(config.codex.command, "~/bin/codex app-server");
@@ -1373,4 +1378,90 @@ fn write_workflow_helper_renders_parseable_yaml_for_every_default() {
     assert_eq!(settings.server.port, Some(0));
     assert_eq!(settings.server.host, "127.0.0.1");
     assert_eq!(snapshot.workflow.prompt, support::WORKFLOW_PROMPT);
+}
+
+#[test]
+fn tracker_agent_tools_default_to_no_delete_no_admin_and_the_linear_allow_list() {
+    use symphony_core::config::schema::{
+        AgentToolSettings, DEFAULT_AGENT_TOOL_METHODS, DEFAULT_LINEAR_MUTATIONS,
+    };
+    let env = MapEnv::new();
+    let tools = |agent_tools: Value| {
+        parse(
+            json!({"tracker": {"kind": "memory", "agent_tools": agent_tools}}),
+            &env,
+        )
+        .map(|settings| settings.tracker.agent_tools)
+    };
+    let defaults = parse(json!({"tracker": {"kind": "memory"}}), &env)
+        .unwrap()
+        .tracker
+        .agent_tools;
+    assert_eq!(defaults, AgentToolSettings::default());
+    assert_eq!(Settings::default().tracker.agent_tools, defaults);
+    assert_eq!(defaults.methods, strings(&DEFAULT_AGENT_TOOL_METHODS));
+    assert!(!defaults.allows_method("DELETE"));
+    assert!(!defaults.allow_admin_paths);
+    assert_eq!(
+        defaults.linear_mutations,
+        strings(&DEFAULT_LINEAR_MUTATIONS)
+    );
+    assert_eq!(tools(json!({})).unwrap(), defaults);
+
+    let custom = tools(json!({
+        "methods": ["get", " Delete ", "GET"],
+        "allow_admin_paths": "true",
+        "linear_mutations": ["issueArchive", " commentCreate "]
+    }))
+    .unwrap();
+    assert_eq!(custom.methods, strings(&["GET", "DELETE"]));
+    assert!(custom.allow_admin_paths);
+    assert_eq!(
+        custom.linear_mutations,
+        strings(&["issueArchive", "commentCreate"])
+    );
+    assert!(
+        tools(json!({"linear_mutations": []}))
+            .unwrap()
+            .linear_mutations
+            .is_empty()
+    );
+
+    for (bad, fragment) in [
+        (json!("all"), "tracker.agent_tools is invalid"),
+        (
+            json!({"methods": "GET"}),
+            "tracker.agent_tools.methods is invalid",
+        ),
+        (
+            json!({"methods": ["GET", "HEAD"]}),
+            "tracker.agent_tools.methods is invalid",
+        ),
+        (
+            json!({"methods": ["TRACE"]}),
+            "tracker.agent_tools.methods is invalid",
+        ),
+        (
+            json!({"allow_admin_paths": "yes"}),
+            "tracker.agent_tools.allow_admin_paths is invalid",
+        ),
+        (
+            json!({"linear_mutations": ["issue Delete"]}),
+            "tracker.agent_tools.linear_mutations is invalid",
+        ),
+        (
+            json!({"linear_mutations": "commentCreate"}),
+            "tracker.agent_tools.linear_mutations is invalid",
+        ),
+    ] {
+        match tools(bad) {
+            Err(ConfigError::InvalidWorkflowConfig(message)) => {
+                assert!(
+                    message.contains(fragment),
+                    "{message:?} should contain {fragment:?}"
+                );
+            }
+            other => panic!("expected invalid config containing {fragment:?}, got {other:?}"),
+        }
+    }
 }

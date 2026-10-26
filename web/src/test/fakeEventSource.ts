@@ -1,3 +1,6 @@
+import { act } from '@testing-library/preact';
+import { vi } from 'vitest';
+
 import type { EventSourceLike } from '../live/liveSource';
 
 type Listener = (event: MessageEvent<string>) => void;
@@ -14,6 +17,19 @@ export class FakeEventSource implements EventSourceLike {
     const last = FakeEventSource.instances[FakeEventSource.instances.length - 1];
     if (last === undefined) throw new Error('no EventSource was created');
     return last;
+  }
+
+  /**
+   * Waits until `count` streams were created (the dashboard connects after an async ticket
+   * request) and returns the newest one.
+   */
+  static async opened(count = 1): Promise<FakeEventSource> {
+    await act(async () => {
+      await vi.waitFor(() => {
+        if (FakeEventSource.instances.length < count) throw new Error('not connected yet');
+      });
+    });
+    return FakeEventSource.latest();
   }
 
   static factory = (url: string): FakeEventSource => new FakeEventSource(url);

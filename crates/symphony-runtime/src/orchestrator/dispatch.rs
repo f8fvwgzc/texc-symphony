@@ -1,10 +1,13 @@
 //! Poll cycle: preflight, candidate fetch, revalidation and dispatch (B.2.7, B.4).
 
+// Modified 2026-10-25: budget gating, redaction and pricing at dispatch (audit A1/A4).
+
 use super::*;
 
 impl Orchestrator<'_> {
     /// `maybe_dispatch/1`: reconcile, validate config, fetch candidates, dispatch in priority order.
     pub(crate) async fn maybe_dispatch(&mut self) {
+        self.enforce_spend().await;
         self.reconcile_running_issues().await;
         self.reconcile_blocked_issues().await;
         if let Err(err) = self.ctx.workflow.force_reload() {
@@ -27,6 +30,10 @@ impl Orchestrator<'_> {
         if self.state.available_slots() == 0 {
             return;
         }
+        if let Some(stop) = self.state.spend.global_stop(&settings.budget, Utc::now()) {
+            tracing::info!("Not dispatching new work: {}", stop.reason());
+            return;
+        }
         let sets = StateSets::from_settings(&settings);
         for issue in sort_issues_for_dispatch(issues) {
             if self.state.should_dispatch(&issue, &settings, &sets) {
@@ -41,9 +48,63 @@ impl Orchestrator<'_> {
         attempt: Option<u32>,
         preferred: Option<&str>,
     ) {
+        if let Some(stop) = self.spend_stop_for(&issue).await {
+            if let (SpendStop::IssueExhausted(reason), Some(id)) = (&stop, issue.id.as_deref()) {
+                tracing::warn!("Blocking {}: {reason}", issue_context(&issue));
+                self.block_for_budget(id, &issue, reason.clone());
+            }
+            return;
+        }
         if let Revalidation::Ok(refreshed) = self.refresh_issue_for_dispatch(&issue).await {
             self.do_dispatch_issue(refreshed, attempt, preferred);
         }
+    }
+
+    /// What stops `issue` from being dispatched now, after loading its stored usage once.
+    pub(crate) async fn spend_stop_for(&mut self, issue: &Issue) -> Option<SpendStop> {
+        let issue_id = issue.id.as_deref()?;
+        let budget = &self.settings().budget;
+        let per_issue =
+            budget.max_tokens_per_issue.is_some() || budget.max_cost_usd_per_issue.is_some();
+        if per_issue && !self.state.spend.knows_issue(issue_id) {
+            let usage = match self.ctx.store.issue_usage(issue_id).await {
+                Ok(usage) => Usage {
+                    tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                    cost_micro_usd: usage.cost_micro_usd,
+                },
+                Err(err) => {
+                    tracing::warn!("Failed to load the usage of issue_id={issue_id}: {err}");
+                    Usage::default()
+                }
+            };
+            self.state.spend.seed_issue(issue_id, usage);
+        }
+        self.state.spend.stop_for(issue_id, budget, Utc::now())
+    }
+
+    /// Blocks a not-running issue whose budget is used up (it stays visible in `blocked`).
+    pub(crate) fn block_for_budget(&mut self, issue_id: &str, issue: &Issue, error: String) {
+        self.remove_retry_entry(issue_id);
+        self.state.claimed.insert(issue_id.to_owned());
+        self.state.blocked.insert(
+            issue_id.to_owned(),
+            BlockedEntry {
+                identifier: issue
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| issue_id.to_owned()),
+                issue: Some(issue.clone()),
+                worker_host: None,
+                workspace_path: None,
+                session_id: None,
+                error,
+                blocked_at: Utc::now(),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+            },
+        );
+        self.notify();
     }
 
     /// `revalidate_issue_for_dispatch/3`: one `fetch_issues_by_ids([id])` right before dispatch.
@@ -175,7 +236,9 @@ impl Orchestrator<'_> {
                 workspace_path: None,
                 started_at: Some(started_at),
             },
+            Arc::new(Redactor::from_settings(&self.settings(), &ProcessEnv)),
         );
+        let pricing = Pricing::from_budget(&self.settings().budget);
         let now = Instant::now();
         self.state.running.insert(
             issue_id.clone(),
@@ -202,6 +265,8 @@ impl Orchestrator<'_> {
                 started_at,
                 started: now,
                 recorder,
+                pricing,
+                cost_micro_usd: 0,
             },
         );
         self.state.claimed.insert(issue_id.clone());

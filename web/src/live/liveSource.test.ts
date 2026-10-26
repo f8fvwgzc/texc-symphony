@@ -191,6 +191,81 @@ describe('createLiveSource over SSE', () => {
   });
 });
 
+describe('createLiveSource with tickets', () => {
+  const unauthorized = new Error('unauthorized');
+  const isUnauthorized = (error: unknown) => error === unauthorized;
+
+  it('resolves a fresh URL before every (re)connect', async () => {
+    let n = 0;
+    const connectUrl = vi.fn(() => Promise.resolve(`/api/v1/events?ticket=t${(n += 1)}`));
+    const { source } = setup({ connectUrl, isUnauthorized });
+    source.start();
+    expect(FakeEventSource.instances).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakeEventSource.latest().url).toBe('/api/v1/events?ticket=t1');
+
+    FakeEventSource.latest().fail();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(connectUrl).toHaveBeenCalledTimes(2);
+    expect(FakeEventSource.latest().url).toBe('/api/v1/events?ticket=t2');
+  });
+
+  it('stops retrying when the ticket is refused, until restart()', async () => {
+    const connectUrl = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(unauthorized)
+      .mockResolvedValue('/api/v1/events?ticket=ok');
+    const { source, fetchState } = setup({ connectUrl, isUnauthorized });
+    source.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.getSnapshot()).toMatchObject({
+      status: 'unauthorized',
+      lastError: 'API token required',
+      nextRetryAt: null,
+    });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(connectUrl).toHaveBeenCalledTimes(1);
+    expect(fetchState).not.toHaveBeenCalled();
+    expect(FakeEventSource.instances).toHaveLength(0);
+
+    source.restart();
+    expect(source.getSnapshot().status).toBe('connecting');
+    await vi.advanceTimersByTimeAsync(0);
+    FakeEventSource.latest().snapshot(makeSnapshot(), 5);
+    expect(source.getSnapshot()).toMatchObject({ status: 'live', generation: 5 });
+  });
+
+  it('counts other ticket failures as stream errors', async () => {
+    const connectUrl = vi
+      .fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue('/api/v1/events?ticket=ok');
+    const { source } = setup({ connectUrl, isUnauthorized });
+    source.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.getSnapshot()).toMatchObject({ status: 'connecting', lastError: 'offline' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(FakeEventSource.latest().url).toBe('/api/v1/events?ticket=ok');
+  });
+
+  it('ignores a ticket that arrives after stop()', async () => {
+    const { source } = setup({ connectUrl: () => Promise.resolve('/late') });
+    source.start();
+    source.stop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(FakeEventSource.instances).toHaveLength(0);
+  });
+
+  it('stops polling on an unauthorized poll', async () => {
+    const fetchState = vi.fn<() => Promise<StatePayload>>(() => Promise.reject(unauthorized));
+    const { source } = setup({ createEventSource: null, fetchState, isUnauthorized });
+    source.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchState).toHaveBeenCalledTimes(1);
+    expect(source.getSnapshot().status).toBe('unauthorized');
+  });
+});
+
 describe('createLiveSource fallback to polling', () => {
   it('polls when EventSource is unsupported', async () => {
     const { source, fetchState } = setup({ createEventSource: null });

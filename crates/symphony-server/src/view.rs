@@ -9,7 +9,10 @@
 //!
 //! Timestamps are typed (`DateTime<Utc>`) and formatted on serialization exactly like the Elixir
 //! `Presenter`: second-truncated with a `Z` suffix, except `requested_at` (microseconds).
-//! `Option` fields always serialize as `null`; nothing is skipped.
+//! `Option` fields always serialize as `null`; nothing is skipped, except `spend` on the state
+//! body, which is left out when the control plane does not report it (Elixir-shaped bodies).
+
+// Modified 2026-10-25: health auth flag, SSE tickets and spend views (audit A1/A4).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
@@ -34,6 +37,43 @@ pub struct StateView {
     pub codex_totals: CodexTotals,
     /// Last rate-limit object reported by Codex, passed through verbatim (or `null`).
     pub rate_limits: Option<Value>,
+    /// Kill switch and budget usage (new in the Rust port); omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend: Option<Box<SpendView>>,
+}
+
+/// `spend`: the kill switch, today's usage and the configured budgets.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpendView {
+    /// `true` while the kill switch holds dispatch (`POST /api/v1/pause`).
+    pub paused: bool,
+    /// Why dispatch is held (kill switch or exhausted daily budget), `null` while dispatching.
+    pub stopped_reason: Option<String>,
+    /// UTC day of the `day_*` counters (`YYYY-MM-DD`).
+    pub day: String,
+    /// Tokens (input + output) used today by all runs.
+    pub day_tokens: u64,
+    /// Cost today in USD (at the configured prices).
+    pub day_cost_usd: f64,
+    /// Cost of all runs of this process in USD.
+    pub total_cost_usd: f64,
+    /// `budget.max_tokens_per_day`.
+    pub max_tokens_per_day: Option<u64>,
+    /// `budget.max_cost_usd_per_day`.
+    pub max_cost_usd_per_day: Option<f64>,
+    /// `budget.max_tokens_per_issue`.
+    pub max_tokens_per_issue: Option<u64>,
+    /// `budget.max_cost_usd_per_issue`.
+    pub max_cost_usd_per_issue: Option<f64>,
+}
+
+/// Body of `POST /api/v1/pause` and `POST /api/v1/resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseState {
+    /// `true` while the kill switch is engaged.
+    pub paused: bool,
+    /// Why it is engaged.
+    pub reason: Option<String>,
 }
 
 /// Token counters of one session (`tokens` of running rows).
@@ -387,6 +427,19 @@ pub struct Health {
     pub uptime_seconds: u64,
     /// Whether run history is available.
     pub store: StoreMode,
+    /// Whether `/api/*` requires `Authorization: Bearer <token>`.
+    pub auth_required: bool,
+}
+
+/// Body of `POST /api/v1/events/tickets` (201).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SseTicket {
+    /// Pass as `?ticket=` when opening an SSE stream; valid once.
+    pub ticket: String,
+    /// When the ticket stops being accepted.
+    pub expires_at: DateTime<Utc>,
+    /// Lifetime in milliseconds.
+    pub expires_in_ms: u64,
 }
 
 /// `data` of SSE `heartbeat` events.

@@ -8,7 +8,7 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::snapshot::{IssueSnapshot, RefreshAck, Snapshot};
+use crate::snapshot::{IssueSnapshot, PauseAck, RefreshAck, Snapshot};
 
 /// Default `snapshot` timeout (Elixir `snapshot/2` default 15 s).
 pub const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -23,6 +23,15 @@ pub enum RuntimeCommand {
     Snapshot(oneshot::Sender<Snapshot>),
     /// Queue an immediate poll + reconcile and reply with the acknowledgement.
     RequestRefresh(oneshot::Sender<RefreshAck>),
+    /// Engage (`paused: true`) or release the kill switch.
+    SetPaused {
+        /// Engage or release.
+        paused: bool,
+        /// Why (stored and shown while paused).
+        reason: Option<String>,
+        /// The resulting state.
+        reply: oneshot::Sender<PauseAck>,
+    },
     /// Test-only: make the orchestrator task panic (exercises the supervisor).
     #[cfg(test)]
     Crash,
@@ -117,6 +126,16 @@ impl RuntimeHandle {
                             operations: vec!["poll".into(), "reconcile".into()],
                         });
                     }
+                    RuntimeCommand::SetPaused {
+                        paused,
+                        reason,
+                        reply,
+                    } => {
+                        let _ = reply.send(PauseAck {
+                            paused,
+                            reason: reason.filter(|_| paused),
+                        });
+                    }
                     #[cfg(test)]
                     RuntimeCommand::Crash => {}
                 }
@@ -175,6 +194,35 @@ impl RuntimeHandle {
         let (reply, response) = oneshot::channel();
         let call = async {
             if !self.send(RuntimeCommand::RequestRefresh(reply)).await {
+                return Err(RefreshError::Unavailable);
+            }
+            response.await.map_err(|_| RefreshError::Unavailable)
+        };
+        tokio::time::timeout(self.shared.refresh_timeout, call)
+            .await
+            .unwrap_or(Err(RefreshError::Timeout))
+    }
+
+    /// The kill switch: `paused = true` stops every running agent and holds dispatch (also across
+    /// restarts) until it is called with `false`.
+    pub async fn set_paused(
+        &self,
+        paused: bool,
+        reason: Option<String>,
+    ) -> Result<PauseAck, RefreshError> {
+        if !self.is_available() {
+            return Err(RefreshError::Unavailable);
+        }
+        let (reply, response) = oneshot::channel();
+        let call = async {
+            if !self
+                .send(RuntimeCommand::SetPaused {
+                    paused,
+                    reason,
+                    reply,
+                })
+                .await
+            {
                 return Err(RefreshError::Unavailable);
             }
             response.await.map_err(|_| RefreshError::Unavailable)

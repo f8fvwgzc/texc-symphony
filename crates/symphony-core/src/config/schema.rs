@@ -1,5 +1,7 @@
 //! Typed settings and the front-matter parser (`SymphonyElixir.Config.Schema`).
 
+// Modified 2026-10-25: server auth settings and the budget section (audit A1/A4).
+
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -28,6 +30,8 @@ pub const DEFAULT_THREAD_SANDBOX: &str = "workspace-write";
 pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 /// Directory name of the default workspace root under the temp dir.
 pub const DEFAULT_WORKSPACE_DIR_NAME: &str = "symphony_workspaces";
+/// Env var holding the HTTP API token when `server.api_token` is not set.
+pub const ENV_API_TOKEN: &str = "SYMPHONY_API_TOKEN";
 
 /// A value that is either a string or a map (Elixir `Schema.StringOrMap`), used by
 /// `codex.approval_policy`.
@@ -114,6 +118,63 @@ pub struct TrackerSettings {
     pub active_states: Option<Vec<String>>,
     /// Terminal states (Linear/memory default when absent; `None` for other kinds when absent).
     pub terminal_states: Option<Vec<String>>,
+    /// `tracker.agent_tools`: what the agent's tracker tools may do with the operator's token.
+    pub agent_tools: AgentToolSettings,
+}
+
+/// Methods the REST agent tools may use when `tracker.agent_tools.methods` is absent (no `DELETE`).
+pub const DEFAULT_AGENT_TOOL_METHODS: [&str; 4] = ["GET", "POST", "PATCH", "PUT"];
+/// Every method `tracker.agent_tools.methods` may list.
+pub const AGENT_TOOL_METHODS: [&str; 5] = ["GET", "POST", "PATCH", "PUT", "DELETE"];
+/// Top-level Linear mutations `linear_graphql` may run when `tracker.agent_tools.linear_mutations`
+/// is absent: comments, issue updates, attachments and relations, nothing that deletes or
+/// administers.
+pub const DEFAULT_LINEAR_MUTATIONS: [&str; 8] = [
+    "commentCreate",
+    "commentUpdate",
+    "issueUpdate",
+    "attachmentCreate",
+    "attachmentLinkURL",
+    "attachmentLinkGitHubPR",
+    "attachmentLinkGitHubIssue",
+    "issueRelationCreate",
+];
+
+/// `tracker.agent_tools:` the scope of the provider-native agent tools, which run with the
+/// operator's tracker credential. The repository/project scope itself comes from the provider
+/// settings; this section only widens or narrows what is allowed inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentToolSettings {
+    /// HTTP methods the REST tools may use, uppercased and deduplicated (default
+    /// [`DEFAULT_AGENT_TOOL_METHODS`]; `DELETE` only when listed).
+    pub methods: Vec<String>,
+    /// Allow administrative endpoints (webhooks, deploy keys, members, secrets, branch protection,
+    /// repository/project settings). Default `false`.
+    pub allow_admin_paths: bool,
+    /// Top-level mutation fields `linear_graphql` may run (default [`DEFAULT_LINEAR_MUTATIONS`]).
+    pub linear_mutations: Vec<String>,
+}
+
+impl Default for AgentToolSettings {
+    fn default() -> Self {
+        Self {
+            methods: DEFAULT_AGENT_TOOL_METHODS.map(str::to_owned).to_vec(),
+            allow_admin_paths: false,
+            linear_mutations: DEFAULT_LINEAR_MUTATIONS.map(str::to_owned).to_vec(),
+        }
+    }
+}
+
+impl AgentToolSettings {
+    /// `true` when `method` (uppercase) is allowed.
+    pub fn allows_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|m| m == method)
+    }
+
+    /// `true` when `field` is an allowed top-level Linear mutation.
+    pub fn allows_linear_mutation(&self, field: &str) -> bool {
+        self.linear_mutations.iter().any(|m| m == field)
+    }
 }
 
 impl fmt::Debug for TrackerSettings {
@@ -144,6 +205,7 @@ impl fmt::Debug for TrackerSettings {
             .field("required_labels", &self.required_labels)
             .field("active_states", &self.active_states)
             .field("terminal_states", &self.terminal_states)
+            .field("agent_tools", &self.agent_tools)
             .finish()
     }
 }
@@ -324,12 +386,21 @@ impl Default for ObservabilitySettings {
 }
 
 /// `server:` section (HTTP API / dashboard).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ServerSettings {
     /// Port (`None` = disabled, `0` = ephemeral).
     pub port: Option<u16>,
     /// Bind host (IP literal or DNS name; default `127.0.0.1`).
     pub host: String,
+    /// Bearer token the HTTP API requires (`server.api_token`, `$VAR` resolved, else
+    /// [`ENV_API_TOKEN`]). `None` leaves the API open, which the server only allows on loopback.
+    pub api_token: Option<String>,
+    /// Env var names that may hold the token (computed; stripped from agent environments).
+    pub secret_environment_names: Vec<String>,
+    /// Extra `Host` header names accepted besides loopback and the bind host (`*` accepts any).
+    pub allowed_hosts: Vec<String>,
+    /// Extra origins allowed for browser writes and CORS (`scheme://host[:port]`, `*` for any).
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for ServerSettings {
@@ -337,6 +408,57 @@ impl Default for ServerSettings {
         Self {
             port: None,
             host: DEFAULT_SERVER_HOST.into(),
+            api_token: None,
+            secret_environment_names: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+        }
+    }
+}
+
+impl fmt::Debug for ServerSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerSettings")
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("api_token", &self.api_token.as_ref().map(|_| "<redacted>"))
+            .field("secret_environment_names", &self.secret_environment_names)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_origins", &self.allowed_origins)
+            .finish()
+    }
+}
+
+/// `budget:` section: spend limits (all optional) and the prices used to turn tokens into cost.
+///
+/// Limits count input + output tokens. A day is a UTC calendar day. Prices default to `0`, so
+/// cost limits only bite once prices are configured.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BudgetSettings {
+    /// Tokens one issue (or task) may use across all of its runs (`> 0`).
+    pub max_tokens_per_issue: Option<u64>,
+    /// Tokens all runs together may use per UTC day (`> 0`).
+    pub max_tokens_per_day: Option<u64>,
+    /// Cost one issue may incur across all of its runs, in USD (`> 0`).
+    pub max_cost_usd_per_issue: Option<f64>,
+    /// Cost all runs together may incur per UTC day, in USD (`> 0`).
+    pub max_cost_usd_per_day: Option<f64>,
+    /// Price of one million input tokens in USD (`>= 0`, default `0`).
+    pub input_usd_per_million_tokens: f64,
+    /// Price of one million output tokens in USD (`>= 0`, default `0`).
+    pub output_usd_per_million_tokens: f64,
+}
+
+impl BudgetSettings {
+    /// Cost of `input` + `output` tokens in micro-USD (rounded; prices are per million tokens,
+    /// so one token at `$1/M` is exactly one micro-dollar).
+    pub fn cost_micro_usd(&self, input: u64, output: u64) -> u64 {
+        let micros = input as f64 * self.input_usd_per_million_tokens
+            + output as f64 * self.output_usd_per_million_tokens;
+        if micros.is_finite() && micros > 0.0 {
+            micros.round() as u64
+        } else {
+            0
         }
     }
 }
@@ -362,6 +484,8 @@ pub struct Settings {
     pub observability: ObservabilitySettings,
     /// `server:`
     pub server: ServerSettings,
+    /// `budget:`
+    pub budget: BudgetSettings,
 }
 
 /// `Schema.normalize_state_limits/1`: keys become `trim + downcase`; values are untouched.
@@ -421,6 +545,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         &mut errors,
     );
     let server = cast_server(&Section::new(root, "server", &mut errors), &mut errors);
+    let budget = cast_budget(&Section::new(root, "budget", &mut errors), &mut errors);
 
     if !errors.is_empty() {
         return Err(ConfigError::InvalidWorkflowConfig(errors.join()));
@@ -436,6 +561,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         hooks,
         observability,
         server,
+        budget,
     };
     Ok(finalize(settings, env))
 }
@@ -456,7 +582,68 @@ fn cast_tracker(s: &Section<'_>, errors: &mut Errors) -> TrackerSettings {
         required_labels,
         active_states: s.string_list("active_states", errors),
         terminal_states: s.string_list("terminal_states", errors),
+        agent_tools: s
+            .map("agent_tools", errors)
+            .map(|raw| cast_agent_tools(&raw, &s.path("agent_tools"), errors))
+            .unwrap_or_default(),
     }
+}
+
+/// `tracker.agent_tools`: methods (case-insensitive, from [`AGENT_TOOL_METHODS`]), the admin
+/// switch and the Linear mutation allow-list (GraphQL names). Absent keys keep their defaults.
+fn cast_agent_tools(
+    raw: &Map<String, Value>,
+    path: &str,
+    errors: &mut Errors,
+) -> AgentToolSettings {
+    let mut out = AgentToolSettings::default();
+    if let Some(value) = raw.get("methods") {
+        let methods = super::cast::cast_string_list(value).and_then(|methods| {
+            methods
+                .iter()
+                .map(|m| {
+                    let upper = m.trim().to_ascii_uppercase();
+                    AGENT_TOOL_METHODS
+                        .contains(&upper.as_str())
+                        .then_some(upper)
+                })
+                .collect::<Option<Vec<String>>>()
+        });
+        match methods {
+            Some(methods) => out.methods = env::uniq(methods),
+            None => errors.push(&format!("{path}.methods"), "is invalid"),
+        }
+    }
+    if let Some(value) = raw.get("allow_admin_paths") {
+        match super::cast::cast_boolean(value) {
+            Some(allow) => out.allow_admin_paths = allow,
+            None => errors.push(&format!("{path}.allow_admin_paths"), "is invalid"),
+        }
+    }
+    if let Some(value) = raw.get("linear_mutations") {
+        let names = super::cast::cast_string_list(value)
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|n| n.trim().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|names| names.iter().all(|n| is_graphql_name(n)));
+        match names {
+            Some(names) => out.linear_mutations = env::uniq(names),
+            None => errors.push(&format!("{path}.linear_mutations"), "is invalid"),
+        }
+    }
+    out
+}
+
+/// A GraphQL `Name`: `[_A-Za-z][_0-9A-Za-z]*`.
+fn is_graphql_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn cast_polling(s: &Section<'_>, errors: &mut Errors) -> PollingSettings {
@@ -679,7 +866,71 @@ fn cast_server(s: &Section<'_>, errors: &mut Errors) -> ServerSettings {
     if let Some(host) = s.string("host", errors) {
         out.host = host;
     }
+    // Kept raw here (`$VAR` or a literal); `finalize` resolves it and the env fallback.
+    out.api_token = s.string("api_token", errors);
+    out.allowed_hosts = s
+        .string_list("allowed_hosts", errors)
+        .map(|hosts| {
+            env::uniq(
+                hosts
+                    .iter()
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty()),
+            )
+        })
+        .unwrap_or_default();
+    if let Some(origins) = s.string_list("allowed_origins", errors) {
+        let origins: Vec<String> = origins
+            .iter()
+            .map(|o| o.trim().trim_end_matches('/').to_ascii_lowercase())
+            .filter(|o| !o.is_empty())
+            .collect();
+        if origins.iter().all(|o| o == "*" || is_http_url(o)) {
+            out.allowed_origins = env::uniq(origins);
+        } else {
+            errors.push(&s.path("allowed_origins"), "is invalid");
+        }
+    }
     out
+}
+
+fn cast_budget(s: &Section<'_>, errors: &mut Errors) -> BudgetSettings {
+    let tokens = |field: &str, errors: &mut Errors| {
+        let v = s.integer(field, errors);
+        let v = s.positive(field, v, errors);
+        s.fit::<u64>(field, v, errors)
+    };
+    let max_tokens_per_issue = tokens("max_tokens_per_issue", errors);
+    let max_tokens_per_day = tokens("max_tokens_per_day", errors);
+    let usd = |field: &str, errors: &mut Errors| {
+        let v = s.number(field, errors)?;
+        if v > 0.0 {
+            Some(v)
+        } else {
+            errors.push(&s.path(field), "must be greater than 0");
+            None
+        }
+    };
+    let max_cost_usd_per_issue = usd("max_cost_usd_per_issue", errors);
+    let max_cost_usd_per_day = usd("max_cost_usd_per_day", errors);
+    let price = |field: &str, errors: &mut Errors| {
+        let v = s.number(field, errors)?;
+        if v >= 0.0 {
+            Some(v)
+        } else {
+            errors.push(&s.path(field), "must be greater than or equal to 0");
+            None
+        }
+    };
+    BudgetSettings {
+        max_tokens_per_issue,
+        max_tokens_per_day,
+        max_cost_usd_per_issue,
+        max_cost_usd_per_day,
+        input_usd_per_million_tokens: price("input_usd_per_million_tokens", errors).unwrap_or(0.0),
+        output_usd_per_million_tokens: price("output_usd_per_million_tokens", errors)
+            .unwrap_or(0.0),
+    }
 }
 
 /// `finalize_settings/1` (order matters; see blueprint A.3.2).
@@ -740,6 +991,13 @@ fn finalize(mut settings: Settings, env: &dyn EnvSource) -> Settings {
         tracker.project_slug = slug.as_str().map(str::to_owned);
     }
     tracker.provider = provider;
+
+    let server = &mut settings.server;
+    let raw_token = server.api_token.take().map(Value::String);
+    server.api_token = env::resolve_secret_setting(raw_token.as_ref(), env.var(ENV_API_TOKEN), env);
+    let mut names = vec![ENV_API_TOKEN.to_owned()];
+    names.extend(env::env_reference_names([raw_token.as_ref()]));
+    server.secret_environment_names = env::uniq(names);
 
     let default_root = default_workspace_root(env);
     settings.workspace.root = env::resolve_path_value(&settings.workspace.root, &default_root, env);

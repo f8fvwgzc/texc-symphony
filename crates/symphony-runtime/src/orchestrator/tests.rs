@@ -185,6 +185,8 @@ fn fake_entry(identifier: &str, issue: Issue, worker_host: Option<&str>) -> Runn
         started_at: Utc::now(),
         started: now,
         recorder: RunRecorder::default(),
+        pricing: Default::default(),
+        cost_micro_usd: 0,
     }
 }
 
@@ -1425,4 +1427,272 @@ async fn shutdown_cancels_and_awaits_every_worker() {
     shutdown.cancel();
     orch.run().await;
     assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+// ----- spend controls (budgets, kill switch) --------------------------------------------------------
+
+fn usage_event(input: u64, output: u64) -> CodexEvent {
+    notification(json!({"method": "thread/tokenUsage/updated",
+        "params": {"tokenUsage": {"total": {
+            "inputTokens": input, "outputTokens": output, "totalTokens": input + output}}}}))
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_issue_over_its_budget_is_stopped_and_blocked_with_cost_recorded() {
+    let store = Store::open_in_memory().unwrap();
+    let mut h = Harness::with_store(
+        json!({"budget": {"max_tokens_per_issue": 100, "input_usd_per_million_tokens": 2,
+            "output_usd_per_million_tokens": 10}}),
+        emitting_factory(vec![usage_event(60, 10), usage_event(100, 20)]),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert!(orch.state.running.is_empty());
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "issue token budget exhausted: 120 of 100 tokens used"
+    );
+    let snapshot = orch.snapshot();
+    // 100 input at $2/M + 20 output at $10/M = 400 micro-USD.
+    assert_eq!(snapshot.codex_totals.cost_micro_usd, 400);
+    assert_eq!(snapshot.spend.day_tokens, 120);
+    assert_eq!(snapshot.spend.day_cost_micro_usd, 400);
+    assert_eq!(snapshot.spend.max_tokens_per_issue, Some(100));
+
+    // The block holds: the next poll does not dispatch the issue again.
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty());
+    let mut finished = None;
+    for _ in 0..200 {
+        let runs = store.list_runs(RunQuery::default()).await.unwrap().runs;
+        if runs.first().is_some_and(|r| r.status != RunStatus::Running) {
+            finished = runs.first().cloned();
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    let run = finished.expect("run finished");
+    assert_eq!(run.status, RunStatus::Blocked);
+    assert_eq!(run.cost_micro_usd, 400);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stored_history_counts_toward_the_issue_budget_after_a_restart() {
+    let store = Store::open_in_memory().unwrap();
+    let previous = store
+        .start_run(symphony_store::NewRun::new("i-1", "MT-1"))
+        .await
+        .unwrap();
+    store
+        .update_usage(
+            previous,
+            symphony_store::TokenUsage {
+                input: 80,
+                output: 30,
+                total: 110,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"budget": {"max_tokens_per_issue": 100}}),
+        blocking_factory(Arc::clone(&started)),
+        store,
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(started.lock().unwrap().is_empty(), "never started");
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "issue token budget exhausted: 110 of 100 tokens used"
+    );
+    // Other issues are unaffected.
+    h.memory.set(vec![issue("i-2", "MT-2", "In Progress")]);
+    orch.dispatch_issue(issue("i-2", "MT-2", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-2"));
+    orch.terminate_running_issue("i-2", false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_day_stops_running_agents_and_holds_dispatch() {
+    let mut h = Harness::new(
+        json!({"budget": {"max_tokens_per_day": 50}}),
+        emitting_factory(vec![usage_event(40, 20)]),
+    );
+    h.memory.set(vec![
+        issue("i-1", "MT-1", "In Progress"),
+        issue("i-2", "MT-2", "In Progress"),
+    ]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    // Stopped, not blocked: the claim is released so the issue runs again tomorrow.
+    assert!(orch.state.blocked.is_empty());
+    assert!(!orch.state.claimed.contains("i-1"));
+    let snapshot = orch.snapshot();
+    assert_eq!(
+        snapshot.spend.stopped_reason.as_deref(),
+        Some("daily token budget exhausted: 60 of 50 tokens used today (UTC)")
+    );
+    assert!(!snapshot.spend.paused);
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty(), "dispatch is held");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_stops_everything_survives_a_restart_and_resumes() {
+    let store = Store::open_in_memory().unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+
+    let (reply, ack) = tokio::sync::oneshot::channel();
+    orch.handle_command(RuntimeCommand::SetPaused {
+        paused: true,
+        reason: Some("runaway spend".into()),
+        reply,
+    });
+    assert_eq!(
+        ack.await.unwrap(),
+        PauseAck {
+            paused: true,
+            reason: Some("runaway spend".into())
+        }
+    );
+    orch.enforce_spend().await;
+    assert!(orch.state.running.is_empty());
+    assert!(!orch.state.claimed.contains("i-1"));
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty());
+    let snapshot = orch.snapshot();
+    assert!(snapshot.spend.paused);
+    assert_eq!(
+        snapshot.spend.stopped_reason.as_deref(),
+        Some("dispatch paused: runaway spend")
+    );
+    let mut persisted = None;
+    for _ in 0..100 {
+        persisted = store.control(PAUSED_CONTROL_KEY).await.unwrap();
+        if persisted.is_some() {
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    assert_eq!(persisted.as_deref(), Some("runaway spend"));
+    drop(orch);
+
+    // A restarted orchestrator comes back paused.
+    let mut h = Harness::with_store(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.restore_spend().await;
+    assert_eq!(orch.state.spend.paused.as_deref(), Some("runaway spend"));
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.is_empty());
+
+    let ack = orch.set_paused(false, None);
+    assert!(!ack.paused);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    // The write is retried in the background until the store takes it.
+    let mut released = false;
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+    assert!(released, "the release was persisted");
+    assert_eq!(started.lock().unwrap().len(), 2);
+    orch.terminate_running_issue("i-1", false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn released_claims_drop_the_completed_bookkeeping() {
+    let mut h = Harness::new(json!({}), result_factory(|| Ok(())));
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    assert!(orch.state.completed.contains("i-1"));
+    orch.release_issue_claim("i-1");
+    assert!(!orch.state.completed.contains("i-1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn raising_the_issue_budget_releases_budget_blocked_issues() {
+    let store = Store::open_in_memory().unwrap();
+    let previous = store
+        .start_run(symphony_store::NewRun::new("i-1", "MT-1"))
+        .await
+        .unwrap();
+    store
+        .update_usage(
+            previous,
+            symphony_store::TokenUsage {
+                input: 100,
+                output: 50,
+                total: 150,
+            },
+            0,
+        )
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"budget": {"max_tokens_per_issue": 100}}),
+        blocking_factory(Arc::clone(&started)),
+        store,
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.blocked.contains_key("i-1"));
+    // Still over budget: the block holds.
+    orch.reconcile_blocked_issues().await;
+    assert!(orch.state.blocked.contains_key("i-1"));
+
+    h.wf.rewrite(json!({"budget": {"max_tokens_per_issue": 1000}}));
+    orch.ctx.workflow.force_reload().unwrap();
+    orch.reconcile_blocked_issues().await;
+    assert!(!orch.state.blocked.contains_key("i-1"));
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    orch.terminate_running_issue("i-1", false, "test").await;
 }

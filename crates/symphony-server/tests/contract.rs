@@ -74,6 +74,30 @@ async fn live_state_responses_match_the_contract() {
     let (_, health) = harness.get("/api/v1/health").await;
     assert_valid(&schema("Health"), &health);
 
+    let (status, paused) = harness.json(Method::POST, "/api/v1/pause?reason=x").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_valid(&schema("PauseState"), &paused);
+    let (_, resumed) = harness.json(Method::POST, "/api/v1/resume").await;
+    assert_valid(&schema("PauseState"), &resumed);
+
+    let mut with_spend = static_snapshot();
+    with_spend.spend = Some(Box::new(symphony_server::SpendView {
+        paused: false,
+        stopped_reason: Some("daily token budget exhausted".into()),
+        day: "2026-10-25".into(),
+        day_tokens: 12,
+        day_cost_usd: 0.5,
+        total_cost_usd: 1.25,
+        max_tokens_per_day: Some(10),
+        max_cost_usd_per_day: None,
+        max_tokens_per_issue: None,
+        max_cost_usd_per_issue: Some(2.0),
+    }));
+    let harness_spend = Harness::new(StaticControlPlane::new(Ok(with_spend)));
+    let (_, state) = harness_spend.get("/api/v1/state").await;
+    assert_eq!(state["spend"]["day_tokens"], 12);
+    assert_valid(&schema("StateSnapshot"), &state);
+
     let (_, openapi) = harness.get("/api/openapi.json").await;
     assert!(openapi.is_object());
 

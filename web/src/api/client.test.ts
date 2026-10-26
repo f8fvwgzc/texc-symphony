@@ -7,8 +7,10 @@ import {
   createApiClient,
   describeError,
   isStoreDisabled,
+  isUnauthorized,
   NetworkError,
 } from './client';
+import { createTokenStore, memoryStorage } from './token';
 
 function jsonResponse(status: number, body: unknown, statusText = ''): Response {
   return new Response(body === undefined ? '' : JSON.stringify(body), {
@@ -24,7 +26,24 @@ function clientWith(...responses: (Response | Error)[]) {
     if (response instanceof Error) fetchMock.mockRejectedValueOnce(response);
     else fetchMock.mockResolvedValueOnce(response);
   }
-  return { client: createApiClient({ baseUrl: 'http://host:4000/', fetch: fetchMock }), fetchMock };
+  const auth = createTokenStore(memoryStorage(), memoryStorage());
+  return {
+    client: createApiClient({ baseUrl: 'http://host:4000/', fetch: fetchMock, auth }),
+    fetchMock,
+    auth,
+  };
+}
+
+function headerOf(
+  fetchMock: ReturnType<typeof vi.fn<typeof fetch>>,
+  index: number,
+  name: string,
+): string | undefined {
+  const headers = fetchMock.mock.calls[index]?.[1]?.headers;
+  if (headers === undefined || headers instanceof Headers || Array.isArray(headers)) {
+    return undefined;
+  }
+  return headers[name];
 }
 
 function urlOf(input: RequestInfo | URL | undefined): string {
@@ -156,6 +175,43 @@ describe('createApiClient', () => {
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
     expect(client.eventsUrl()).toBe('http://host:4000/api/v1/events');
     expect(createApiClient().eventsUrl()).toBe('/api/v1/events');
+  });
+
+  it('sends the stored API token as a bearer header', async () => {
+    const { client, fetchMock, auth } = clientWith(
+      jsonResponse(200, makeSnapshot()),
+      jsonResponse(200, makeSnapshot()),
+    );
+    await client.getState();
+    expect(headerOf(fetchMock, 0, 'authorization')).toBeUndefined();
+    auth.save('s3cret', false);
+    await client.getState();
+    expect(headerOf(fetchMock, 1, 'authorization')).toBe('Bearer s3cret');
+    expect(calledUrl(fetchMock, 1)).not.toContain('s3cret');
+  });
+
+  it('marks the token rejected on 401', async () => {
+    const { client, auth } = clientWith(
+      jsonResponse(401, {
+        error: { code: 'unauthorized', message: 'Missing or invalid API token' },
+      }),
+    );
+    auth.save('wrong', false);
+    const error = await client.getState().catch((reason: unknown) => reason);
+    expect(isUnauthorized(error)).toBe(true);
+    expect(isUnauthorized(new ApiError(403, 'host_not_allowed', 'x'))).toBe(false);
+    expect(auth.rejected()).toBe(true);
+  });
+
+  it('POSTs for an SSE ticket and appends it to the events URL', async () => {
+    const ticket = { ticket: 'a b/c', expires_at: 't', expires_in_ms: 60_000 };
+    const { client, fetchMock, auth } = clientWith(jsonResponse(201, ticket));
+    auth.save('tok', false);
+    await expect(client.createStreamTicket()).resolves.toEqual(ticket);
+    expect(calledUrl(fetchMock)).toBe('http://host:4000/api/v1/events/tickets');
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
+    expect(headerOf(fetchMock, 0, 'authorization')).toBe('Bearer tok');
+    expect(client.eventsUrl('a b/c')).toBe('http://host:4000/api/v1/events?ticket=a+b%2Fc');
   });
 
   it('describes arbitrary errors', () => {

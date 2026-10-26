@@ -4,14 +4,20 @@
 //!   `api_key` (env `GITLAB_PAT`), `api_url` (default `https://gitlab.com/api/v4`, https only).
 //! - Headers: `Accept: application/json`, `Authorization: Bearer <api_key>`; never `PRIVATE-TOKEN`.
 //! - States: `opened`/`closed` (`all` for both); pages of 100 ordered by `created_at`.
-//! - Every issue is dispatchable (closed, confidential and incident issues included).
-//! - One agent tool, `gitlab_api` (raw REST passthrough; no `PATCH`).
+//! - Every issue is dispatchable (closed, confidential and incident issues included), except
+//!   issues opened by anyone outside `provider.allowed_authors` when that list is set.
+//! - One agent tool, `gitlab_api` (REST passthrough; no `PATCH`) limited to
+//!   `/projects/{url-encoded project_path}` of the configured project, the `tracker.agent_tools`
+//!   methods, and no [`ADMIN_SUBPATHS`] unless `allow_admin_paths` (see [`crate::scope`]).
+
+// Modified 2026-10-25: scoped `gitlab_api` and `allowed_authors` routing (audit A2).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::config::tracker::validate_tracker;
 use symphony_core::config::{
     GitLabSettings, TrackerSettings, resolve_gitlab, secret_environment_names,
@@ -21,10 +27,11 @@ use symphony_core::{EnvSource, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError};
 use crate::rest::{
-    RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
+    RestCall, RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
     normalize_candidate_page, opt_string, parse_positive_id, present_str, query_pairs, state_set,
     trimmed_string, uniq,
 };
+use crate::scope::{self, Denied};
 use crate::tool::{ToolContext, ToolResult};
 use crate::transport::{HttpClient, HttpRequest, Method};
 use crate::{MAX_PAGES, Tracker};
@@ -32,11 +39,43 @@ use crate::{MAX_PAGES, Tracker};
 /// Page size for state reads.
 pub const PAGE_SIZE: usize = 100;
 
+/// Project subresources (below `/projects/{project}/`) that need
+/// `tracker.agent_tools.allow_admin_paths`: webhooks, members and access tokens, CI/CD variables,
+/// deploy keys and tokens, protected refs and environments, sharing, transfer and archiving,
+/// push rules, integrations, mirrors, export/import and runners.
+pub const ADMIN_SUBPATHS: &[&str] = &[
+    "hooks",
+    "members",
+    "invitations",
+    "access_requests",
+    "access_tokens",
+    "variables",
+    "deploy_keys",
+    "deploy_tokens",
+    "protected_branches",
+    "protected_tags",
+    "protected_environments",
+    "approval_rules",
+    "share",
+    "transfer",
+    "archive",
+    "unarchive",
+    "push_rule",
+    "integrations",
+    "services",
+    "remote_mirrors",
+    "mirror",
+    "export",
+    "import",
+    "runners",
+    "job_token_scope",
+];
+
 /// The `gitlab_api` tool.
 pub static TOOL: RestToolSpec = RestToolSpec {
     provider: Provider::Gitlab,
     name: "gitlab_api",
-    description: "Execute a GitLab REST API request using Symphony's configured auth.\n",
+    description: "Execute a GitLab REST API request for the configured project (paths under /projects/{url-encoded project path}) using Symphony's configured auth.\n",
     methods: &["GET", "POST", "PUT", "DELETE"],
     method_description: "GitLab REST method.",
     path_description: "GitLab REST path such as /projects/group%2Frepo/issues/1/notes.",
@@ -196,6 +235,51 @@ pub fn normalize_issue(raw: &Value, project_path: &str) -> Option<Issue> {
     })
 }
 
+/// `normalize_issue`, then `dispatchable: false` when `allowed_authors` is set and the issue's
+/// `author.username` is not in it (case-insensitive).
+fn normalize_routed(raw: &Value, settings: &GitLabSettings) -> Option<Issue> {
+    let mut issue = normalize_issue(raw, &settings.project_path)?;
+    if !settings.allowed_authors.is_empty() {
+        let author = raw
+            .pointer("/author/username")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        if !author.is_some_and(|a| settings.allowed_authors.contains(&a)) {
+            issue.dispatchable = false;
+        }
+    }
+    Some(issue)
+}
+
+/// The `gitlab_api` scope: `/projects/{project}` where the (percent-decoded) project segment is
+/// the configured `project_path` (case-insensitive; the encoded `%2F` form is the only place a
+/// `/` may appear), the bare project resource read-only, no [`ADMIN_SUBPATHS`] — the last two
+/// unless `allow_admin_paths`.
+pub fn check_scope(
+    settings: &GitLabSettings,
+    call: &RestCall,
+    policy: &AgentToolSettings,
+) -> Result<(), Denied> {
+    let segments = scope::split_path(TOOL.name, &call.path)?;
+    let scope_text = format!(
+        "paths under /projects/{}",
+        encode_unreserved(&settings.project_path)
+    );
+    match segments.as_slice() {
+        [projects, project, rest @ ..]
+            if projects.is("projects") && project.is(&settings.project_path) =>
+        {
+            scope::refuse_encoded_slashes(TOOL.name, rest)?;
+            scope::check_scope_root(TOOL.name, rest, call.method, policy, "the project")?;
+            if !policy.allow_admin_paths && scope::matches_admin(rest, ADMIN_SUBPATHS) {
+                return Err(scope::admin_path(TOOL.name, &call.path));
+            }
+            Ok(())
+        }
+        _ => Err(scope::out_of_scope(TOOL.name, &scope_text)),
+    }
+}
+
 /// First `assignees[]` entry, else `assignee`; its integer `id` (as a string) or its `username`.
 ///
 /// Elixir applied the id/username clauses to the *issue* when nobody was assigned and returned the
@@ -253,7 +337,7 @@ impl Tracker for GitLabTracker {
                 &raw,
                 "GitLab issue",
                 &requested,
-                |item| normalize_issue(item, &resolved.project_path),
+                |item| normalize_routed(item, &resolved),
             ));
             if raw.len() < PAGE_SIZE {
                 return Ok(issues);
@@ -281,7 +365,7 @@ impl Tracker for GitLabTracker {
             match self.get(&resolved, &path, Map::new(), true).await? {
                 None => {}
                 Some(raw @ Value::Object(_)) => issues.push(
-                    normalize_issue(&raw, &resolved.project_path)
+                    normalize_routed(&raw, &resolved)
                         .ok_or(TrackerError::UnknownPayload(Provider::Gitlab))?,
                 ),
                 Some(_) => return Err(TrackerError::UnknownPayload(Provider::Gitlab)),
@@ -296,8 +380,8 @@ impl Tracker for GitLabTracker {
         secret_environment_names(settings)
     }
 
-    fn agent_tool_specs(&self) -> Vec<Value> {
-        vec![TOOL.spec()]
+    fn agent_tool_specs(&self, settings: &TrackerSettings) -> Vec<Value> {
+        vec![TOOL.spec(&settings.agent_tools)]
     }
 
     async fn execute_agent_tool(
@@ -313,14 +397,18 @@ impl Tracker for GitLabTracker {
             Ok(call) => call,
             Err(err) => return TOOL.argument_error(err),
         };
+        let resolved = match self.settings(&ctx.settings) {
+            Ok(resolved) => resolved,
+            Err(err) => return TOOL.client_error(&err),
+        };
+        let policy = &ctx.settings.agent_tools;
+        if let Err(denied) = scope::check_method(&TOOL, call.method, policy)
+            .and_then(|()| check_scope(&resolved, &call, policy))
+        {
+            return denied.tool_result();
+        }
         match self
-            .request(
-                &ctx.settings,
-                call.method,
-                &call.path,
-                &call.query,
-                call.body,
-            )
+            .perform(&resolved, call.method, &call.path, &call.query, call.body)
             .await
         {
             Ok(response) => TOOL.response(&response),

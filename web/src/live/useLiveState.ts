@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 
-import type { ApiClient } from '../api/client';
+import { isUnauthorized, type ApiClient } from '../api/client';
 import {
   createLiveSource,
   type EventSourceFactory,
@@ -8,7 +8,10 @@ import {
   type LiveSourceOptions,
 } from './liveSource';
 
-export type LiveTuning = Omit<LiveSourceOptions, 'url' | 'fetchState' | 'createEventSource'>;
+export type LiveTuning = Omit<
+  LiveSourceOptions,
+  'url' | 'fetchState' | 'createEventSource' | 'connectUrl' | 'isUnauthorized'
+>;
 
 export interface UseLiveStateOptions extends LiveTuning {
   /** Override SSE support detection (tests pass a fake; `null` forces polling). */
@@ -18,6 +21,8 @@ export interface UseLiveStateOptions extends LiveTuning {
 export interface LiveState extends LiveSnapshot {
   /** Re-fetch `/api/v1/state` immediately. */
   refresh: () => Promise<void>;
+  /** Reconnect from scratch (after the API token changed). */
+  restart: () => void;
 }
 
 /** Uses the browser `EventSource` when available, otherwise `null` (poll only). */
@@ -28,6 +33,8 @@ export function defaultEventSourceFactory(): EventSourceFactory | null {
 
 /**
  * Live orchestrator state: SSE on `/api/v1/events`, falling back to polling `/api/v1/state`.
+ * Every SSE connection first asks for a single-use ticket (`POST /api/v1/events/tickets`, sent
+ * with the API token) and connects with `?ticket=`, so the token never appears in a URL.
  * The connection is created on mount and torn down on unmount.
  */
 export function useLiveState(client: ApiClient, options: UseLiveStateOptions = {}): LiveState {
@@ -36,6 +43,8 @@ export function useLiveState(client: ApiClient, options: UseLiveStateOptions = {
       createLiveSource({
         ...options,
         url: client.eventsUrl(),
+        connectUrl: async () => client.eventsUrl((await client.createStreamTicket()).ticket),
+        isUnauthorized,
         fetchState: () => client.getState(),
         createEventSource:
           options.createEventSource === undefined
@@ -58,5 +67,8 @@ export function useLiveState(client: ApiClient, options: UseLiveStateOptions = {
     };
   }, [source]);
 
-  return useMemo(() => ({ ...snapshot, refresh: () => source.refresh() }), [snapshot, source]);
+  return useMemo(
+    () => ({ ...snapshot, refresh: () => source.refresh(), restart: () => source.restart() }),
+    [snapshot, source],
+  );
 }
