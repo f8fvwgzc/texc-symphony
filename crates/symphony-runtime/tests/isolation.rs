@@ -37,6 +37,7 @@ trace="$SYMP_TEST_CODEX_TRACE"
 } >> "$trace"
 count=0
 while IFS= read -r _line; do
+  printf 'IN=%s\n' "$_line" >> "$trace"
   count=$((count + 1))
   case "$count" in
     1) printf '%s\n' '{"id":1,"result":{}}' ;;
@@ -63,6 +64,18 @@ fn setup(isolation: Value) -> Setup {
 
 /// `symphony`: the executable whose `egress-shim` the network jail would run.
 fn setup_with(isolation: Value, symphony: Option<PathBuf>) -> Setup {
+    setup_tracker(
+        isolation,
+        symphony,
+        Arc::new(MemoryTracker::new(MemoryIssues::new())),
+    )
+}
+
+fn setup_tracker(
+    isolation: Value,
+    symphony: Option<PathBuf>,
+    tracker: Arc<dyn symphony_trackers::Tracker>,
+) -> Setup {
     let wf = TestWorkflow::new(json!({}));
     let fixture = wf.path("env_codex.sh");
     fs::write(&fixture, ENV_FIXTURE).unwrap();
@@ -73,8 +86,7 @@ fn setup_with(isolation: Value, symphony: Option<PathBuf>) -> Setup {
     let operator_home = wf.path("operator-home");
     fs::create_dir_all(&operator_home).unwrap();
     let trace = wf.path("codex.trace");
-    let client = TrackerClient::new(TrackerDeps::new().unwrap())
-        .with_tracker(Arc::new(MemoryTracker::new(MemoryIssues::new())));
+    let client = TrackerClient::new(TrackerDeps::new().unwrap()).with_tracker(tracker);
     let runner = AgentRunner::new(Arc::clone(&wf.store), client, Default::default()).with_options(
         RunnerOptions {
             codex_env: vec![
@@ -152,6 +164,21 @@ async fn task_uids_without_root_fail_before_anything_runs() {
 }
 
 #[tokio::test]
+async fn a_repo_on_a_host_the_operator_did_not_allow_is_refused() {
+    // deny mode, no git_hosts, no github_app: the submitter cannot pick a host to reach.
+    let s = setup(json!({"network": {"mode": "deny", "allow": ["pypi.org:443"]}}));
+    fs::create_dir_all(workspace(&s)).unwrap();
+    let (ctx, _rx) = task_context(Some("https://evil.example/a/b"));
+    let err = s.runner.run(ctx).await.unwrap_err();
+    assert!(
+        matches!(&err, RunError::IsolationUnavailable(m)
+            if m.contains("evil.example") && m.contains("git_hosts")),
+        "{err:?}"
+    );
+    assert!(read(&s.trace).is_empty(), "the agent never started");
+}
+
+#[tokio::test]
 async fn isolation_is_refused_on_ssh_workers() {
     let s = setup(json!({}));
     let (mut ctx, _rx) = task_context(None);
@@ -221,40 +248,29 @@ async fn app_api(calls: u64) -> MockServer {
 }
 
 #[tokio::test]
-async fn an_app_key_an_agent_could_read_is_refused_before_a_token_is_minted() {
+async fn an_app_key_the_task_users_could_read_is_refused_before_a_token_is_minted() {
+    use std::os::unix::fs::PermissionsExt;
     let keys = tempfile::tempdir().unwrap();
     let key = keys.path().join("app.pem");
     fs::write(&key, "not used").unwrap();
     let server = app_api(0).await;
-    // Network allowed and no task uid: the agent runs as Symphony's user, outside any jail, and
-    // could read the key (and mint tokens for every repository of the App).
-    let s = setup(json!({
-        "github_app": {"app_id": 99, "private_key_file": key.to_string_lossy(), "api_url": server.uri()},
-        "network": {"mode": "allow"},
-    }));
-    let (ctx, _rx) = task_context(Some("https://github.com/acme/widgets"));
-    let err = s.runner.run(ctx).await.unwrap_err();
-    assert!(
-        matches!(&err, RunError::IsolationUnavailable(m) if m.contains("network.mode: deny")),
-        "{err:?}"
-    );
-    assert!(read(&s.trace).is_empty(), "the agent never started");
-
-    // With task uids the key must not be readable by them: a 0644 key (a Kubernetes Secret's
-    // default) is refused, also before the root check.
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
-    let s = setup(json!({
-        "github_app": {"app_id": 99, "private_key_file": key.to_string_lossy(), "api_url": server.uri()},
-        "task_uids": {"first": 200000, "count": 10},
-        "network": {"mode": "allow"},
-    }));
-    let (ctx, _rx) = task_context(Some("https://github.com/acme/widgets"));
-    let err = s.runner.run(ctx).await.unwrap_err();
-    assert!(
-        matches!(&err, RunError::IsolationUnavailable(m) if m.contains("must not be readable by group or others")),
-        "{err:?}"
-    );
+    // A 0644 key (a Kubernetes Secret's default mode) is readable by the task uids; it is
+    // refused before the root check, so any user can run this test.
+    for mode in [0o644, 0o640, 0o604] {
+        fs::set_permissions(&key, fs::Permissions::from_mode(mode)).unwrap();
+        let s = setup(json!({
+            "github_app": {"app_id": 99, "private_key_file": key.to_string_lossy(), "api_url": server.uri()},
+            "task_uids": {"first": 200000, "count": 10},
+            "network": {"mode": "allow"},
+        }));
+        let (ctx, _rx) = task_context(Some("https://github.com/acme/widgets"));
+        let err = s.runner.run(ctx).await.unwrap_err();
+        assert!(
+            matches!(&err, RunError::IsolationUnavailable(m) if m.contains("must not be readable by group or others")),
+            "{mode:o}: {err:?}"
+        );
+        assert!(read(&s.trace).is_empty(), "the agent never started");
+    }
 }
 
 #[tokio::test]
@@ -344,6 +360,7 @@ fn allow_all() -> symphony_core::config::NetworkIsolation {
     symphony_core::config::NetworkIsolation {
         mode: symphony_core::config::NetworkMode::Allow,
         allow: Vec::new(),
+        git_hosts: Vec::new(),
     }
 }
 
@@ -424,4 +441,82 @@ async fn a_planted_home_symlink_is_refused() {
         env,
         vec![("HOME".to_owned(), ws.join(".home").display().to_string())]
     );
+}
+
+/// A tracker whose agent tool acts with the operator's credential.
+struct ToolTracker;
+
+#[async_trait::async_trait]
+impl symphony_trackers::Tracker for ToolTracker {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn fetch_issues_by_states(
+        &self,
+        _settings: &symphony_core::config::TrackerSettings,
+        _states: &[String],
+    ) -> Result<Vec<Issue>, symphony_trackers::TrackerError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_issues_by_ids(
+        &self,
+        _settings: &symphony_core::config::TrackerSettings,
+        _ids: &[String],
+    ) -> Result<Vec<Issue>, symphony_trackers::TrackerError> {
+        Ok(Vec::new())
+    }
+
+    fn secret_environment_names(
+        &self,
+        _settings: &symphony_core::config::TrackerSettings,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn agent_tool_specs(&self, _settings: &symphony_core::config::TrackerSettings) -> Vec<Value> {
+        vec![json!({"name": "operator_tracker_tool", "description": "x",
+            "inputSchema": {"type": "object"}})]
+    }
+}
+
+#[tokio::test]
+async fn an_isolated_task_gets_no_tracker_tools() {
+    let symphony = RunnerOptions::default().symphony_executable;
+    // A tracker issue still gets the operator's tracker tool...
+    let s = setup_tracker(
+        json!({"network": {"mode": "allow"}}),
+        symphony.clone(),
+        Arc::new(ToolTracker),
+    );
+    let mut ctx = WorkerContext::standalone(support::issue("issue-1", "MT-1", "In Progress"));
+    ctx.events = EventSink::none();
+    let runner = s.runner.clone().with_options(RunnerOptions {
+        max_turns: Some(1),
+        codex_env: vec![(
+            "SYMP_TEST_CODEX_TRACE".into(),
+            s.trace.display().to_string(),
+        )],
+        ..RunnerOptions::default()
+    });
+    let _ = runner.run(ctx).await;
+    assert!(
+        read(&s.trace).contains("operator_tracker_tool"),
+        "{}",
+        read(&s.trace)
+    );
+
+    // ...an isolated task (another tenant's work) does not.
+    let s = setup_tracker(
+        json!({"network": {"mode": "allow"}}),
+        symphony,
+        Arc::new(ToolTracker),
+    );
+    fs::create_dir_all(workspace(&s)).unwrap();
+    let (ctx, _rx) = task_context(None);
+    s.runner.run(ctx).await.unwrap();
+    let trace = read(&s.trace);
+    assert!(trace.contains("IN="), "the app-server ran: {trace}");
+    assert!(!trace.contains("operator_tracker_tool"), "{trace}");
 }

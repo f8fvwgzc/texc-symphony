@@ -424,6 +424,7 @@ isolation:
     private_key_file: /var/run/secrets/github-app/private-key.pem
   network:
     mode: deny
+    git_hosts: ["github.com"]
     allow: ["pypi.org:443", "files.pythonhosted.org:443"]
 ```
 
@@ -437,6 +438,7 @@ isolation:
 | `isolation.github_app.git_host` | string | `github.com` | Repositories `https://<git_host>/OWNER/REPO[.git]` and `git@<git_host>:OWNER/REPO[.git]` get a token. | new runs |
 | `isolation.network.mode` | string | `deny` | `deny` or `allow` (no restriction beyond the backend's own `network`). | new runs |
 | `isolation.network.allow` | list of strings | `[]` | Extra `host:port` entries (exact host, case-insensitive; `[v6]:port`). | new runs |
+| `isolation.network.git_hosts` | list of strings | `[]` | Git hosts a task's `repo` may use (`github_app.git_host` is always allowed). In deny mode a task whose repo host is not listed is refused. | new runs |
 
 What each part does:
 
@@ -469,6 +471,12 @@ What each part does:
 - **Default-deny network** (`network.mode: deny`). Symphony starts an egress proxy for the run
   that reaches only the repository's git host on port 443 (https; never 22), the LLM gateway
   (`LLM_GATEWAY_URL`) when one is configured, and `network.allow`; everything else gets `403`.
+  The submitter chooses `repo`, so the repository host must be one the operator allowed
+  (`network.git_hosts` or `github_app.git_host`); a task with any other repo host is refused
+  (`isolation_unavailable`) rather than being able to pick a host to reach. The proxy also
+  resolves each hostname and refuses an answer in a loopback, private, link-local or
+  carrier-grade-NAT range, so a tenant-controlled name cannot reach an internal service; an
+  operator may still name such an address as an IP literal in `allow`.
   Nothing in the task can bypass it: the `api` backend's bubblewrap shell has an empty network
   namespace and reaches the proxy only through `symphony egress-shim`; Codex, Claude Code and a
   `sandbox: none` shell run in the **network jail** (`bwrap --dev-bind / / --unshare-net` with

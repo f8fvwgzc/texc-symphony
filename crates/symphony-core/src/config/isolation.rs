@@ -52,8 +52,10 @@ impl IsolationSettings {
         repo: Option<&str>,
         llm: Option<&LlmConnection>,
     ) -> Vec<HostPort> {
+        // Only an operator-allowed git host (the submitter does not choose what to reach).
         let repo = repo
             .and_then(repo_host)
+            .filter(|host| self.git_host_allowed(host))
             .map(|host| HostPort::new(&host, GIT_HTTPS_PORT));
         let api = self.github_app.as_ref().and_then(|app| {
             repo.as_ref()
@@ -75,6 +77,40 @@ impl IsolationSettings {
             }
         }
         out
+    }
+}
+
+impl IsolationSettings {
+    /// The git hosts a task's repository may use: `network.git_hosts` plus `github_app.git_host`
+    /// (both operator-configured).
+    pub fn allowed_git_hosts(&self) -> Vec<String> {
+        let mut hosts = self.network.git_hosts.clone();
+        if let Some(app) = &self.github_app
+            && !hosts.contains(&app.git_host)
+        {
+            hosts.push(app.git_host.clone());
+        }
+        hosts
+    }
+
+    /// `true` when `host` (already lowercased) is an allowed git host.
+    pub fn git_host_allowed(&self, host: &str) -> bool {
+        self.allowed_git_hosts().iter().any(|h| h == host)
+    }
+
+    /// `Ok` unless `repo`'s host is one the operator did not allow, in deny mode (allow mode
+    /// does not restrict egress, so it does not restrict the repo host either). `Err` names the
+    /// offending host (or the whole `repo` when no host parses).
+    pub fn check_repo_host(&self, repo: Option<&str>) -> Result<(), String> {
+        if !self.network.denies() {
+            return Ok(());
+        }
+        let Some(repo) = repo else { return Ok(()) };
+        match repo_host(repo) {
+            Some(host) if self.git_host_allowed(&host) => Ok(()),
+            Some(host) => Err(host),
+            None => Err(repo.to_owned()),
+        }
     }
 }
 
@@ -138,6 +174,10 @@ pub struct NetworkIsolation {
     pub mode: NetworkMode,
     /// Extra reachable `host:port` entries in deny mode.
     pub allow: Vec<HostPort>,
+    /// Git hosts a task's repository may use (lowercased). The submitter picks `repo`, so in
+    /// deny mode the host must be one the operator listed here (or `github_app.git_host`);
+    /// otherwise the task cannot pick a host to reach (F4).
+    pub git_hosts: Vec<String>,
 }
 
 impl NetworkIsolation {
@@ -326,6 +366,14 @@ pub(crate) fn cast_isolation(
         &section.nested("network", "isolation.network", errors),
         errors,
     );
+    // The App key mints tokens for every repository of the App: only a task uid that cannot
+    // read it keeps it from the task's agents.
+    if github_app.is_some() && task_uids.is_none() {
+        errors.push(
+            "isolation.github_app",
+            "needs isolation.task_uids (an agent running as Symphony's user could read the App key)",
+        );
+    }
     Some(IsolationSettings {
         task_uids,
         github_app,
@@ -449,7 +497,26 @@ fn cast_network(s: &Section<'_>, errors: &mut Errors) -> NetworkIsolation {
             }
         }
     };
-    NetworkIsolation { mode, allow }
+    let git_hosts = match s.string_list("git_hosts", errors) {
+        None => Vec::new(),
+        Some(entries) => entries
+            .iter()
+            .filter_map(|entry| {
+                let host = entry.trim().to_ascii_lowercase();
+                if host.is_empty() || host.contains(['/', ' ', '@', ':']) {
+                    errors.push(&s.path("git_hosts"), "is invalid");
+                    None
+                } else {
+                    Some(host)
+                }
+            })
+            .collect(),
+    };
+    NetworkIsolation {
+        mode,
+        allow,
+        git_hosts,
+    }
 }
 
 #[cfg(test)]

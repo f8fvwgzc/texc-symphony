@@ -29,7 +29,7 @@
 //! variables alone.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -397,8 +397,56 @@ fn parse_request(head: &[u8]) -> Result<Request, &'static str> {
     })
 }
 
+/// `true` for an address a task must not reach through the proxy: loopback, private, link-local,
+/// unspecified, carrier-grade NAT or an IPv4-mapped form of one. The host's own services and
+/// other pods live at such addresses, so a tenant name resolving there is refused.
+pub(crate) fn is_internal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_internal_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_internal_v4(v4),
+            None => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+            }
+        },
+    }
+}
+
+fn is_internal_v4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.octets()[0] == 0 // "this network" 0.0.0.0/8
+        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64/10
+}
+
+/// A vetted address for `target`: an IP literal (the allow-list already vetted the exact IP an
+/// operator named) as is; a hostname resolved to its first non-internal address, so a
+/// tenant-controlled name cannot point the proxy at an internal service (no DNS rebinding needed).
+async fn resolve_upstream(target: &HostPort) -> Result<SocketAddr, (&'static str, String)> {
+    if let Ok(ip) = target.host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, target.port));
+    }
+    let resolved = tokio::net::lookup_host((target.host.as_str(), target.port))
+        .await
+        .map_err(|err| ("502 Bad Gateway", format!("cannot resolve {target}: {err}")))?;
+    resolved
+        .into_iter()
+        .find(|addr| !is_internal(addr.ip()))
+        .ok_or((
+            "403 Forbidden",
+            format!("{target} resolves only to internal addresses"),
+        ))
+}
+
 async fn connect_upstream(target: &HostPort) -> Result<TcpStream, (&'static str, String)> {
-    let connect = TcpStream::connect((target.host.as_str(), target.port));
+    let addr = resolve_upstream(target).await?;
+    let connect = TcpStream::connect(addr);
     match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(err)) => Err((
@@ -604,6 +652,42 @@ mod tests {
         };
         assert!(network_jail(&no_socket, Some(shim), Path::new("/w"), &[]).is_err());
         assert!(network_jail(&route, None, Path::new("/w"), &[]).is_err());
+    }
+
+    #[test]
+    fn internal_addresses_are_refused() {
+        for internal in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "100.100.0.1",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(is_internal(internal.parse().unwrap()), "{internal}");
+        }
+        for public in ["8.8.8.8", "140.82.121.4", "2606:4700::1111", "172.32.0.1"] {
+            assert!(!is_internal(public.parse().unwrap()), "{public}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hostname_that_resolves_to_a_loopback_address_is_refused() {
+        // localhost resolves to 127.0.0.1 / ::1: a tenant name pointing inward is refused.
+        let err = resolve_upstream(&HostPort::new("localhost", 443))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "403 Forbidden", "{err:?}");
+        // An operator-named IP literal is taken as given (the allow-list vetted it).
+        let addr = resolve_upstream(&HostPort::new("127.0.0.1", 8080))
+            .await
+            .unwrap();
+        assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
     }
 
     #[test]

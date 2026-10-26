@@ -69,7 +69,8 @@ fn every_part_is_cast_with_defaults() {
         vec![HostPort::new("pypi.org", 443), HostPort::new("::1", 8080)]
     );
 
-    let custom = isolation(json!({"github_app": {
+    let uids = json!({"first": 200000, "count": 10});
+    let custom = isolation(json!({"task_uids": uids, "github_app": {
         "app_id": "Iv1.abc", "private_key_file": "/k.pem",
         "api_url": "https://ghe.example/api/v3/", "git_host": "GHE.example",
     }}));
@@ -79,10 +80,20 @@ fn every_part_is_cast_with_defaults() {
     assert_eq!(app.git_host, "ghe.example");
 
     // Plain http only to a loopback host (local mocks).
-    let local = isolation(json!({"github_app": {
+    let local = isolation(json!({"task_uids": uids, "github_app": {
         "app_id": 1, "private_key_file": "/k.pem", "api_url": "http://127.0.0.1:8080",
     }}));
     assert_eq!(local.github_app.unwrap().api_url, "http://127.0.0.1:8080");
+}
+
+#[test]
+fn a_github_app_needs_task_uids() {
+    // Without its own uid, a task's agent could read the App key Symphony reads.
+    let message = invalid(json!({"github_app": {"app_id": 1, "private_key_file": "/k.pem"}}));
+    assert!(
+        message.contains("isolation.github_app needs isolation.task_uids"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -139,7 +150,7 @@ fn bad_values_are_reported_by_path() {
 #[test]
 fn a_github_app_task_may_also_reach_the_api_of_its_git_host() {
     let settings = parse(
-        json!({"isolation": {"github_app": {
+        json!({"isolation": {"task_uids": {"first": 200000, "count": 10}, "github_app": {
             "app_id": 7, "private_key_file": "/run/secrets/app.pem",
             "api_url": "https://ghe.example.com/api/v3", "git_host": "ghe.example.com",
         }}}),
@@ -153,7 +164,8 @@ fn a_github_app_task_may_also_reach_the_api_of_its_git_host() {
         "on GHE the API shares the git host"
     );
     let settings = parse(
-        json!({"isolation": {"github_app": {"app_id": 7, "private_key_file": "/run/secrets/app.pem"}}}),
+        json!({"isolation": {"task_uids": {"first": 200000, "count": 10},
+            "github_app": {"app_id": 7, "private_key_file": "/run/secrets/app.pem"}}}),
         &MapEnv::new(),
     )
     .unwrap();
@@ -165,10 +177,64 @@ fn a_github_app_task_may_also_reach_the_api_of_its_git_host() {
             HostPort::new("api.github.com", 443)
         ]
     );
-    // Another git host gets no token, so no API either.
+    // A repo on a host the operator did not allow is not added (and is refused at preflight).
+    assert!(
+        isolation
+            .egress_allow_list(Some("https://gitlab.com/acme/widgets"), None)
+            .is_empty()
+    );
+}
+
+#[test]
+fn only_operator_allowed_git_hosts_are_reachable() {
+    let settings = parse(
+        json!({"isolation": {"task_uids": {"first": 200000, "count": 10},
+            "network": {"git_hosts": ["GitHub.com", "git.internal"]}}}),
+        &MapEnv::new(),
+    )
+    .unwrap();
+    let isolation = settings.isolation.as_ref().unwrap();
+    // A listed host is reachable and allowed.
     assert_eq!(
-        isolation.egress_allow_list(Some("https://gitlab.com/acme/widgets"), None),
-        vec![HostPort::new("gitlab.com", 443)]
+        isolation.egress_allow_list(Some("https://github.com/a/b"), None),
+        vec![HostPort::new("github.com", 443)]
+    );
+    assert!(
+        isolation
+            .check_repo_host(Some("https://github.com/a/b"))
+            .is_ok()
+    );
+    assert!(
+        isolation
+            .check_repo_host(Some("ssh://git@git.internal/a/b"))
+            .is_ok()
+    );
+    // The submitter cannot pick another host: refused, and not on the allow-list.
+    assert!(
+        isolation
+            .egress_allow_list(Some("https://evil.example/a/b"), None)
+            .is_empty()
+    );
+    assert_eq!(
+        isolation.check_repo_host(Some("https://evil.example/a/b")),
+        Err("evil.example".to_owned())
+    );
+    assert_eq!(
+        isolation.check_repo_host(Some("https://10.0.0.5/a/b")),
+        Err("10.0.0.5".to_owned())
+    );
+    // allow mode does not restrict egress, so it does not restrict the repo host.
+    let open = parse(
+        json!({"isolation": {"task_uids": {"first": 200000, "count": 10},
+            "network": {"mode": "allow"}}}),
+        &MapEnv::new(),
+    )
+    .unwrap();
+    assert!(
+        open.isolation
+            .unwrap()
+            .check_repo_host(Some("https://anywhere.example/a/b"))
+            .is_ok()
     );
 }
 
@@ -178,7 +244,8 @@ fn the_allow_list_is_the_git_host_the_gateway_and_the_extras() {
         .with("LLM_GATEWAY_URL", "http://Gateway.internal:8080/")
         .with("LLM_MODEL", "claude-sonnet");
     let settings = parse(
-        json!({"isolation": {"network": {"allow": ["pypi.org:443", "github.com:443"]}}}),
+        json!({"isolation": {"network": {
+            "git_hosts": ["github.com"], "allow": ["pypi.org:443", "github.com:443"]}}}),
         &env,
     )
     .unwrap();

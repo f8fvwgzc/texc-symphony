@@ -53,6 +53,7 @@ extraVolumes:
   - name: github-app
     secret:
       secretName: github-app-key
+      defaultMode: 0400
 extraVolumeMounts:
   - name: github-app
     mountPath: /var/run/secrets/github-app
@@ -68,6 +69,7 @@ has "$out" "app.kubernetes.io/name: llm-gateway" "extra egress rule"
 has "$out" "port: 8080" "extra egress rule"
 lacks "$out" "- Ingress" "ingress untouched"
 has "$out" "secretName: github-app-key" "extra volume"
+has "$out" "defaultMode: 256" "the App key is readable by its owner only (0400)"
 has "$out" "mountPath: /var/run/secrets/github-app" "extra volume mount"
 helm lint "$chart" -f "$values" >/dev/null
 

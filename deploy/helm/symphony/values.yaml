@@ -43,7 +43,7 @@ extraEnv: []
 extraEnvFrom: []
 # Extra volumes and their mounts in the Symphony container (for example the GitHub App key of
 # `isolation.github_app`, from a Secret mounted read-only at /var/run/secrets/github-app; give
-# it `defaultMode: 0400`, which `isolation.task_uids` with `network.mode: allow` requires).
+# it `defaultMode: 0400`: `isolation.github_app` refuses a key the task uids could read).
 extraVolumes: []
 extraVolumeMounts: []
 

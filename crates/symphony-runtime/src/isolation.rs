@@ -29,12 +29,24 @@ fn unavailable(message: impl Into<String>) -> RunError {
 }
 
 /// Checks, before any work, that `isolation` can apply to a run on `worker_host`: no SSH worker,
-/// a GitHub App key no agent can read, and root for `task_uids` (switching and chowning to other
-/// users needs it).
-pub fn preflight(isolation: &IsolationSettings, worker_host: Option<&str>) -> Result<(), RunError> {
+/// a repository on an operator-allowed git host, a GitHub App key no agent can read, and root
+/// for `task_uids` (switching and chowning to other users needs it).
+pub fn preflight(
+    isolation: &IsolationSettings,
+    worker_host: Option<&str>,
+    repo: Option<&str>,
+) -> Result<(), RunError> {
     if let Some(host) = worker_host {
         return Err(unavailable(format!(
             "task isolation is not supported on SSH workers (worker_host={host})"
+        )));
+    }
+    // The submitter chooses `repo`; in deny mode it must be a host the operator allowed, or the
+    // task could reach (or exfiltrate to) any host, including internal services (F4).
+    if let Err(host) = isolation.check_repo_host(repo) {
+        return Err(unavailable(format!(
+            "repository host {host:?} is not in isolation.network.git_hosts (or \
+             isolation.github_app.git_host); the operator must allow it"
         )));
     }
     if let Some(app) = &isolation.github_app {
@@ -59,21 +71,16 @@ pub fn preflight(isolation: &IsolationSettings, worker_host: Option<&str>) -> Re
 }
 
 /// The GitHub App key mints tokens for every repository the App is installed on, so no agent may
-/// read it. Under a default-deny network every agent process runs where it reads as empty (the
-/// `api` shell's sandbox, the network jail); otherwise only a task uid that cannot read the file
-/// keeps it out of reach.
+/// read it: the task runs as its own uid, and the key must be readable by its owner only (it is
+/// also masked wherever agents run under a default-deny network).
 fn app_key_out_of_reach(
     isolation: &IsolationSettings,
     app: &symphony_core::config::GitHubAppSettings,
 ) -> Result<(), RunError> {
-    if isolation.network.denies() {
-        return Ok(());
-    }
     if isolation.task_uids.is_none() {
         return Err(unavailable(
-            "isolation.github_app needs network.mode: deny (agents run where the App key reads \
-             as empty) or isolation.task_uids: an agent running as Symphony's user could read \
-             the key and mint tokens for every repository of the App",
+            "isolation.github_app needs isolation.task_uids: an agent running as Symphony's \
+             user could read the App key and mint tokens for every repository of the App",
         ));
     }
     #[cfg(unix)]

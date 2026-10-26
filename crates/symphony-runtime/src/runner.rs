@@ -257,7 +257,8 @@ impl AgentRunner {
         // Isolation applies to task runs only, and a run that cannot be isolated never starts.
         let isolation_settings = ctx.task.as_ref().and(settings.isolation.as_ref());
         if let Some(isolation_settings) = isolation_settings {
-            isolation::preflight(isolation_settings, worker_host)?;
+            let repo = ctx.task.as_ref().and_then(|task| task.repo.as_deref());
+            isolation::preflight(isolation_settings, worker_host, repo)?;
         }
 
         let workspaces = self.workspace_manager(&settings);
@@ -352,16 +353,23 @@ impl AgentRunner {
             .backend(Some(&name))
             .ok_or(RunError::UnknownBackend(name))?;
         let backend = backend_for(&backend_settings, self.options.symphony_executable.clone());
-        let binding = self
-            .tracker
-            .bind_agent_tools(settings)
-            .map_err(RunError::ToolBinding)?;
+        // The tracker tools act with the operator's credential from Symphony's own network: an
+        // isolated task (another tenant's work) gets none.
+        let tools: Arc<dyn symphony_codex::DynamicToolHandler> = if isolation.is_some() {
+            Arc::new(symphony_codex::NoDynamicTools)
+        } else {
+            let binding = self
+                .tracker
+                .bind_agent_tools(settings)
+                .map_err(RunError::ToolBinding)?;
+            Arc::new(TrackerToolHandler::new(binding))
+        };
         let mut options = StartOptions::new(
             workspace,
             Arc::clone(settings),
             self.workflow.workflow_file_path(),
         )
-        .with_tool_handler(Arc::new(TrackerToolHandler::new(binding)))
+        .with_tool_handler(tools)
         .with_stop_grace(self.options.codex_stop_grace);
         if let Some(host) = worker_host {
             options = options.with_worker_host(
