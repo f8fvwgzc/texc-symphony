@@ -240,7 +240,7 @@ The command exits 0 with a report. It exits 1 with:
 - `Workflow file not found: <path>` when the path is not a regular file;
 - `Invalid option(s): ...` for an unknown option or a second path;
 - the reason `symphony` would print at startup, without its
-  `Failed to start Symphony with workflow <path>: ` prefix, when the file cannot be read, is not
+  `Failed to start Symphony with workflow <path>:` prefix, when the file cannot be read, is not
   UTF-8, has front matter that is not a YAML mapping, or has a malformed reference marker.
 
 It does not check the settings themselves (for example `agent.max_turns`) or tracker credentials.
