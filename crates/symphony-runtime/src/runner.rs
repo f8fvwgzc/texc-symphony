@@ -603,7 +603,11 @@ mod tests {
         assert!(policy.removed().iter().any(|n| n == "GITHUB_TOKEN"));
         assert!(policy.removed().iter().any(|n| n == "GH_TOKEN"));
         assert!(hook_env_policy(&settings, false).removed().is_empty());
+        // No tracker secrets; the LLM contract's are always stripped.
         settings.tracker.kind = Some("memory".into());
-        assert!(hook_env_policy(&settings, true).removed().is_empty());
+        assert_eq!(
+            hook_env_policy(&settings, true).removed(),
+            symphony_core::config::llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)
+        );
     }
 }

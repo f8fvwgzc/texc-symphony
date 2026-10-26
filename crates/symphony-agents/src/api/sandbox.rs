@@ -1,23 +1,24 @@
 //! Confinement of the API agent loop's `shell` tool (`sandbox` / `network` of an `api` backend).
 //!
-//! * **bubblewrap** (Linux): the root file system read-only, the workspace and a private `/tmp`
-//!   writable, a fresh `/dev`, a private PID namespace with its own `/proc` (host processes and
-//!   their environments are invisible; everything dies with the command), a new session, and no
-//!   network (`--unshare-net`) unless allowed.
-//! * **seatbelt** (macOS `sandbox-exec`): file writes only to the workspace, `/private/tmp`, a
-//!   private per-command temp directory (`$TMPDIR` for the command) and a few device files; no
-//!   LaunchServices, AppleEvents, `open`, `osascript` or `launchctl` (which would start programs
-//!   outside the sandbox); network denied unless allowed.
-//! * **none**: no confinement beyond the workspace cwd and the filtered environment.
+//! * **bubblewrap** (Linux, the only production sandbox): only the system directories
+//!   ([`SYSTEM_DIRS`], [`ETC_ENTRIES`]) are bound read-only, so `$HOME`, `/run`, `/var`, the data
+//!   directory, other workspaces, credential files and filesystem sockets are not there; the
+//!   workspace and a private `/tmp` are writable; every namespace is new (`--unshare-all`: user,
+//!   PID with its own `/proc`, IPC, UTS, cgroup, and network unless allowed); a new session; the
+//!   environment is cleared and rebuilt from an allow-list.
+//! * **seatbelt** (macOS `sandbox-exec`, development only, never picked by `auto`): file writes
+//!   only to the workspace and temp directories, network denied unless allowed, a few launchers
+//!   denied by path. Reads are unrestricted and a copied launcher escapes it: not a security
+//!   boundary, so it needs `unconfined: true` on the backend.
+//! * **none**: no confinement; needs `unconfined: true` on the backend.
 //!
-//! `auto` picks bubblewrap or seatbelt when installed and refuses otherwise: running commands of
-//! a remote model unconfined has to be an explicit `sandbox: none`.
+//! `auto` picks bubblewrap and refuses without it.
 //!
 //! A task under `isolation.network.mode: deny` gets [`NetworkAccess::Proxy`] whatever the
-//! backend's `network` says: bubblewrap keeps `--unshare-net` and runs the command under the
-//! egress shim (`symphony egress-shim`, see [`crate::egress`]) with the proxy's socket directory
-//! bound in; seatbelt denies the network except `localhost:<proxy port>`; `none` only sets the
-//! proxy variables (advisory).
+//! backend's `network` says: bubblewrap keeps the network namespace empty and runs the command
+//! under the egress shim (`symphony egress-shim`, see [`crate::egress`]) with the proxy's socket
+//! directory and the shim bound in; seatbelt denies the network except `localhost:<proxy port>`;
+//! `none` only sets the proxy variables (advisory).
 
 use std::path::{Path, PathBuf};
 
@@ -80,15 +81,11 @@ pub fn resolve(mode: SandboxMode) -> Result<Confinement, String> {
             {
                 return Ok(Confinement::Bubblewrap(bwrap));
             }
-            if cfg!(target_os = "macos")
-                && let Some(seatbelt) = seatbelt_binary()
-            {
-                return Ok(Confinement::Seatbelt(seatbelt));
-            }
             Err(
-                "the shell tool needs a sandbox: install bubblewrap (`bwrap`, Linux) or use \
-                 macOS sandbox-exec, or set `sandbox: none` on the backend to run commands \
-                 unconfined (for example inside a container that is the sandbox)"
+                "the shell tool needs a sandbox: install bubblewrap (`bwrap`, Linux, with \
+                 unprivileged user namespaces). For development on macOS set `sandbox: \
+                 seatbelt` with `unconfined: true` (not a security boundary); `sandbox: none` \
+                 with `unconfined: true` runs commands with Symphony's own access"
                     .into(),
             )
         }
@@ -149,6 +146,53 @@ pub fn seatbelt_profile(
     profile
 }
 
+/// System directories bound read-only into bubblewrap (when they exist).
+pub const SYSTEM_DIRS: [&str; 9] = [
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/opt",
+    "/nix/store",
+];
+
+/// The parts of `/etc` toolchains need (bound read-only when they exist); the rest of `/etc`
+/// (service configs such as `/etc/symphony`) stays out.
+pub const ETC_ENTRIES: [&str; 26] = [
+    "/etc/alternatives",
+    "/etc/bash.bashrc",
+    "/etc/ca-certificates",
+    "/etc/ca-certificates.conf",
+    "/etc/environment",
+    "/etc/gai.conf",
+    "/etc/gitconfig",
+    "/etc/group",
+    "/etc/host.conf",
+    "/etc/hostname",
+    "/etc/hosts",
+    "/etc/inputrc",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/etc/localtime",
+    "/etc/mime.types",
+    "/etc/nsswitch.conf",
+    "/etc/os-release",
+    "/etc/passwd",
+    "/etc/pki",
+    "/etc/profile",
+    "/etc/profile.d",
+    "/etc/resolv.conf",
+    "/etc/ssl",
+    "/etc/timezone",
+];
+
+/// Variables copied from Symphony's environment into bubblewrap (everything else is cleared).
+pub const PASSED_ENV: [&str; 6] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"];
+
 /// `bash -lc <script>` in `workspace` under `confinement`. stderr of bash goes to stdout (so
 /// the model sees one stream in order); the wrapper's own stderr stays separate. `tmp` is the
 /// command's private temp directory (seatbelt: the only writable temp dir besides
@@ -160,6 +204,7 @@ pub fn command(
     network: &NetworkAccess,
     tmp: Option<&Path>,
     masked: &[PathBuf],
+    env: &[(String, String)],
 ) -> Command {
     let script = format!("exec 2>&1\n{script}");
     let mut command = match confinement {
@@ -169,7 +214,7 @@ pub fn command(
             command
         }
         Confinement::Bubblewrap(bwrap) => {
-            // The shim needs the proxy's socket (bound in below) and itself.
+            // The shim needs the proxy's socket and itself (both bound in below).
             let shim = match network {
                 NetworkAccess::Proxy {
                     route,
@@ -178,21 +223,40 @@ pub fn command(
                 _ => None,
             };
             let mut command = Command::new(bwrap);
-            command
-                .args(["--ro-bind", "/", "/", "--dev", "/dev"])
-                // A PID namespace (needed for `--proc` without setuid, and it hides host
-                // processes) and a new session; everything inside dies with the command.
-                .args(["--unshare-pid", "--new-session", "--proc", "/proc"])
-                .args(["--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp"])
-                .arg("--bind")
-                .arg(workspace)
-                .arg(workspace);
-            if *network != NetworkAccess::Allowed {
-                command.arg("--unshare-net");
+            for dir in SYSTEM_DIRS.iter().chain(ETC_ENTRIES.iter()) {
+                command.args(["--ro-bind-try", dir, dir]);
             }
-            if let Some(dir) = shim.and_then(|(socket, _)| socket.parent()) {
+            command
+                .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+                // Every namespace new (user, PID with its own /proc, IPC, UTS, cgroup, network)
+                // and a new session; everything inside dies with the command.
+                .args(["--unshare-all", "--new-session"]);
+            if *network == NetworkAccess::Allowed {
+                command.arg("--share-net");
+            }
+            if let Some((socket, shim)) = shim {
                 // After `--tmpfs /tmp`, which would hide a socket directory under /tmp.
-                command.arg("--bind").arg(dir).arg(dir);
+                if let Some(dir) = socket.parent() {
+                    command.arg("--bind").arg(dir).arg(dir);
+                }
+                command.arg("--ro-bind").arg(shim).arg(shim);
+            }
+            command.arg("--bind").arg(workspace).arg(workspace);
+            // The environment is rebuilt from an allow-list as bwrap's own (it passes it on), not
+            // with `--setenv`: bwrap's argv, and the values in it, are world-readable in
+            // `/proc/<pid>/cmdline`. Variables the caller adds later (a task's token) get the
+            // same treatment.
+            command
+                .env_clear()
+                .env("HOME", "/tmp")
+                .env("TMPDIR", "/tmp");
+            for name in PASSED_ENV {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+            for (name, value) in env {
+                command.env(name, value);
             }
             // Secret files (the LLM key, ...) read as empty inside the sandbox.
             for file in masked.iter().filter(|f| f.is_file()) {
@@ -274,26 +338,76 @@ mod tests {
     }
 
     #[test]
-    fn bubblewrap_commands_bind_the_workspace_and_drop_the_network() {
+    fn bubblewrap_binds_only_system_dirs_and_clears_the_environment() {
+        let argv = |network: NetworkAccess| -> String {
+            command(
+                &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+                Path::new("/w/MT-1"),
+                "ls",
+                &network,
+                None,
+                &[],
+                &[("GIT_AUTHOR_NAME".to_owned(), "Agent".to_owned())],
+            )
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+        };
+        let joined = argv(NetworkAccess::Denied);
+        assert!(
+            !joined.contains("--ro-bind / /"),
+            "the host root is not bound"
+        );
+        assert!(joined.contains("--ro-bind-try /usr /usr"));
+        assert!(joined.contains("--ro-bind-try /etc/ssl /etc/ssl"));
+        assert!(!joined.contains("--ro-bind-try /etc /etc"));
+        assert!(joined.contains("--unshare-all --new-session --bind /w/MT-1 /w/MT-1"));
+        assert!(!joined.contains("--share-net"));
+        assert!(
+            !joined.contains("--setenv"),
+            "no values in the world-readable argv"
+        );
+        assert!(joined.ends_with("-- bash -lc exec 2>&1\nls"));
+        assert!(argv(NetworkAccess::Allowed).contains("--unshare-all --new-session --share-net"));
         let command = command(
             &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
-            Path::new("/w/MT-1"),
+            Path::new("/w"),
             "ls",
             &NetworkAccess::Denied,
             None,
             &[],
+            &[("GIT_AUTHOR_NAME".to_owned(), "Agent".to_owned())],
         );
-        let args: Vec<String> = command
+        let envs: Vec<(String, Option<String>)> = command
             .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
             .collect();
-        let joined = args.join(" ");
-        assert!(joined.starts_with(
-            "--ro-bind / / --dev /dev --unshare-pid --new-session --proc /proc --tmpfs /tmp"
-        ));
-        assert!(joined.contains("--bind /w/MT-1 /w/MT-1 --unshare-net"));
-        assert!(joined.ends_with("-- bash -lc exec 2>&1\nls"));
+        for (name, value) in [
+            ("GIT_AUTHOR_NAME", "Agent"),
+            ("HOME", "/tmp"),
+            ("TMPDIR", "/tmp"),
+        ] {
+            assert!(
+                envs.contains(&(name.to_owned(), Some(value.to_owned()))),
+                "{name}: {envs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_never_picks_seatbelt() {
+        if cfg!(target_os = "macos") {
+            let err = resolve(SandboxMode::Auto).unwrap_err();
+            assert!(err.contains("sandbox: seatbelt"), "{err}");
+        }
     }
 
     fn route(socket: Option<&str>) -> EgressRoute {
@@ -324,9 +438,14 @@ mod tests {
             &network,
             None,
             &[],
+            &[],
         );
         let joined = args(&command).join(" ");
-        assert!(joined.contains("--unshare-net"), "{joined}");
+        assert!(!joined.contains("--share-net"), "{joined}");
+        assert!(
+            joined.contains("--ro-bind /usr/local/bin/symphony /usr/local/bin/symphony"),
+            "the shim is reachable inside: {joined}"
+        );
         let tmpfs = joined.find("--tmpfs /tmp").unwrap();
         let bind = joined
             .find("--bind /tmp/symphony-egress-1-0 /tmp/symphony-egress-1-0")
@@ -364,9 +483,10 @@ mod tests {
                 &network,
                 None,
                 &[],
+                &[],
             ))
             .join(" ");
-            assert!(joined.contains("--unshare-net"), "{joined}");
+            assert!(!joined.contains("--share-net"), "{joined}");
             assert!(!joined.contains("egress-shim"), "{joined}");
         }
     }
@@ -389,6 +509,7 @@ mod tests {
             "ls",
             &network,
             None,
+            &[],
             &[],
         );
         let envs: Vec<(String, String)> = command

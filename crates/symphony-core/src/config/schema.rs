@@ -551,7 +551,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
         env,
     );
     let worker = cast_worker(&Section::new(root, "worker", &mut errors), &mut errors);
-    let mut agent = cast_agent(&Section::new(root, "agent", &mut errors), &mut errors);
+    let agent = cast_agent(&Section::new(root, "agent", &mut errors), &mut errors);
     let mut codex = cast_codex(&Section::new(root, "codex", &mut errors), &mut errors);
     let hooks = cast_hooks(&Section::new(root, "hooks", &mut errors), &mut errors);
     let observability = cast_observability(
@@ -563,7 +563,7 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     let isolation = super::isolation::cast_isolation(root, &mut errors);
     let llm = super::llm::from_env(env, &mut errors);
     if let Some(llm) = &llm {
-        apply_llm_contract(root, llm, &mut agent, &mut codex);
+        apply_llm_contract(llm, &mut codex);
     }
     let backends = super::backend::cast_backends(root, llm.as_ref(), &mut errors);
     if !backends.contains_key(&agent.backend) {
@@ -592,23 +592,11 @@ pub fn parse(config: &Map<String, Value>, env: &dyn EnvSource) -> Result<Setting
     Ok(finalize(settings, env))
 }
 
-/// The contract's defaults outside `backends:`: `agent.backend` becomes `llm` unless set, and
-/// Codex gets the contract as its model provider (it speaks the OpenAI Responses API, so only
-/// for OpenAI-compatible providers and gateway mode) unless `codex.provider` is set.
-fn apply_llm_contract(
-    root: &Map<String, Value>,
-    llm: &super::llm::LlmConnection,
-    agent: &mut AgentSettings,
-    codex: &mut CodexSettings,
-) {
-    let explicit = |section: &str, key: &str| {
-        root.get(section)
-            .and_then(|s| s.get(key))
-            .is_some_and(|v| !v.is_null())
-    };
-    if !explicit("agent", "backend") {
-        agent.backend = super::llm::LLM_BACKEND.into();
-    }
+/// The contract's defaults outside `backends:`: Codex gets the contract as its model provider (it
+/// speaks the OpenAI Responses API, so only for OpenAI-compatible providers and gateway mode)
+/// unless `codex.provider` is set. `agent.backend` is not changed: the built-in `llm` backend is
+/// used only where the workflow (or a task) names it.
+fn apply_llm_contract(llm: &super::llm::LlmConnection, codex: &mut CodexSettings) {
     if codex.provider.is_none() && llm.serves_openai() {
         codex.provider = Some(CodexProvider {
             name: super::llm::CODEX_LLM_PROVIDER.into(),

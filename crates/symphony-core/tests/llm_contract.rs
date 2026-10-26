@@ -45,10 +45,10 @@ fn an_anthropic_key_file_configures_the_llm_backend() {
         Some(SecretSource::File("/var/run/secrets/llm/api-key".into()))
     );
     assert_eq!(
-        settings.agent.backend, LLM_BACKEND,
-        "the contract's backend is the default"
+        settings.agent.backend, "codex",
+        "an existing deployment keeps its backend; `llm` must be chosen"
     );
-    let backend = settings.backend(None).unwrap();
+    let backend = settings.backend(Some(LLM_BACKEND)).unwrap();
     assert_eq!(backend.model.as_deref(), Some("claude-sonnet-4-5"));
     let api = api(&settings, LLM_BACKEND);
     assert_eq!(api.provider, ApiProvider::Anthropic);
@@ -253,7 +253,6 @@ fn bad_contract_values_are_reported_by_variable() {
             vec![("LLM_GATEWAY_URL", "not a url"), ("LLM_MODEL", "m")],
             "LLM_GATEWAY_URL is invalid",
         ),
-        (vec![("LLM_MODEL", "m")], "LLM_PROVIDER can't be blank"),
     ] {
         let env = vars
             .iter()
@@ -287,4 +286,22 @@ fn secrets_are_read_when_used_and_trimmed() {
     assert_eq!(SecretSource::Env("K".into()).read(&env).unwrap(), "sk-env");
     let missing = SecretSource::Env("NOPE".into()).read(&env).unwrap_err();
     assert_eq!(missing, "the variable NOPE is not set");
+}
+
+#[test]
+fn stray_variables_do_not_break_a_workflow_and_are_reported() {
+    use symphony_core::config::llm::{describe, stray_variables};
+    let env = MapEnv::new()
+        .with("LLM_MODEL", "m")
+        .with("LLM_API_KEY", "k");
+    let settings = parse(&env, json!({})).unwrap();
+    assert_eq!(settings.llm, None);
+    assert_eq!(stray_variables(&env), vec!["LLM_API_KEY", "LLM_MODEL"]);
+    assert_eq!(describe(&settings), None);
+    let env = env.with("LLM_PROVIDER", "openai");
+    assert!(stray_variables(&env).is_empty());
+    let settings = parse(&env, json!({})).unwrap();
+    let line = describe(&settings).unwrap();
+    assert!(line.contains("agent.backend is `codex`"), "{line}");
+    assert!(line.contains("codex uses it"), "{line}");
 }

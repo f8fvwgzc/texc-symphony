@@ -177,6 +177,8 @@ impl Orchestrator<'_> {
             entry.recorder.finish(run_status, error.clone());
             self.task_finish(task.id, task_status, task.result, error);
             self.release_issue_claim(issue_id);
+            // Final: the clone is not needed any more (unblocking a failed task clones again).
+            self.remove_task_workspace(task.id);
             return;
         }
         if blocked {

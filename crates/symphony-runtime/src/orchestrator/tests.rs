@@ -1716,7 +1716,7 @@ async fn queued_tasks_run_once_and_record_their_result() {
     assert!(orch.state.running.contains_key(&issue_id));
     assert_eq!(
         orch.state.running[&issue_id].identifier,
-        format!("TASK-{id}")
+        format!("task-{id}")
     );
     run_until(&mut orch, |o| o.state.running.is_empty()).await;
     let task = task_status(&store, id, TaskStatus::Succeeded).await;
@@ -1735,7 +1735,7 @@ async fn queued_tasks_run_once_and_record_their_result() {
     orch.maybe_dispatch().await;
     assert!(orch.state.running.is_empty());
     let runs = store.list_runs(RunQuery::default()).await.unwrap().runs;
-    assert_eq!(runs[0].issue_identifier, format!("TASK-{id}"));
+    assert_eq!(runs[0].issue_identifier, format!("task-{id}"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2121,4 +2121,62 @@ async fn the_kill_switch_of_one_replica_reaches_the_others() {
     }
     orch_b.sync_kill_switch().await;
     assert_eq!(orch_b.state.spend.paused, None);
+}
+
+#[tokio::test]
+async fn task_workspaces_are_separate_from_tracker_issues_and_removed_when_final() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    // A tracker issue whose identifier looks like a task's must not share anything with it.
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "memory"}}),
+        task_factory(Arc::default(), || Ok(())),
+        store.clone(),
+    );
+    h.memory
+        .set(vec![issue("lin-1", &format!("task-{id}"), "In Progress")]);
+    let _ = started;
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let workspace = orch.task_workspace(id);
+    assert!(
+        workspace.ends_with(format!(".tasks/{id}")),
+        "{}",
+        workspace.display()
+    );
+    std::fs::create_dir_all(workspace.join("clone")).unwrap();
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    task_status(&store, id, TaskStatus::Succeeded).await;
+    let mut removed = false;
+    for _ in 0..200 {
+        if !workspace.exists() {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(removed, "the workspace of a final task is removed");
+
+    // A stale workspace of a finished task is swept at startup; a queued task keeps its own.
+    std::fs::create_dir_all(&workspace).unwrap();
+    let queued = store
+        .create_task(symphony_store::NewTask {
+            prompt: "later".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let kept = orch.task_workspace(queued.id);
+    std::fs::create_dir_all(&kept).unwrap();
+    orch.sweep_task_workspaces().await;
+    for _ in 0..200 {
+        if !workspace.exists() {
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(!workspace.exists());
+    assert!(kept.exists());
 }

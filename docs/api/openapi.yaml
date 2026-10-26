@@ -357,7 +357,7 @@ paths:
         Queues work for an agent without a tracker issue. The task runs once, in a fresh workspace
         (empty, or a shallow clone of `repo`), on `backend` (default `agent.backend`), with the
         prompt sent as-is (wrapped by the backend's `prompt_template`). Its final agent message
-        becomes `result`. Runs are recorded under the identifier `TASK-<id>`.
+        becomes `result`. Runs are recorded under the identifier `task-<id>`.
       requestBody:
         required: true
         content:
@@ -1152,7 +1152,7 @@ components:
       additionalProperties: false
       properties:
         id: { type: integer, minimum: 1 }
-        identifier: { type: string, description: '`TASK-<id>`: the identifier of its runs and live entries.' }
+        identifier: { type: string, description: '`task-<id>`: the identifier of its runs and live entries.' }
         title: { type: [string, 'null'] }
         prompt: { type: string }
         repo: { type: [string, 'null'] }

@@ -11,6 +11,7 @@
 
 // Modified 2026-10-25: hidden `agent-tools` subcommand (MCP bridge for Claude Code) (Part B).
 // Modified 2026-10-26: hidden `egress-shim` subcommand (task network isolation).
+// Modified 2026-10-26: `init` subcommand (the container image's PID 1).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -74,7 +75,8 @@ pub fn acknowledgement_banner() -> String {
     long_about = "Turn tracker work into isolated, autonomous coding-agent runs.\n\n\
         Symphony polls the tracker configured in WORKFLOW.md, gives every eligible issue its own \
         workspace and drives a Codex app-server session in it.\n\n\
-        Other commands:\n  symphony workspace before-remove [--branch <name>] [--repo <owner/name>]",
+        Other commands:\n  symphony workspace before-remove [--branch <name>] [--repo <owner/name>]\n  \
+        symphony init -- <command> [args...]",
     disable_help_subcommand = true,
     args_override_self = true
 )]
@@ -133,6 +135,24 @@ struct EgressShimArgs {
     port: u16,
     /// The command and its arguments.
     #[arg(last = true, required = true, value_name = "command")]
+    command: Vec<OsString>,
+}
+
+/// `symphony init -- <command> [args...]`: the container image's PID 1 (see [`crate::init`]).
+#[derive(Debug, Parser)]
+#[command(
+    name = "symphony init",
+    about = "Run a command as PID 1: keep this environment unreadable, forward signals, reap children.",
+    disable_help_subcommand = true
+)]
+struct InitArgs {
+    /// The command and its arguments.
+    #[arg(
+        value_name = "command",
+        required = true,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     command: Vec<OsString>,
 }
 
@@ -223,6 +243,11 @@ pub enum Command {
         /// Loopback port inside the sandbox.
         port: u16,
         /// The command to run.
+        command: Vec<OsString>,
+    },
+    /// `symphony init -- <command> [args...]` (the container image's PID 1).
+    Init {
+        /// The command and its arguments (never empty).
         command: Vec<OsString>,
     },
 }
@@ -319,6 +344,9 @@ pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliE
     }
     if args.get(1).is_some_and(|arg| arg == "egress-shim") {
         return evaluate_egress_shim(args);
+    }
+    if args.get(1).is_some_and(|arg| arg == "init") {
+        return evaluate_init(args);
     }
     let matches = RunArgs::command()
         .version(version())
@@ -439,6 +467,19 @@ fn evaluate_egress_shim(args: &[OsString]) -> Result<Command, CliExit> {
     Ok(Command::EgressShim {
         socket: parsed.socket,
         port: parsed.port,
+        command: parsed.command,
+    })
+}
+
+fn evaluate_init(args: &[OsString]) -> Result<Command, CliExit> {
+    let argv = std::iter::once(OsString::from("symphony init")).chain(args.iter().skip(2).cloned());
+    let parsed = InitArgs::try_parse_from(argv).map_err(|err| match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            CliExit::Help(err.render().to_string())
+        }
+        _ => CliExit::InvalidOption(invalid_option_message(&err)),
+    })?;
+    Ok(Command::Init {
         command: parsed.command,
     })
 }
@@ -773,6 +814,38 @@ mod tests {
         ] {
             assert_eq!(fx.eval(bad).unwrap_err().exit_code(), 1, "{bad:?}");
         }
+        assert!(fx.checked.borrow().is_empty(), "no workflow lookup");
+    }
+
+    #[test]
+    fn init_takes_the_rest_of_the_line_as_its_command() {
+        let fx = Fixture::new();
+        let command = |args: &[&str]| Command::Init {
+            command: args.iter().map(OsString::from).collect(),
+        };
+        // The image's entrypoint: the command's own flags are not init's.
+        assert_eq!(
+            fx.eval(&[
+                "init",
+                "--",
+                "symphony",
+                "--port",
+                "4000",
+                "/config/WORKFLOW.md"
+            ]),
+            Ok(command(&[
+                "symphony",
+                "--port",
+                "4000",
+                "/config/WORKFLOW.md"
+            ]))
+        );
+        assert_eq!(
+            fx.eval(&["init", "sh", "-c", "exit 3"]),
+            Ok(command(&["sh", "-c", "exit 3"]))
+        );
+        assert_eq!(fx.eval(&["init"]).unwrap_err().exit_code(), 1);
+        assert_eq!(fx.eval(&["init", "--help"]).unwrap_err().exit_code(), 0);
         assert!(fx.checked.borrow().is_empty(), "no workflow lookup");
     }
 }

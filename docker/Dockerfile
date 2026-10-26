@@ -13,6 +13,8 @@
 #
 # Modified 2026-10-25: the default command no longer acknowledges the guardrails banner (audit A3);
 # the image also carries the Claude Code CLI and bubblewrap for the `api` backend's shell sandbox.
+# Modified 2026-10-26: `symphony init` replaces tini as PID 1, so PID 1's environment (every secret
+# the container starts with) is not readable to agents running as the same user.
 
 ARG RUST_VERSION=1.99.0
 ARG NODE_VERSION=22
@@ -159,12 +161,11 @@ LABEL org.opencontainers.image.title="symphony" \
       dev.symphony.claude-code.installed="${INSTALL_CLAUDE_CODE}" \
       dev.symphony.claude-code.version="${CLAUDE_CODE_VERSION}"
 
-# git/bash/ssh for workspace hooks, SSH workers and agents; tini as PID 1 so signals reach
-# symphony and zombie hook/agent processes are reaped; wget for the health check; bubblewrap
+# git/bash/ssh for workspace hooks, SSH workers and agents; wget for the health check; bubblewrap
 # confines the `api` backend's shell tool (it needs user namespaces; see docker/README.md).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      bash bubblewrap ca-certificates git openssh-client tini wget && \
+      bash bubblewrap ca-certificates git openssh-client wget && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 symphony && \
     useradd --uid 10001 --gid 10001 --home-dir /home/symphony --create-home \
@@ -187,10 +188,16 @@ WORKDIR /srv/symphony
 VOLUME ["/data", "/workspaces"]
 EXPOSE 4000
 
+# Docker runs the probe with the container's whole environment (every secret) as uid 10001, and
+# its processes are dumpable: `exec env -i` hands wget an empty environment, so only the brief
+# sh/env start-up holds it, not the request.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -q -T 4 -O /dev/null "http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health" || exit 1
+  CMD ["sh", "-c", "exec env -i wget -q -T 4 -O /dev/null \"http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health\""]
 
-ENTRYPOINT ["tini", "--", "symphony"]
+# `symphony init` is PID 1: it forwards signals to symphony and reaps orphaned hook and agent
+# processes like tini did, and it keeps its environment unreadable to them (tini's was readable
+# through /proc/1/environ). Do not add Docker's `--init`: tini would hold the secrets again.
+ENTRYPOINT ["symphony", "init", "--", "symphony"]
 # Deliberately not pre-acknowledged: an operator who has reviewed the sandbox settings in
 # WORKFLOW.md passes --i-understand-that-this-will-be-running-without-the-usual-guardrails
 # (see docker/README.md). The API also needs SYMPHONY_API_TOKEN, because the image binds 0.0.0.0.

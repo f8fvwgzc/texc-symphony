@@ -260,6 +260,9 @@ pub struct RunQuery {
     pub before_id: Option<i64>,
     /// Only runs for this issue identifier (exact match).
     pub issue_identifier: Option<String>,
+    /// Only runs for this issue id (exact match; task runs: `task:<id>`).
+    #[serde(default)]
+    pub issue_id: Option<String>,
     /// Only runs with this status.
     pub status: Option<RunStatus>,
 }

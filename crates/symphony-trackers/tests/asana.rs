@@ -581,15 +581,80 @@ fn asana_api_scope_classifies_paths() {
     };
     assert_eq!(
         check(Method::Get, "/projects/project-1/tasks", None),
-        Ok(ScopeTarget::Project)
+        Ok(vec![ScopeTarget::Project])
     );
     assert_eq!(
         check(Method::Post, "/tasks/42/stories", None),
-        Ok(ScopeTarget::Task("42".into()))
+        Ok(vec![ScopeTarget::Task("42".into())])
     );
     assert_eq!(
         check(Method::Post, "/sections/s-1/addTask", None),
-        Ok(ScopeTarget::Section("s-1".into()))
+        Ok(vec![ScopeTarget::Section("s-1".into())])
+    );
+    // Every task the body names must be verified as well.
+    assert_eq!(
+        check(
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": "77", "insert_before": "78"}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Section("s-1".into()),
+            ScopeTarget::Task("77".into()),
+            ScopeTarget::Task("78".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/addDependencies",
+            Some(json!({"data": {"dependencies": ["5", {"gid": "6"}]}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Task("42".into()),
+            ScopeTarget::Task("5".into()),
+            ScopeTarget::Task("6".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/setParent",
+            Some(json!({"data": {"parent": "9"}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Task("42".into()),
+            ScopeTarget::Task("9".into())
+        ])
+    );
+    // Numbers and single {gid} objects are references too; `null` clears the parent.
+    assert_eq!(
+        check(
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": 77, "insert_after": {"gid": "78"}}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Section("s-1".into()),
+            ScopeTarget::Task("77".into()),
+            ScopeTarget::Task("78".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/setParent",
+            Some(json!({"data": {"parent": null}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"name": "s"}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
     );
     assert_eq!(
         check(
@@ -597,7 +662,7 @@ fn asana_api_scope_classifies_paths() {
             "/tasks/42/addProject",
             Some(json!({"data": {"project": "project-1"}}))
         ),
-        Ok(ScopeTarget::Task("42".into()))
+        Ok(vec![ScopeTarget::Task("42".into())])
     );
     assert_eq!(
         check(
@@ -605,7 +670,7 @@ fn asana_api_scope_classifies_paths() {
             "/tasks",
             Some(json!({"data": {"name": "n", "projects": ["project-1"]}}))
         ),
-        Ok(ScopeTarget::Project)
+        Ok(vec![ScopeTarget::Project])
     );
     for (method, path, body, rule) in [
         (
@@ -628,6 +693,40 @@ fn asana_api_scope_classifies_paths() {
             "body_out_of_scope",
         ),
         (Method::Get, "/tasks", None, "body_out_of_scope"),
+        // A reference of an unexpected shape is refused instead of skipped.
+        (
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": true}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addDependencies",
+            Some(json!({"data": {"dependencies": ["5", {"name": "x"}]}})),
+            "body_out_of_scope",
+        ),
+        // Subtasks and new tasks may not be filed into other projects.
+        (
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"projects": ["other"]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"memberships": [{"project": "other"}]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks",
+            Some(
+                json!({"data": {"projects": ["project-1"], "memberships": [{"project": "other"}]}}),
+            ),
+            "body_out_of_scope",
+        ),
         (
             Method::Post,
             "/tasks/42/addProject",
@@ -676,6 +775,15 @@ async fn asana_api_checks_task_and_section_membership_before_writing() {
         .and(query_param("opt_fields", "memberships.project.gid"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
             "gid": "outside", "memberships": [{"project": {"gid": "other-project"}}]
+        }})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/tasks/42"))
+        .and(query_param("opt_fields", "memberships.project.gid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "42", "memberships": [{"project": {"gid": "project-1"}}]
         }})))
         .expect(1)
         .mount(&server)
@@ -751,6 +859,17 @@ async fn asana_api_checks_task_and_section_membership_before_writing() {
     )
     .await;
     assert!(ok);
+    // A foreign task moved into an in-project section is refused (it would then pass the
+    // membership check of /tasks/{gid}).
+    let (ok, output) = run_tool(
+        &tracker,
+        "asana_api",
+        json!({"method": "POST", "path": "/sections/s-in/addTask", "body": {"data": {"task": "outside"}}}),
+        &s,
+    )
+    .await;
+    assert!(!ok);
+    assert_eq!(output["error"]["rule"], "path_out_of_scope");
     let (ok, _) = run_tool(
         &tracker,
         "asana_api",

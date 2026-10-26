@@ -124,6 +124,7 @@ async fn a_bubblewrap_shell_reaches_only_the_proxy() {
             &network,
             None,
             &[],
+            &[],
         );
         output(command.into_std())
     };

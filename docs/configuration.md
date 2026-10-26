@@ -255,22 +255,25 @@ once `LLM_PROVIDER` or `LLM_GATEWAY_URL` is set; values from `WORKFLOW.md` alway
 | `LLM_GATEWAY_TOKEN_FILE` | with the gateway | File holding the gateway token, sent as a bearer token. |
 
 Errors name the variable (`LLM_PROVIDER is invalid`, `LLM_MODEL can't be blank`) and fail the
-workflow load like any other setting. Setting `LLM_MODEL`, `LLM_BASE_URL` or a key without
-`LLM_PROVIDER` or `LLM_GATEWAY_URL` is an error, so a typo does not silently disable the contract.
+workflow load like any other setting. `LLM_MODEL`, `LLM_BASE_URL` or a key without
+`LLM_PROVIDER` or `LLM_GATEWAY_URL` leave the contract off and log a warning. The contract never
+changes `agent.backend`: run issues or tasks on it with `agent.backend: llm` (or a task's
+`backend: llm`). At startup Symphony logs one line saying what the contract configures.
 
 What the contract configures:
 
 | Where | Default it supplies | Overridden by |
 |---|---|---|
 | Built-in backend `llm` | An `api` backend (Symphony's agent loop, [agents.md](agents.md#api-the-built-in-agent-loop)) with the contract's wire format, endpoint, credential, model, timeout and retries. | `backends.llm` |
-| `agent.backend` | `llm` | `agent.backend` |
 | `api` backends | `provider`; and, when they set no `base_url` and use the contract's wire format, the endpoint, the credential and the model. A backend with its own `base_url` never receives the contract's key. `request_timeout_ms` and `max_retries` default from the contract. | the backend's own keys |
 | Codex | `codex.provider` (`symphony-llm`: the contract's OpenAI-compatible endpoint, `request_max_retries`, `stream_idle_timeout_ms`) and `codex.model`, for `openai` / `openai-compatible` and gateway mode (Codex speaks only the Responses API). Codex reads its key from the environment, so its process gets the credential as `SYMPHONY_LLM_API_KEY` (local runs; SSH workers need their own). | `codex.provider`, `codex.model` |
 | Claude Code (`claude_code`) | For `anthropic` and gateway mode (Claude Code speaks only Anthropic Messages): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (provider) or `ANTHROPIC_AUTH_TOKEN` (gateway; a stray `ANTHROPIC_API_KEY` is then removed), `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `API_TIMEOUT_MS`, and the backend's `model`. Claude Code has no retry setting. | the backend's `api_key_env`, `model` |
 
 Secrets: `LLM_API_KEY`, `LLM_API_KEY_FILE` and `LLM_GATEWAY_TOKEN_FILE` are removed from every
-agent child environment; the credential's value is redacted in recorded events; the key files read
-as empty inside the `api` backend's bubblewrap sandbox and are unreadable under seatbelt. The API
+agent child environment, and the key (the variable's value, or the file's contents) is redacted
+in recorded events, also while the contract is off (a stray `LLM_API_KEY` in a shared
+environment). The key files read as empty inside the `api` backend's bubblewrap sandbox; seatbelt
+only refuses direct reads of them, and a command can escape it (development only). The API
 loop keeps the key in Symphony's process. Codex and Claude Code call the model themselves, so they
 receive the credential; prefer gateway mode, whose token is the only secret they then see.
 
@@ -682,7 +685,10 @@ tracker:
   entries (`invalid_asana_states`). Completed tasks are never dispatched.
 - Tool: `asana_api`, limited to the configured project: `/projects/<project_gid>` and below,
   `/tasks/<gid>...` and `/sections/<gid>...` after one `GET` confirms the task or section belongs
-  to the project, and `POST /tasks` whose `data.projects` includes the project. Changing the project
+  to the project, and `POST /tasks` whose `data.projects` is exactly the project. Every task the
+  body names (`data.task` of `addTask`, `data.parent`, `data.insert_before`/`insert_after`,
+  `data.dependencies`/`dependents`) must belong to the project too; `addProject` must target the
+  project, and `subtasks` may only name the project in `data.projects`/`memberships`. Changing the project
   or a section itself is an admin call, as are the project subpaths `addMembers`, `removeMembers`,
   `addFollowers`, `removeFollowers`, `project_memberships`, `duplicate`, `saveAsTemplate`,
   `addCustomFieldSetting` and `removeCustomFieldSetting`. Other paths (users, workspaces, other

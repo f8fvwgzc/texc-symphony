@@ -178,18 +178,16 @@ impl Settings {
         })
     }
 
-    /// Env var names to strip from agent children: the tracker's secrets and the HTTP API token.
+    /// Env var names to strip from agent children: the tracker's secrets, the HTTP API token,
+    /// backend keys and the LLM contract's secrets (also while the contract is off, so a stray
+    /// `LLM_API_KEY` from a shared environment does not reach agents).
     pub fn secret_environment_names(&self) -> Vec<String> {
         crate::env::uniq(
             tracker::secret_environment_names(&self.tracker)
                 .into_iter()
                 .chain(self.server.secret_environment_names.iter().cloned())
                 .chain(backend::backend_secret_environment_names(&self.backends))
-                .chain(
-                    self.llm
-                        .iter()
-                        .flat_map(|_| llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)),
-                ),
+                .chain(llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)),
         )
     }
 

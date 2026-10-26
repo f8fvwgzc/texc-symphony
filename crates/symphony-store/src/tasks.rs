@@ -20,6 +20,8 @@ use crate::ops::{clamp_u32, timestamp};
 pub const DEFAULT_TASK_LIMIT: u32 = 50;
 /// Maximum page size of [`TaskQuery`].
 pub const MAX_TASK_LIMIT: u32 = 200;
+/// Longest task prompt, in bytes (also the API's limit for new tasks).
+pub const MAX_TASK_PROMPT_BYTES: usize = 256 * 1024;
 /// Longest stored result, in bytes (longer results are cut on a char boundary).
 pub const MAX_TASK_RESULT_BYTES: usize = 256 * 1024;
 
@@ -123,7 +125,7 @@ pub struct NewTask {
 pub struct TaskRecord {
     /// Task id.
     pub id: i64,
-    /// Identifier of its runs in run history and the live state (`TASK-<id>`).
+    /// Identifier of its runs in run history and the live state (`task-<id>`).
     pub identifier: String,
     /// Short label.
     pub title: Option<String>,
@@ -157,9 +159,10 @@ pub struct TaskRecord {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-/// `TASK-<id>`.
+/// `task-<id>`: lowercase, so it never equals an (uppercase) Linear or Jira key; runs of a task
+/// are matched by their issue id `task:<id>`, never by this identifier.
 pub fn task_identifier(id: i64) -> String {
-    format!("TASK-{id}")
+    format!("task-{id}")
 }
 
 /// Filters and cursor of `Store::list_tasks`.
@@ -427,6 +430,13 @@ pub(crate) fn requeue_task(
         Some(message) => format!("{}\n\nOperator reply:\n{message}", task.prompt),
         None => task.prompt,
     };
+    // Every reply grows the prompt: refuse past the limit a new task's prompt has.
+    if prompt.len() > MAX_TASK_PROMPT_BYTES {
+        return Err(StoreError::InvalidArgument(format!(
+            "task {id}: the prompt with this reply would exceed {} bytes",
+            MAX_TASK_PROMPT_BYTES
+        )));
+    }
     db.execute(
         "UPDATE tasks SET status = 'queued', prompt = ?2, error = NULL, result = NULL, \
          finished_at = NULL, updated_at = ?3 WHERE id = ?1 AND status IN ('blocked', 'failed')",

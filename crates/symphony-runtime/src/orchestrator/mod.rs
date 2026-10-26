@@ -285,6 +285,58 @@ impl<'w> Orchestrator<'w> {
         });
     }
 
+    /// `<workspace.root>/.tasks/<id>`, the workspace of task `id` (see `workspace::TASK_WORKSPACES`).
+    pub(crate) fn task_workspace(&self, id: i64) -> std::path::PathBuf {
+        self.task_workspaces().join(id.to_string())
+    }
+
+    fn task_workspaces(&self) -> std::path::PathBuf {
+        self.settings()
+            .local_workspace_root(&self.ctx.workflow.workflow_file_path())
+            .join(crate::workspace::TASK_WORKSPACES)
+    }
+
+    /// Removes task `id`'s workspace in the background (its agent is already stopped). Task
+    /// workspaces run no workflow hooks.
+    pub(crate) fn remove_task_workspace(&self, id: i64) {
+        let path = self.task_workspace(id);
+        tokio::spawn(async move {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => tracing::debug!("Removed task workspace path={}", path.display()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(
+                    "Failed to remove task workspace path={}: {err}",
+                    path.display()
+                ),
+            }
+        });
+    }
+
+    /// Startup: removes the workspaces of tasks that are final or unknown (a previous process
+    /// stopped before cleaning them up).
+    pub(crate) async fn sweep_task_workspaces(&self) {
+        if !self.ctx.store.is_enabled() {
+            return;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(self.task_workspaces()).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            match self.ctx.store.get_task(id).await {
+                Ok(Some(task)) if !task.status.is_final() => {}
+                Ok(_) => self.remove_task_workspace(id),
+                Err(err) => tracing::warn!("Failed to read task {id}: {err}"),
+            }
+        }
+    }
+
     pub(crate) fn workspace_manager(&self, settings: &Arc<Settings>) -> WorkspaceManager {
         WorkspaceManager::new(
             Arc::clone(settings),
@@ -331,6 +383,7 @@ impl<'w> Orchestrator<'w> {
             Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
         }
         self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
+        self.sweep_task_workspaces().await;
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -392,6 +445,8 @@ impl<'w> Orchestrator<'w> {
                 } else {
                     self.release_issue_claim(&issue_id);
                 }
+                // A cancelled task never runs again (a blocked one leaves its workspace here).
+                self.remove_task_workspace(id);
                 self.notify();
                 let _ = reply.send(running);
             }

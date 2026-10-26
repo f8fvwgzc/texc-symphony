@@ -872,7 +872,7 @@ async fn tasks_move_through_their_lifecycle() {
     let store = memory();
     let created = store.create_task(task("Summarize README")).await.unwrap();
     assert_eq!(created.status, TaskStatus::Queued);
-    assert_eq!(created.identifier, format!("TASK-{}", created.id));
+    assert_eq!(created.identifier, format!("task-{}", created.id));
     assert_eq!(created.metadata, Some(json!({"ticket": 7})));
     assert_eq!(created.limits.max_tokens, Some(1000));
 
@@ -1143,4 +1143,35 @@ async fn a_task_is_started_by_one_claimant_only() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn unblocking_cannot_grow_a_prompt_past_the_limit() {
+    use symphony_store::{MAX_TASK_PROMPT_BYTES, NewTask, TaskStatus};
+    let store = memory();
+    let task = store
+        .create_task(NewTask {
+            prompt: "x".repeat(MAX_TASK_PROMPT_BYTES - 10),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    store.start_task(task.id).await.unwrap();
+    store
+        .finish_task(
+            task.id,
+            TaskStatus::Blocked,
+            None,
+            Some("needs input".into()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .requeue_task(task.id, Some("a reply that is too long".into()))
+            .await,
+        Err(StoreError::InvalidArgument(_))
+    ));
+    let still = store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(still.status, TaskStatus::Blocked);
 }

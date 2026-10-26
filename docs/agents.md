@@ -35,8 +35,8 @@ backends:
 `codex` always exists; define `backends.codex` only to set its `model`, `prompt_template` or
 `pricing`. With the platform's LLM connection contract (`LLM_*` environment,
 [configuration.md](configuration.md#llm-connection-contract)) there is also a built-in `llm`
-backend (an `api` backend from the contract), which becomes the default; the contract also
-supplies defaults to the other backends.
+backend (an `api` backend from the contract), used where `agent.backend: llm` or a task names
+it; the contract also supplies defaults to the other backends.
 
 ## Adding a provider (no code)
 
@@ -99,8 +99,9 @@ were made (`agent_limit_exceeded`). The conversation persists across the turns o
 | `temperature` | provider default | `0..2`. |
 | `stream` | `true` | `false` for servers with broken streaming. |
 | `request_timeout_ms` | `600000` | One model request. |
-| `sandbox` | `auto` | `shell` confinement: `auto`, `bubblewrap`, `seatbelt`, `none`. |
-| `network` | `false` | Network access for `shell` commands (a task's `isolation.network.mode: deny` wins). |
+| `sandbox` | `auto` | `shell` confinement: `auto` (= `bubblewrap`), `bubblewrap`, `seatbelt` (macOS development only), `none` (needs `unconfined`). |
+| `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt; a task's `isolation.network.mode: deny` wins). `false` cannot be set with `sandbox: none`, which cannot enforce it. |
+| `unconfined` | `false` | Must be `true` with `sandbox: none` (commands reach the network and every file and process environment Symphony's user can read) and with `sandbox: seatbelt` (reads are not limited and the sandbox can be escaped). |
 | `shell_timeout_ms` | `600000` | One command (a smaller per-call `timeout_ms` wins). |
 
 Tools:
@@ -115,16 +116,21 @@ Tools:
   the tail is ever buffered), host secrets removed from the environment and `unset` again after
   the login profile, a private temp directory as `$TMPDIR`, the whole process group killed on
   timeout or stop.
-  - `bubblewrap` (Linux): read-only root, writable workspace and a private `/tmp`, a private PID
-    namespace and `/proc` (host processes and their environments are invisible, and everything
-    dies with the command), a new session, no network unless `network: true`. Needs
-    unprivileged user namespaces.
-  - `seatbelt` (macOS `sandbox-exec`): writes only to the workspace, `/private/tmp` and the
-    command's private temp directory; LaunchServices, AppleEvents, `open`, `osascript`,
-    `automator` and `launchctl` are denied (they would start programs outside the sandbox); no
-    network unless allowed. Seatbelt allows reads everywhere and is weaker than bubblewrap.
-  - `auto` uses whichever is installed and **refuses** to run commands when neither is; set
-    `none` only where something else is the sandbox (a disposable container or VM).
+  - `bubblewrap` (Linux, the production sandbox): only system directories (`/usr`, `/bin`,
+    `/lib*`, `/opt`, and the parts of `/etc` toolchains need) are bound read-only, so `$HOME`,
+    `/run`, `/var`, the run-history database, other workspaces, credential files and
+    filesystem sockets are not reachable; the workspace and a private `/tmp` are writable;
+    every namespace is new (user, PID with its own `/proc`, IPC, UTS, cgroup, and network
+    unless `network: true`); the environment is cleared and rebuilt from `PATH`, the locale
+    variables and the backend's own variables. Needs unprivileged user namespaces.
+  - `seatbelt` (macOS `sandbox-exec`): for development only, never chosen by `auto`, and it
+    needs `unconfined: true`. It limits writes and the network, but reads are unrestricted and a
+    copied launcher (`cp /bin/launchctl ./lc`) escapes it.
+  - `auto` is `bubblewrap` and **refuses** to run commands without it.
+  - `none` runs commands with Symphony's own access (files, network, the environments of
+    Symphony's user's processes other than Symphony and the image's init, which are
+    non-dumpable) and therefore needs `unconfined: true`. A container is no sandbox for this:
+    Symphony, its run history and its secret files live in it.
 - `tracker`: the tracker's scoped tools (`linear_graphql`, `github_api`, ...), executed by
   Symphony with the host-side credential ([agent tool scope](configuration.md#agent-tool-scope)).
 
@@ -139,9 +145,9 @@ Each turn runs, in the workspace:
 
 ```text
 bash -lc 'exec <command> -p --output-format stream-json --verbose [--model M]
-  --permission-mode <mode> [--allowedTools ...] [--disallowedTools ...] [--max-turns N]
-  [--append-system-prompt S] [--mcp-config <file> --strict-mcp-config] [--resume <session>]
-  [extra_args...]'
+  --permission-mode <mode> --setting-sources user --strict-mcp-config [--allowedTools ...]
+  [--disallowedTools ...] [--max-turns N] [--append-system-prompt S] [--mcp-config <file>]
+  [--resume <session>] [extra_args...]'
 ```
 
 with the prompt on stdin. The first turn starts a session; later turns resume it.
@@ -153,21 +159,31 @@ with the prompt on stdin. The first turn starts a session; later turns resume it
 | `permission_mode` | `acceptEdits` | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`. |
 | `max_turns` | CLI default | `--max-turns` per Symphony turn. |
 | `api_key_env` | none | Passed to Claude Code as `ANTHROPIC_API_KEY`; without it Claude Code uses its own login. |
-| `extra_args` | `[]` | Appended verbatim. |
+| `extra_args` | `[]` | Appended verbatim, except that `--setting-sources`, `--settings`, `--mcp-config`, `--strict-mcp-config` and `--dangerously-skip-permissions` are refused. |
 
 Tracker tools reach Claude Code through MCP: Symphony serves them on a private Unix socket and
-points Claude at `symphony agent-tools --socket <path>` (`--strict-mcp-config`), adding
+points Claude at `symphony agent-tools --socket <path>` (`--mcp-config`), adding
 `mcp__symphony__<tool>` to `--allowedTools`. Calls run inside Symphony with the scoped tool
 handler, so the tracker token never reaches Claude. Claude Code's own `Bash` tool is not
-sandboxed by Symphony: keep `allowed_tools` narrow. Tracker and API tokens are removed from its
-environment.
+sandboxed by Symphony: keep `allowed_tools` narrow.
+
+Claude Code only reads the operator's user settings (`--setting-sources user`) and only
+Symphony's MCP config (`--strict-mcp-config`), so a cloned repository's `.claude/settings.json`
+(permissions, hooks) or `.mcp.json` cannot widen `allowed_tools`; `extra_args` may not change
+these flags. Tracker tokens and the other backends' keys are removed from its environment, but
+Claude Code itself receives its own key (`api_key_env`, passed as `ANTHROPIC_API_KEY`, or the LLM
+contract's credential), so commands its `Bash` tool runs can read that key. The `api_key_env`
+variable is removed from every other child (hooks, Codex, the api shell) and redacted.
 
 ## Image and requirements
 
 The Docker image ships the Codex CLI, the Claude Code CLI and `bubblewrap`
 (`INSTALL_CODEX=false` / `INSTALL_CLAUDE_CODE=false` leave the CLIs out; the `api` backend needs
-neither). Inside a container, `bubblewrap` needs user namespaces; if the runtime does not allow
-them, the container is the sandbox: set `sandbox: none` and keep the container unprivileged.
+neither). Inside a container, `bubblewrap` needs unprivileged user namespaces: the default
+seccomp profiles of Docker and Kubernetes (`RuntimeDefault`) block them, so the `api` backend's
+shell needs a seccomp profile that allows `clone`/`unshare` with `CLONE_NEWUSER` (and, on Ubuntu
+hosts, `kernel.apparmor_restrict_unprivileged_userns=0`). Without that, run the shell elsewhere
+or leave the `shell` tool out of `tools`; do not fall back to `sandbox: none`.
 
 A gated GitHub workflow (`.github/workflows/real-provider.yml`, manual `workflow_dispatch`) runs
 one tiny real turn against Anthropic and an OpenAI-compatible endpoint when the repository has

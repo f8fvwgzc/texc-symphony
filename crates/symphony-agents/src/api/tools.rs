@@ -643,6 +643,7 @@ impl Toolbox {
             &self.shell.network,
             Some(tmp.path()),
             &self.shell.masked_files,
+            &self.shell.extra_env,
         );
         command
             .stdin(Stdio::null())

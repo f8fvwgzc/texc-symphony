@@ -5,6 +5,7 @@ symphony [--i-understand-that-this-will-be-running-without-the-usual-guardrails]
          [--logs-root <path>] [--port <port>] [--host <addr>]
          [--db-path <path> | --no-db] [path-to-WORKFLOW.md]
 symphony workspace before-remove [--branch <name>] [--repo <owner/name>]
+symphony init -- <command> [args...]
 symphony --version | -V
 symphony --help | -h
 ```
@@ -203,6 +204,24 @@ hooks:
   `gh` printed something).
 - It exits 0 even when closing a pull request fails. The only failure exit is for invalid options
   (`Invalid option(s): ...`, exit 1). `--help` exits 0.
+
+## `symphony init`
+
+```text
+symphony init -- <command> [args...]
+```
+
+The container image's PID 1 (its entrypoint is `symphony init -- symphony`); it replaces `tini`.
+PID 1 holds the environment the container started with, so every secret in it (API token,
+tracker tokens, LLM keys). `symphony init` first marks itself non-dumpable, so other processes of
+the same user, such as agents and hooks, cannot read its `/proc/1/environ` or memory; it refuses
+to start when that fails. It then runs the command in its own process group (handing it the
+terminal, if there is one), forwards SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 and
+SIGWINCH to it, reaps every child that ends (orphans included), and exits with the command's
+status (`128 + n` when signal `n` ended it). It exits 1 when the command cannot be started.
+
+Do not put another init in front of it (Docker's `--init`, Compose `init: true`): that init would
+hold the same environment, readable.
 
 ## Examples
 

@@ -93,7 +93,7 @@ fn task_context(repo: Option<&str>) -> (WorkerContext, mpsc::UnboundedReceiver<C
     let (tx, rx) = mpsc::unbounded_channel();
     let mut ctx = WorkerContext::standalone(Issue {
         id: Some("task:7".into()),
-        identifier: Some("TASK-7".into()),
+        identifier: Some("task-7".into()),
         title: Some("A task".into()),
         state: Some("task".into()),
         ..Issue::default()
@@ -108,9 +108,11 @@ fn task_context(repo: Option<&str>) -> (WorkerContext, mpsc::UnboundedReceiver<C
     (ctx, rx)
 }
 
+/// `<root>/.tasks/7`: a task's workspace (never a tracker identifier's).
 fn workspace(s: &Setup) -> PathBuf {
     s.wf.workspace_root()
-        .join(symphony_core::workspace_key(Some("TASK-7")))
+        .join(symphony_runtime::workspace::TASK_WORKSPACES)
+        .join("7")
 }
 
 fn trace_value(trace: &str, key: &str) -> String {

@@ -71,15 +71,16 @@ impl ApiProvider {
 /// How the API loop's `shell` tool is confined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
-    /// `bubblewrap` on Linux or `sandbox-exec` on macOS when installed; otherwise `shell` refuses
-    /// to run (set `none` to run unconfined, e.g. inside a container that is the sandbox).
+    /// `bubblewrap` when installed; otherwise `shell` refuses to run. Never seatbelt.
     Auto,
-    /// Linux `bwrap`: read-only root, writable workspace and `/tmp`, no network unless allowed.
+    /// Linux `bwrap`: only system directories bound read-only, writable workspace and private
+    /// `/tmp`, new namespaces, no network unless allowed. The production sandbox.
     Bubblewrap,
-    /// macOS `sandbox-exec` profile: writes only to the workspace and temp dirs, no network
-    /// unless allowed.
+    /// macOS `sandbox-exec`, for development only, so it needs `unconfined: true`: it limits
+    /// writes and the network, but reads are unrestricted and a copied launcher escapes it.
     Seatbelt,
-    /// No confinement beyond the workspace cwd and a filtered environment.
+    /// No confinement beyond the workspace cwd and a filtered environment; needs
+    /// `unconfined: true`. A container is no sandbox for this: Symphony and its secrets run in it.
     None,
 }
 
@@ -392,6 +393,25 @@ fn cast_claude(entry: &Entry<'_>, errors: &mut Errors) -> ClaudeCodeSettings {
     out.max_turns = entry.positive_u32("max_turns", errors);
     out.api_key_env = entry.env_name("api_key_env", errors);
     out.extra_args = entry.list("extra_args", errors).unwrap_or_default();
+    // Symphony pins where Claude Code reads settings and MCP servers from (a cloned repository
+    // must not configure them); bypassing permissions goes through `permission_mode`.
+    const PINNED: [&str; 5] = [
+        "--setting-sources",
+        "--settings",
+        "--mcp-config",
+        "--strict-mcp-config",
+        "--dangerously-skip-permissions",
+    ];
+    if out.extra_args.iter().any(|arg| {
+        PINNED
+            .iter()
+            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    }) {
+        errors.push(
+            &entry.key("extra_args"),
+            "must not set --setting-sources, --settings, --mcp-config, --strict-mcp-config or --dangerously-skip-permissions",
+        );
+    }
     out
 }
 
@@ -500,6 +520,33 @@ fn cast_api(
             SandboxMode::Auto
         }
     };
+    // A shell that is not confined must be chosen knowingly. Under `none` it reaches the network
+    // (whatever `network` says) and every file and process environment Symphony can read; under
+    // seatbelt it reads every file and can escape through a copied launcher.
+    let unconfined = entry.boolean("unconfined", errors).unwrap_or(false);
+    let network = entry.boolean("network", errors);
+    match (sandbox, unconfined) {
+        (SandboxMode::None, false) => errors.push(
+            &entry.key("sandbox"),
+            "none needs unconfined: true (commands then have network access and Symphony's own file and environment access)",
+        ),
+        (SandboxMode::Seatbelt, false) => errors.push(
+            &entry.key("sandbox"),
+            "seatbelt needs unconfined: true (macOS development only: it does not limit reads, and a copied launcher escapes it)",
+        ),
+        (SandboxMode::None | SandboxMode::Seatbelt, true) => {}
+        (_, true) => errors.push(
+            &entry.key("unconfined"),
+            "only applies to sandbox: none or seatbelt",
+        ),
+        (_, false) => {}
+    }
+    if sandbox == SandboxMode::None && network == Some(false) {
+        errors.push(
+            &entry.key("network"),
+            "false cannot be enforced with sandbox: none (its commands always have network access)",
+        );
+    }
     let temperature = match entry.get("temperature") {
         None => None,
         Some(value) => match cast_number(value) {
@@ -559,7 +606,7 @@ fn cast_api(
                     .map_or(600_000, |s| s.saturating_mul(1000))
             }),
         sandbox,
-        network: entry.boolean("network", errors).unwrap_or(false),
+        network: network.unwrap_or(false),
         shell_timeout_ms: entry
             .positive("shell_timeout_ms", errors)
             .unwrap_or(600_000),
@@ -666,12 +713,26 @@ pub(crate) fn cast_backends(
     out
 }
 
-/// Env var names that hold host-side API keys of `api` backends (removed from every child).
+/// Env var names that hold the API keys of `api` and `claude_code` backends: removed from every
+/// child (the `claude_code` backend hands its key to Claude Code as `ANTHROPIC_API_KEY` itself)
+/// and redacted. Codex's `codex.provider.api_key_env` is not listed: Codex reads it itself.
 pub fn backend_secret_environment_names(
     backends: &BTreeMap<String, BackendSettings>,
 ) -> Vec<String> {
     env::uniq(backends.values().filter_map(|b| match &b.kind {
         BackendKind::Api(api) => api.api_key_env.clone(),
-        _ => None,
+        BackendKind::ClaudeCode(claude) => claude.api_key_env.clone(),
+        BackendKind::Codex => None,
     }))
+}
+
+/// Files holding the API keys of `api` backends (their contents are redacted).
+pub fn backend_secret_files(backends: &BTreeMap<String, BackendSettings>) -> Vec<PathBuf> {
+    backends
+        .values()
+        .filter_map(|b| match &b.kind {
+            BackendKind::Api(api) => api.api_key_file.clone(),
+            _ => None,
+        })
+        .collect()
 }

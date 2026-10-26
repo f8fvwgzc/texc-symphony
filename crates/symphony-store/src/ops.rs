@@ -265,6 +265,10 @@ pub(crate) fn list_runs(db: &mut dyn Db, query: &RunQuery) -> Result<RunPage> {
         values.push(Val::Text(identifier.clone()));
         clauses.push(format!("issue_identifier = ?{}", values.len()));
     }
+    if let Some(issue_id) = &query.issue_id {
+        values.push(Val::Text(issue_id.clone()));
+        clauses.push(format!("issue_id = ?{}", values.len()));
+    }
     if let Some(status) = query.status {
         values.push(Val::Text(status.as_str().to_string()));
         clauses.push(format!("status = ?{}", values.len()));
