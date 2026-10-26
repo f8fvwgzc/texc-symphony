@@ -66,6 +66,7 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Run(invocation)) => run(invocation),
+        Ok(Command::Init { command }) => crate::init::run(&command),
         Ok(Command::AgentTools { socket }) => {
             #[cfg(unix)]
             let served = tokio::runtime::Builder::new_current_thread()
@@ -111,7 +112,8 @@ fn fail(message: &str) -> ExitCode {
 
 /// Boots Symphony for a validated invocation and blocks until it stops.
 pub fn run(invocation: Invocation) -> ExitCode {
-    crate::hardening::protect_secrets();
+    // Before anything reads a secret; a failure is logged once logging is up.
+    let protected = crate::hardening::protect_secrets();
     let workflow_path = invocation.workflow.display().to_string();
     let workflow = match WorkflowStore::start(Some(invocation.workflow.clone())) {
         Ok(workflow) => workflow,
@@ -130,6 +132,9 @@ pub fn run(invocation: Invocation) -> ExitCode {
     let dashboard_enabled = workflow.settings().observability.dashboard_enabled && stdout_is_tty;
     let console = (!dashboard_enabled).then_some(console_format);
     let logging = logging::init(&invocation.logs_root, console);
+    if let Err(err) = protected {
+        tracing::warn!("Failed to mark the process non-dumpable: {err}");
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

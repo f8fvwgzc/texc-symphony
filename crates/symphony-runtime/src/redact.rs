@@ -15,10 +15,13 @@
 //! event log, it does not make printing secrets safe.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::Value;
+use symphony_core::config::SecretSource;
+use symphony_core::config::llm::{LLM_API_KEY_FILE, LLM_GATEWAY_TOKEN_FILE};
 use symphony_core::{EnvSource, Settings};
 
 /// Replacement text for a redacted secret.
@@ -109,24 +112,20 @@ impl Redactor {
             .secret_environment_names()
             .into_iter()
             .filter_map(|name| env.var(&name));
-        // The LLM contract's credential and `api` backend keys may live in files (mounted Secrets).
-        let llm = settings
-            .llm
-            .as_ref()
-            .and_then(|llm| llm.credential())
-            .and_then(|source| source.read(env).ok());
+        // The LLM contract's key files (read whether or not the contract is on) and `api` backend
+        // keys may live in files (mounted Secrets).
+        let llm_files = [LLM_API_KEY_FILE, LLM_GATEWAY_TOKEN_FILE]
+            .into_iter()
+            .filter_map(|name| env.var(name))
+            .map(|path| PathBuf::from(path.trim()));
         let files = symphony_core::config::backend::backend_secret_files(&settings.backends)
             .into_iter()
-            .filter_map(|path| {
-                symphony_core::config::SecretSource::File(path)
-                    .read(env)
-                    .ok()
-            });
+            .chain(llm_files)
+            .filter_map(|path| SecretSource::File(path).read(env).ok());
         Self::new(
             from_env
                 .chain(settings.tracker.api_key.clone())
                 .chain(settings.server.api_token.clone())
-                .chain(llm)
                 .chain(files),
         )
     }
@@ -313,6 +312,31 @@ mod tests {
         let redactor = Redactor::from_settings(&settings, &env);
         assert_eq!(
             redactor.redact_str("claude-key-0123456789 file-key-0123456789"),
+            "[REDACTED] [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn stray_llm_keys_are_stripped_and_redacted_while_the_contract_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("gateway-token");
+        std::fs::write(&token_file, "stray-gateway-token-0123\n").unwrap();
+        // No LLM_PROVIDER or LLM_GATEWAY_URL: the contract is off.
+        let env = MapEnv::new()
+            .with("LLM_API_KEY", "stray-llm-key-0123456789")
+            .with("LLM_GATEWAY_TOKEN_FILE", token_file.display().to_string());
+        let settings = symphony_core::config::parse(&serde_json::Map::new(), &env).unwrap();
+        assert!(settings.llm.is_none());
+        let names = settings.secret_environment_names();
+        for name in ["LLM_API_KEY", "LLM_API_KEY_FILE", "LLM_GATEWAY_TOKEN_FILE"] {
+            assert!(
+                names.contains(&name.to_owned()),
+                "{name} stripped: {names:?}"
+            );
+        }
+        let redactor = Redactor::from_settings(&settings, &env);
+        assert_eq!(
+            redactor.redact_str("stray-llm-key-0123456789 stray-gateway-token-0123"),
             "[REDACTED] [REDACTED]"
         );
     }

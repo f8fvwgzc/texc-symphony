@@ -182,3 +182,53 @@ fn claude_code_extra_args_cannot_unpin_settings_or_mcp() {
     parse(json!({"backends": {"cc": {"kind": "claude_code", "extra_args": ["--add-dir", "/x"]}}}))
         .unwrap();
 }
+
+#[test]
+fn an_unconfined_shell_must_be_acknowledged() {
+    let api = |extra: Value| {
+        let mut entry = json!({"kind": "api", "provider": "openai", "model": "m"});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"backends": {"a": entry}})
+    };
+    for (extra, fragment) in [
+        (
+            json!({"sandbox": "none"}),
+            "backends.a.sandbox none needs unconfined: true",
+        ),
+        (
+            json!({"sandbox": "none", "network": false}),
+            "backends.a.sandbox none needs unconfined: true",
+        ),
+        // An explicit `network: false` would be silently ignored.
+        (
+            json!({"sandbox": "none", "unconfined": true, "network": false}),
+            "backends.a.network false cannot be enforced with sandbox: none",
+        ),
+        (
+            json!({"sandbox": "seatbelt"}),
+            "backends.a.sandbox seatbelt needs unconfined: true",
+        ),
+        (
+            json!({"unconfined": true}),
+            "backends.a.unconfined only applies to sandbox: none or seatbelt",
+        ),
+        (
+            json!({"sandbox": "bubblewrap", "unconfined": true}),
+            "backends.a.unconfined only applies to sandbox: none or seatbelt",
+        ),
+    ] {
+        let message = invalid(api(extra.clone()));
+        assert!(message.contains(fragment), "{extra}: {message}");
+    }
+    for extra in [
+        json!({"sandbox": "none", "unconfined": true}),
+        json!({"sandbox": "seatbelt", "unconfined": true, "network": false}),
+        json!({"sandbox": "bubblewrap", "network": false}),
+        json!({}),
+    ] {
+        assert!(parse(api(extra.clone())).is_ok(), "{extra}");
+    }
+}

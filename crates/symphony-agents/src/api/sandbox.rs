@@ -9,7 +9,7 @@
 //! * **seatbelt** (macOS `sandbox-exec`, development only, never picked by `auto`): file writes
 //!   only to the workspace and temp directories, network denied unless allowed, a few launchers
 //!   denied by path. Reads are unrestricted and a copied launcher escapes it: not a security
-//!   boundary.
+//!   boundary, so it needs `unconfined: true` on the backend.
 //! * **none**: no confinement; needs `unconfined: true` on the backend.
 //!
 //! `auto` picks bubblewrap and refuses without it.
@@ -58,8 +58,8 @@ pub fn resolve(mode: SandboxMode) -> Result<Confinement, String> {
             Err(
                 "the shell tool needs a sandbox: install bubblewrap (`bwrap`, Linux, with \
                  unprivileged user namespaces). For development on macOS set `sandbox: \
-                 seatbelt` (not a security boundary); `sandbox: none` with `unconfined: true` \
-                 runs commands with Symphony's own access"
+                 seatbelt` with `unconfined: true` (not a security boundary); `sandbox: none` \
+                 with `unconfined: true` runs commands with Symphony's own access"
                     .into(),
             )
         }

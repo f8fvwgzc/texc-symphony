@@ -71,15 +71,16 @@ impl ApiProvider {
 /// How the API loop's `shell` tool is confined.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
-    /// `bubblewrap` on Linux or `sandbox-exec` on macOS when installed; otherwise `shell` refuses
-    /// to run (set `none` to run unconfined, e.g. inside a container that is the sandbox).
+    /// `bubblewrap` when installed; otherwise `shell` refuses to run. Never seatbelt.
     Auto,
-    /// Linux `bwrap`: read-only root, writable workspace and `/tmp`, no network unless allowed.
+    /// Linux `bwrap`: only system directories bound read-only, writable workspace and private
+    /// `/tmp`, new namespaces, no network unless allowed. The production sandbox.
     Bubblewrap,
-    /// macOS `sandbox-exec` profile: writes only to the workspace and temp dirs, no network
-    /// unless allowed.
+    /// macOS `sandbox-exec`, for development only, so it needs `unconfined: true`: it limits
+    /// writes and the network, but reads are unrestricted and a copied launcher escapes it.
     Seatbelt,
-    /// No confinement beyond the workspace cwd and a filtered environment.
+    /// No confinement beyond the workspace cwd and a filtered environment; needs
+    /// `unconfined: true`. A container is no sandbox for this: Symphony and its secrets run in it.
     None,
 }
 
@@ -519,17 +520,32 @@ fn cast_api(
             SandboxMode::Auto
         }
     };
-    // No confinement must be chosen knowingly: the shell then reaches the network (whatever
-    // `network` says) and every file and process environment Symphony can read.
+    // A shell that is not confined must be chosen knowingly. Under `none` it reaches the network
+    // (whatever `network` says) and every file and process environment Symphony can read; under
+    // seatbelt it reads every file and can escape through a copied launcher.
     let unconfined = entry.boolean("unconfined", errors).unwrap_or(false);
+    let network = entry.boolean("network", errors);
     match (sandbox, unconfined) {
         (SandboxMode::None, false) => errors.push(
             &entry.key("sandbox"),
             "none needs unconfined: true (commands then have network access and Symphony's own file and environment access)",
         ),
-        (SandboxMode::None, true) => {}
-        (_, true) => errors.push(&entry.key("unconfined"), "only applies to sandbox: none"),
+        (SandboxMode::Seatbelt, false) => errors.push(
+            &entry.key("sandbox"),
+            "seatbelt needs unconfined: true (macOS development only: it does not limit reads, and a copied launcher escapes it)",
+        ),
+        (SandboxMode::None | SandboxMode::Seatbelt, true) => {}
+        (_, true) => errors.push(
+            &entry.key("unconfined"),
+            "only applies to sandbox: none or seatbelt",
+        ),
         (_, false) => {}
+    }
+    if sandbox == SandboxMode::None && network == Some(false) {
+        errors.push(
+            &entry.key("network"),
+            "false cannot be enforced with sandbox: none (its commands always have network access)",
+        );
     }
     let temperature = match entry.get("temperature") {
         None => None,
@@ -590,7 +606,7 @@ fn cast_api(
                     .map_or(600_000, |s| s.saturating_mul(1000))
             }),
         sandbox,
-        network: entry.boolean("network", errors).unwrap_or(false),
+        network: network.unwrap_or(false),
         shell_timeout_ms: entry
             .positive("shell_timeout_ms", errors)
             .unwrap_or(600_000),

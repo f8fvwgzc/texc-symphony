@@ -6,9 +6,14 @@
 //!
 //! ```text
 //! <command> -p --output-format stream-json --verbose [--model M] --permission-mode MODE
-//!   [--allowedTools T...] [--disallowedTools T...] [--max-turns N]
-//!   [--append-system-prompt S] [--resume SESSION] [extra_args...]
+//!   --setting-sources user --strict-mcp-config [--allowedTools T...] [--disallowedTools T...]
+//!   [--max-turns N] [--append-system-prompt S] [--mcp-config FILE] [--resume SESSION]
+//!   [extra_args...]
 //! ```
+//!
+//! `--setting-sources user --strict-mcp-config` are always there, so a cloned repository's
+//! `.claude/settings.json` or `.mcp.json` cannot widen the permissions; `extra_args` may not set
+//! them, `--settings`, `--mcp-config` or `--dangerously-skip-permissions` (refused at config load).
 //!
 //! The prompt goes to stdin. The first turn starts a new Claude session; its id (from the `init`
 //! or `result` message) is passed as `--resume` on later turns, so a multi-turn run keeps its
@@ -19,9 +24,9 @@
 //! a dropped turn kills its whole process group.
 //!
 //! The tracker's scoped tools reach Claude Code through MCP ([`crate::mcp`]): when the session
-//! has tools, each turn also gets `--mcp-config <file> --strict-mcp-config` (a `symphony
-//! agent-tools` server relaying to this process) and the `mcp__symphony__<tool>` names in
-//! `--allowedTools`. The tracker token stays in Symphony.
+//! has tools, each turn also gets `--mcp-config <file>` (a `symphony agent-tools` server
+//! relaying to this process) and the `mcp__symphony__<tool>` names in `--allowedTools`. The
+//! tracker token stays in Symphony.
 //!
 //! Not supported yet: SSH workers (`agent_backend_unsupported`).
 

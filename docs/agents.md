@@ -100,8 +100,8 @@ were made (`agent_limit_exceeded`). The conversation persists across the turns o
 | `stream` | `true` | `false` for servers with broken streaming. |
 | `request_timeout_ms` | `600000` | One model request. |
 | `sandbox` | `auto` | `shell` confinement: `auto` (= `bubblewrap`), `bubblewrap`, `seatbelt` (macOS development only), `none` (needs `unconfined`). |
-| `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt). |
-| `unconfined` | `false` | Must be `true` with `sandbox: none`: commands then reach the network and every file and process environment Symphony's user can read. |
+| `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt). `false` cannot be set with `sandbox: none`, which cannot enforce it. |
+| `unconfined` | `false` | Must be `true` with `sandbox: none` (commands reach the network and every file and process environment Symphony's user can read) and with `sandbox: seatbelt` (reads are not limited and the sandbox can be escaped). |
 | `shell_timeout_ms` | `600000` | One command (a smaller per-call `timeout_ms` wins). |
 
 Tools:
@@ -123,13 +123,14 @@ Tools:
     every namespace is new (user, PID with its own `/proc`, IPC, UTS, cgroup, and network
     unless `network: true`); the environment is cleared and rebuilt from `PATH`, the locale
     variables and the backend's own variables. Needs unprivileged user namespaces.
-  - `seatbelt` (macOS `sandbox-exec`): for development only, and never chosen by `auto`. It
-    limits writes and the network, but reads are unrestricted and a copied launcher (`cp
-    /bin/launchctl ./lc`) escapes it.
+  - `seatbelt` (macOS `sandbox-exec`): for development only, never chosen by `auto`, and it
+    needs `unconfined: true`. It limits writes and the network, but reads are unrestricted and a
+    copied launcher (`cp /bin/launchctl ./lc`) escapes it.
   - `auto` is `bubblewrap` and **refuses** to run commands without it.
   - `none` runs commands with Symphony's own access (files, network, the environments of
-    Symphony's user's processes) and therefore needs `unconfined: true`. A container is no
-    sandbox for this: Symphony and its secrets live in it.
+    Symphony's user's processes other than Symphony and the image's init, which are
+    non-dumpable) and therefore needs `unconfined: true`. A container is no sandbox for this:
+    Symphony, its run history and its secret files live in it.
 - `tracker`: the tracker's scoped tools (`linear_graphql`, `github_api`, ...), executed by
   Symphony with the host-side credential ([agent tool scope](configuration.md#agent-tool-scope)).
 
@@ -144,9 +145,9 @@ Each turn runs, in the workspace:
 
 ```text
 bash -lc 'exec <command> -p --output-format stream-json --verbose [--model M]
-  --permission-mode <mode> [--allowedTools ...] [--disallowedTools ...] [--max-turns N]
-  [--append-system-prompt S] [--mcp-config <file> --strict-mcp-config] [--resume <session>]
-  [extra_args...]'
+  --permission-mode <mode> --setting-sources user --strict-mcp-config [--allowedTools ...]
+  [--disallowedTools ...] [--max-turns N] [--append-system-prompt S] [--mcp-config <file>]
+  [--resume <session>] [extra_args...]'
 ```
 
 with the prompt on stdin. The first turn starts a session; later turns resume it.
@@ -158,10 +159,10 @@ with the prompt on stdin. The first turn starts a session; later turns resume it
 | `permission_mode` | `acceptEdits` | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`. |
 | `max_turns` | CLI default | `--max-turns` per Symphony turn. |
 | `api_key_env` | none | Passed to Claude Code as `ANTHROPIC_API_KEY`; without it Claude Code uses its own login. |
-| `extra_args` | `[]` | Appended verbatim. |
+| `extra_args` | `[]` | Appended verbatim, except that `--setting-sources`, `--settings`, `--mcp-config`, `--strict-mcp-config` and `--dangerously-skip-permissions` are refused. |
 
 Tracker tools reach Claude Code through MCP: Symphony serves them on a private Unix socket and
-points Claude at `symphony agent-tools --socket <path>` (`--strict-mcp-config`), adding
+points Claude at `symphony agent-tools --socket <path>` (`--mcp-config`), adding
 `mcp__symphony__<tool>` to `--allowedTools`. Calls run inside Symphony with the scoped tool
 handler, so the tracker token never reaches Claude. Claude Code's own `Bash` tool is not
 sandboxed by Symphony: keep `allowed_tools` narrow.

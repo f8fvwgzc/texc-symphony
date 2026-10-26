@@ -25,7 +25,7 @@ services:
     # settings in config/WORKFLOW.md, acknowledge it in compose.override.yaml (see README.md):
     #   command: ["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "/config/WORKFLOW.md"]
     restart: unless-stopped
-    init: false # the image already runs tini as PID 1
+    init: false # the image's own init (`symphony init`) is PID 1; Docker's would expose the secrets
     env_file:
       - path: .env
         required: false

@@ -270,8 +270,10 @@ What the contract configures:
 | Claude Code (`claude_code`) | For `anthropic` and gateway mode (Claude Code speaks only Anthropic Messages): `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` (provider) or `ANTHROPIC_AUTH_TOKEN` (gateway; a stray `ANTHROPIC_API_KEY` is then removed), `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `API_TIMEOUT_MS`, and the backend's `model`. Claude Code has no retry setting. | the backend's `api_key_env`, `model` |
 
 Secrets: `LLM_API_KEY`, `LLM_API_KEY_FILE` and `LLM_GATEWAY_TOKEN_FILE` are removed from every
-agent child environment; the credential's value is redacted in recorded events; the key files read
-as empty inside the `api` backend's bubblewrap sandbox and are unreadable under seatbelt. The API
+agent child environment, and the key (the variable's value, or the file's contents) is redacted
+in recorded events, also while the contract is off (a stray `LLM_API_KEY` in a shared
+environment). The key files read as empty inside the `api` backend's bubblewrap sandbox; seatbelt
+only refuses direct reads of them, and a command can escape it (development only). The API
 loop keeps the key in Symphony's process. Codex and Claude Code call the model themselves, so they
 receive the credential; prefer gateway mode, whose token is the only secret they then see.
 
