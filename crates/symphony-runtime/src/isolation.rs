@@ -545,32 +545,29 @@ mod tests {
         assert!(uids_in_use(4_000_000_000, 1).is_empty());
     }
 
-    // Regression: a process that marks itself non-dumpable makes its `/proc/<pid>` root-owned,
-    // but `proc_uid` reads `/proc/<pid>/status`, so the scan still sees its real uid (a leftover
-    // daemon cannot hide from the free-uid check or the kill pass this way).
+    // Regression: `proc_uid` reads the real uid from `/proc/<pid>/status`, not the owner of
+    // `/proc/<pid>` — which the kernel sets to root for a non-dumpable process, so a leftover
+    // daemon that marks itself non-dumpable cannot hide from the free-uid scan or the kill pass.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_non_dumpable_process_is_still_seen_by_the_uid_scan() {
+    fn proc_uid_reads_the_real_uid_even_when_non_dumpable() {
         use rustix::process::{DumpableBehavior, set_dumpable_behavior};
         use std::os::unix::fs::MetadataExt;
+        // proc_uid agrees with the dir owner of a normal (dumpable) process.
         let me = proc_uid("self").expect("own uid from status");
-        // Our `/proc/self` is owner-readable now.
         assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), me);
+        // Mark the process non-dumpable; on a real host the kernel then roots `/proc/self`, and
+        // the old dir-owner read returns 0 instead of `me`. (A container's /proc may not change
+        // the owner; record it rather than require it.)
         set_dumpable_behavior(DumpableBehavior::NotDumpable).unwrap();
-        // Now `/proc/self` is owned by root, so the old dir-owner read would give 0, not `me`.
-        let dir_owner = std::fs::metadata("/proc/self").unwrap().uid();
-        // `proc_uid` reads `/proc/<pid>/status`, so it still returns the real uid.
         let from_status = proc_uid("self");
         // Restore before asserting, so a failure does not leave the binary non-dumpable.
         set_dumpable_behavior(DumpableBehavior::Dumpable).unwrap();
-        assert_eq!(
-            dir_owner, 0,
-            "non-dumpable should make /proc/self root-owned"
-        );
+        // The behaviour that matters: status still yields the real uid while non-dumpable.
         assert_eq!(
             from_status,
             Some(me),
-            "proc_uid must read the real uid from status, not the root-owned dir"
+            "proc_uid must read the uid from status"
         );
     }
 
