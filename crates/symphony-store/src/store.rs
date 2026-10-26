@@ -453,17 +453,19 @@ impl Store {
         )
     }
 
-    /// Extends `owner`'s leases on `keys` by `ttl`; returns how many it still held.
+    /// Extends `owner`'s leases on `keys` by `ttl`; returns the keys it still held (all of them
+    /// without a database: there is nobody to lose them to).
     pub fn renew_leases(
         &self,
         owner: impl Into<String>,
         keys: Vec<String>,
         ttl: Duration,
-    ) -> Pending<u64> {
+    ) -> Pending<Vec<String>> {
         let (owner, now) = (owner.into(), Utc::now());
+        let all = keys.clone();
         self.submit(
             "renew_leases",
-            || 0,
+            move || all,
             move |conn| leases::renew(conn, &owner, &keys, now, ttl),
         )
     }

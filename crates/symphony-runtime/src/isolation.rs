@@ -4,7 +4,7 @@
 //! |---|---|
 //! | Own uid per task (`task_uids`) | the workspace (`0700`) and `<workspace>/.home` belong to the task uid; the clone, Codex, Claude Code and the api shell run as it; the api file tools hand what they write to it. Needs root: without it the run fails with `isolation_unavailable`. |
 //! | Short-lived repository credentials (`github_app`) | a GitHub App installation token scoped to the task's repository ([`crate::credentials`]), given to the clone and the agent through the environment only (never argv), redacted from the run's events; the operator's own tokens stay stripped. |
-//! | Default-deny network (`network.mode: deny`) | an [`EgressProxy`] allowing only the repository's git host on 443, the LLM gateway and `network.allow`. The api backend's sandboxed shell cannot bypass it (bubblewrap: empty network namespace + shim; seatbelt: everything but the proxy port denied); Codex and Claude Code only get proxy variables, so the pod's NetworkPolicy is the boundary for them. |
+//! | Default-deny network (`network.mode: deny`) | an [`EgressProxy`] allowing only the repository's git host on 443, the LLM gateway and `network.allow`. No task process can bypass it: the api shell (bubblewrap: empty network namespace + shim; seatbelt: everything but the proxy port denied) and Codex, Claude Code and an unconfined shell in the network jail (`symphony_agents::egress::network_jail`); where the jail cannot run they do not start. |
 //!
 //! Every task process gets `HOME=<workspace>/.home`, so the operator's `~/.gitconfig`, `gh` login
 //! or agent logins are never visible to a task. SSH workers are not supported.

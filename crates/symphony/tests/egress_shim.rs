@@ -1,6 +1,7 @@
 //! `symphony egress-shim` end to end: the real binary relays a command's traffic to a task's
-//! egress proxy, also from inside a bubblewrap sandbox without a network (Linux, when bubblewrap
-//! can create namespaces here).
+//! egress proxy, also from inside a bubblewrap sandbox without a network and from the network
+//! jail Codex and Claude Code run in (Linux, when bubblewrap can create namespaces here; CI
+//! requires it with `SYMPHONY_REQUIRE_SANDBOX`).
 
 #![cfg(unix)]
 
@@ -81,7 +82,7 @@ async fn the_binary_relays_a_command_through_the_proxy() {
 }
 
 fn bwrap_usable(bwrap: &Path) -> bool {
-    Command::new(bwrap)
+    let usable = Command::new(bwrap)
         .args([
             "--ro-bind",
             "/",
@@ -93,7 +94,11 @@ fn bwrap_usable(bwrap: &Path) -> bool {
         ])
         .args(["--proc", "/proc", "--", "true"])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    if !usable && std::env::var_os("SYMPHONY_REQUIRE_SANDBOX").is_some_and(|v| !v.is_empty()) {
+        panic!("SYMPHONY_REQUIRE_SANDBOX is set but bubblewrap cannot create namespaces here");
+    }
+    usable
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -125,7 +130,8 @@ async fn a_bubblewrap_shell_reaches_only_the_proxy() {
             None,
             &[],
             &[],
-        );
+        )
+        .unwrap();
         output(command.into_std())
     };
     let curl = "curl -sS --fail --max-time 10";
@@ -136,4 +142,53 @@ async fn a_bubblewrap_shell_reaches_only_the_proxy() {
     assert!(!out.status.success(), "refused by the proxy: {out:?}");
     let out = run(format!("{curl} --noproxy '*' http://{other}/")).await;
     assert!(!out.status.success(), "no route around the proxy: {out:?}");
+}
+
+/// What Codex and Claude Code run under when a task's network is default-deny: no file sandbox,
+/// but no route out except the proxy (not with `--noproxy`, not straight to the address).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jailed_agent_process_reaches_only_the_proxy() {
+    let (Some(bwrap), Some(_)) = (find_executable("bwrap"), find_executable("curl")) else {
+        eprintln!("skipped: bwrap or curl is not installed");
+        return;
+    };
+    if !bwrap_usable(&bwrap) {
+        eprintln!("skipped: bubblewrap cannot create namespaces here");
+        return;
+    }
+    let allowed = http_server().await;
+    let other = http_server().await;
+    let proxy = proxy_allowing(allowed).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+    let jail = symphony_agents::egress::network_jail(
+        &proxy.route(),
+        Some(Path::new(SYMPHONY)),
+        &workspace,
+    )
+    .unwrap();
+    let run = |script: String| {
+        let mut command = Command::new(&jail[0]);
+        command.args(&jail[1..]).args(["bash", "-c"]).arg(script);
+        output(command)
+    };
+    let curl = "curl -sS --fail --max-time 10";
+    let out = run(format!("{curl} http://{allowed}/")).await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    let out = run(format!("{curl} http://{other}/")).await;
+    assert!(!out.status.success(), "refused by the proxy: {out:?}");
+    let out = run(format!("{curl} --noproxy '*' http://{allowed}/")).await;
+    assert!(
+        !out.status.success(),
+        "no route around the proxy, even to an allowed host: {out:?}"
+    );
+    // Only the network is confined: the agent works in its directory on the host's files.
+    let out = run(format!("pwd; test -x {SYMPHONY} && touch made-in-the-jail")).await;
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        workspace.display().to_string()
+    );
+    assert!(workspace.join("made-in-the-jail").exists());
 }

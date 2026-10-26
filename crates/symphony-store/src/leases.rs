@@ -32,25 +32,29 @@ pub(crate) fn acquire(
     Ok(changed > 0)
 }
 
-/// Extends `owner`'s leases on `keys` to `now + ttl`; returns how many it still held.
+/// Extends `owner`'s leases on `keys` to `now + ttl`; returns the keys it still held (a key
+/// whose lease expired and was taken by another owner is missing).
 pub(crate) fn renew(
     db: &mut dyn Db,
     owner: &str,
     keys: &[String],
     now: DateTime<Utc>,
     ttl: std::time::Duration,
-) -> Result<u64> {
+) -> Result<Vec<String>> {
     if keys.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let expires_at = expiry(now, ttl);
     in_transaction(db, |db| {
-        let mut held = 0;
+        let mut held = Vec::with_capacity(keys.len());
         for key in keys {
-            held += db.execute(
+            let renewed = db.execute(
                 "UPDATE leases SET expires_at = ?1 WHERE key = ?2 AND owner = ?3",
                 &vals![expires_at, key.as_str(), owner],
             )?;
+            if renewed > 0 {
+                held.push(key.clone());
+            }
         }
         Ok(held)
     })

@@ -129,8 +129,9 @@ impl ClaudeCodeBackend {
         self
     }
 
-    /// The executable whose `agent-tools` subcommand serves the tracker tools (default: the
-    /// running executable, which is `symphony` in production); `None` disables the bridge.
+    /// The `symphony` executable whose `agent-tools` subcommand serves the tracker tools and
+    /// whose `egress-shim` subcommand relays a jailed task's traffic (default: the running
+    /// executable); `None` disables the bridge and refuses tasks with a default-deny network.
     pub fn with_tool_bridge(mut self, program: Option<PathBuf>) -> Self {
         self.bridge_program = program;
         self
@@ -256,13 +257,17 @@ impl AgentBackend for ClaudeCodeBackend {
         };
         // Set below rather than removed.
         secret_names.retain(|name| !llm_env.iter().any(|(set, _)| set == name));
+        // A default-deny network runs every turn in the network jail: Claude Code and the
+        // commands its tools run reach only the task's egress proxy (the shim sets the variables).
+        let launcher = match &options.egress {
+            Some(route) => {
+                crate::egress::network_jail(route, self.bridge_program.as_deref(), &workspace)
+                    .map_err(CodexError::Unsupported)?
+            }
+            None => Vec::new(),
+        };
         let relay = self.relay(&options).await;
-        // Advisory for Claude Code (it is not sandboxed by Symphony): the kernel-level boundary is
-        // the pod's NetworkPolicy.
-        let mut task_env = options.task_env.clone();
-        if let Some(route) = &options.egress {
-            task_env.extend(crate::egress::proxy_env(&route.proxy_url()));
-        }
+        let task_env = options.task_env.clone();
         Ok(Box::new(ClaudeSession {
             backend: self.settings.clone(),
             claude,
@@ -272,6 +277,7 @@ impl AgentBackend for ClaudeCodeBackend {
             env: options.env,
             task_env,
             run_as: options.run_as,
+            launcher,
             llm_env,
             thread_id: local_thread_id(),
             claude_session: None,
@@ -319,10 +325,12 @@ struct ClaudeSession {
     bash: PathBuf,
     secret_names: Vec<String>,
     env: Vec<(String, String)>,
-    /// Per-task variables (and the egress proxy's), set after the secrets are removed.
+    /// Per-task variables, set after the secrets are removed.
     task_env: Vec<(String, String)>,
     /// `(uid, gid)` the turns run as (task isolation).
     run_as: Option<(u32, u32)>,
+    /// What each turn runs under (the network jail of a task; empty otherwise).
+    launcher: Vec<std::ffi::OsString>,
     /// Model access variables (configured key or LLM contract), set last.
     llm_env: Vec<(String, String)>,
     thread_id: String,
@@ -359,7 +367,14 @@ impl ClaudeSession {
             self.claude_session.as_deref(),
             bridge,
         );
-        let mut command = Command::new(&self.bash);
+        let mut command = match self.launcher.split_first() {
+            Some((program, args)) => {
+                let mut command = Command::new(program);
+                command.args(args).arg(&self.bash);
+                command
+            }
+            None => Command::new(&self.bash),
+        };
         command
             .arg("-lc")
             .arg(local_launch_command(&line, &self.secret_names))

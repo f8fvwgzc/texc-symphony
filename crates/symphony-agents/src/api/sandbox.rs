@@ -18,7 +18,8 @@
 //! backend's `network` says: bubblewrap keeps the network namespace empty and runs the command
 //! under the egress shim (`symphony egress-shim`, see [`crate::egress`]) with the proxy's socket
 //! directory and the shim bound in; seatbelt denies the network except `localhost:<proxy port>`;
-//! `none` only sets the proxy variables (advisory).
+//! `none` runs the command in the network jail ([`crate::egress::network_jail`], Linux; the
+//! command is refused where the jail cannot run).
 
 use std::path::{Path, PathBuf};
 
@@ -27,7 +28,7 @@ use symphony_codex::launch::find_executable;
 use symphony_core::config::SandboxMode;
 use tokio::process::Command;
 
-use crate::egress::{SHIM_PORT, SHIM_SUBCOMMAND, proxy_env};
+use crate::egress::{SHIM_PORT, SHIM_SUBCOMMAND, network_jail, proxy_env};
 
 /// What network a command may use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,7 +197,8 @@ pub const PASSED_ENV: [&str; 6] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
 /// `bash -lc <script>` in `workspace` under `confinement`. stderr of bash goes to stdout (so
 /// the model sees one stream in order); the wrapper's own stderr stays separate. `tmp` is the
 /// command's private temp directory (seatbelt: the only writable temp dir besides
-/// `/private/tmp`, so the shared `$TMPDIR` of Symphony stays out of reach).
+/// `/private/tmp`, so the shared `$TMPDIR` of Symphony stays out of reach). `Err` when a
+/// default-deny network cannot be enforced for an unconfined command.
 pub fn command(
     confinement: &Confinement,
     workspace: &Path,
@@ -205,11 +207,24 @@ pub fn command(
     tmp: Option<&Path>,
     masked: &[PathBuf],
     env: &[(String, String)],
-) -> Command {
+) -> Result<Command, String> {
     let script = format!("exec 2>&1\n{script}");
     let mut command = match confinement {
         Confinement::None => {
-            let mut command = Command::new("bash");
+            // Unconfined, but a task's default-deny network still holds: the command runs in the
+            // network jail (the shim inside sets the proxy variables).
+            let mut command = match network {
+                NetworkAccess::Proxy { route, shim } => {
+                    let jail = network_jail(route, shim.as_deref(), workspace)?;
+                    let (program, args) = jail
+                        .split_first()
+                        .ok_or_else(|| "the network jail is empty".to_owned())?;
+                    let mut command = Command::new(program);
+                    command.args(args).arg("bash");
+                    command
+                }
+                _ => Command::new("bash"),
+            };
             command.arg("-lc").arg(&script);
             command
         }
@@ -294,15 +309,13 @@ pub fn command(
     if let (Some(tmp), Confinement::Seatbelt(_) | Confinement::None) = (tmp, confinement) {
         command.env("TMPDIR", tmp);
     }
-    if let (NetworkAccess::Proxy { route, .. }, Confinement::Seatbelt(_) | Confinement::None) =
-        (network, confinement)
-    {
+    if let (NetworkAccess::Proxy { route, .. }, Confinement::Seatbelt(_)) = (network, confinement) {
         for (name, value) in proxy_env(&route.proxy_url()) {
             command.env(name, value);
         }
     }
     command.current_dir(workspace);
-    command
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -349,6 +362,7 @@ mod tests {
                 &[],
                 &[("GIT_AUTHOR_NAME".to_owned(), "Agent".to_owned())],
             )
+            .unwrap()
             .as_std()
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -379,7 +393,8 @@ mod tests {
             None,
             &[],
             &[("GIT_AUTHOR_NAME".to_owned(), "Agent".to_owned())],
-        );
+        )
+        .unwrap();
         let envs: Vec<(String, Option<String>)> = command
             .as_std()
             .get_envs()
@@ -439,7 +454,8 @@ mod tests {
             None,
             &[],
             &[],
-        );
+        )
+        .unwrap();
         let joined = args(&command).join(" ");
         assert!(!joined.contains("--share-net"), "{joined}");
         assert!(
@@ -476,19 +492,73 @@ mod tests {
                 shim: Some(PathBuf::from("/s")),
             },
         ] {
-            let joined = args(&super::command(
-                &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
-                Path::new("/w"),
-                "ls",
-                &network,
-                None,
-                &[],
-                &[],
-            ))
+            let joined = args(
+                &super::command(
+                    &Confinement::Bubblewrap(PathBuf::from("/usr/bin/bwrap")),
+                    Path::new("/w"),
+                    "ls",
+                    &network,
+                    None,
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            )
             .join(" ");
             assert!(!joined.contains("--share-net"), "{joined}");
             assert!(!joined.contains("egress-shim"), "{joined}");
         }
+    }
+
+    #[test]
+    fn an_unconfined_command_with_a_default_deny_network_runs_in_the_network_jail() {
+        let network = NetworkAccess::Proxy {
+            route: route(Some("/tmp/symphony-egress-1-0/proxy.sock")),
+            shim: Some(PathBuf::from("/usr/local/bin/symphony")),
+        };
+        let command = command(
+            &Confinement::None,
+            Path::new("/w/MT-1"),
+            "git push",
+            &network,
+            None,
+            &[],
+            &[],
+        );
+        if !cfg!(target_os = "linux") || find_executable("bwrap").is_none() {
+            // No jail here: refused, never run with proxy variables alone.
+            assert!(command.unwrap_err().contains("bubblewrap"));
+            return;
+        }
+        let joined = args(&command.unwrap()).join(" ");
+        assert!(
+            joined.contains(
+                "--unshare-net --die-with-parent --chdir /w/MT-1 -- \
+                 /usr/local/bin/symphony egress-shim"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.ends_with("-- bash -lc exec 2>&1\ngit push"),
+            "{joined}"
+        );
+        // Without a shim there is nothing to relay through: refused too.
+        let no_shim = NetworkAccess::Proxy {
+            route: route(Some("/tmp/x/proxy.sock")),
+            shim: None,
+        };
+        assert!(
+            super::command(
+                &Confinement::None,
+                Path::new("/w"),
+                "ls",
+                &no_shim,
+                None,
+                &[],
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -511,7 +581,8 @@ mod tests {
             None,
             &[],
             &[],
-        );
+        )
+        .unwrap();
         let envs: Vec<(String, String)> = command
             .as_std()
             .get_envs()

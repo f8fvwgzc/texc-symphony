@@ -1021,14 +1021,15 @@ async fn leases_are_exclusive_renewable_and_expire() {
             .renew_leases("replica-a", vec!["issue-1".into(), "unheld".into()], ttl)
             .await
             .unwrap(),
-        1
+        vec!["issue-1".to_owned()],
+        "only the keys still held"
     );
     assert_eq!(
         store
             .renew_leases("replica-b", vec!["issue-1".into()], ttl)
             .await
             .unwrap(),
-        0,
+        Vec::<String>::new(),
         "renewing is for the holder only"
     );
     store.release_lease("issue-1", "replica-b").await.unwrap();

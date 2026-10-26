@@ -56,8 +56,9 @@ extraVolumeMounts: []
 #       app_id: 123456
 #       private_key_file: /var/run/secrets/github-app/private-key.pem   # via extraVolumes
 #     network: {mode: deny, allow: []}         # default deny: git host:443 + LLM gateway
-# Symphony's egress proxy confines the api backend's sandboxed shell; for Codex and Claude Code it
-# is advisory, so enable `networkPolicy` below to enforce egress at the pod level.
+# Symphony's egress proxy confines every task process (the api shell in bubblewrap, Codex and Claude
+# Code in a bubblewrap network jail), which needs a seccomp profile that allows user namespaces;
+# `networkPolicy` below adds a pod-level layer.
 
 # The platform LLM connection contract (LLM_*), shared by every core.
 global:

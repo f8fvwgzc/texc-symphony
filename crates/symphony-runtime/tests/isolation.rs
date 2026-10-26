@@ -1,5 +1,6 @@
-//! Task isolation in the agent runner: refused runs, and an isolated task's environment, token,
-//! egress proxy and redacted events, driven by a fake app-server.
+//! Task isolation in the agent runner: refused runs (also a default-deny network that cannot be
+//! enforced), and an isolated task's environment, token and redacted events, driven by a fake
+//! app-server.
 
 #![cfg(unix)]
 
@@ -33,9 +34,6 @@ trace="$SYMP_TEST_CODEX_TRACE"
   printf 'SYMPHONY_GIT_TOKEN=%s\n' "$SYMPHONY_GIT_TOKEN"
   printf 'HELPER_KEY=%s\n' "$GIT_CONFIG_KEY_1"
   printf 'HTTPS_PROXY=%s\n' "$HTTPS_PROXY"
-  if command -v curl >/dev/null 2>&1 && [ -n "$http_proxy" ]; then
-    printf 'REFUSED_STATUS=%s\n' "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://example.invalid/)"
-  fi
 } >> "$trace"
 count=0
 while IFS= read -r _line; do
@@ -60,6 +58,11 @@ struct Setup {
 }
 
 fn setup(isolation: Value) -> Setup {
+    setup_with(isolation, RunnerOptions::default().symphony_executable)
+}
+
+/// `symphony`: the executable whose `egress-shim` the network jail would run.
+fn setup_with(isolation: Value, symphony: Option<PathBuf>) -> Setup {
     let wf = TestWorkflow::new(json!({}));
     let fixture = wf.path("env_codex.sh");
     fs::write(&fixture, ENV_FIXTURE).unwrap();
@@ -83,6 +86,7 @@ fn setup(isolation: Value) -> Setup {
                 ),
             ],
             codex_stop_grace: Duration::from_millis(500),
+            symphony_executable: symphony,
             ..RunnerOptions::default()
         },
     );
@@ -199,7 +203,7 @@ fn generate_key(dir: &Path) -> Option<PathBuf> {
 }
 
 #[tokio::test]
-async fn an_isolated_task_gets_its_own_home_token_and_proxy() {
+async fn an_isolated_task_gets_its_own_home_and_token() {
     let keys = tempfile::tempdir().unwrap();
     let Some(key) = generate_key(keys.path()) else {
         eprintln!("skipped: openssl is not available");
@@ -224,7 +228,9 @@ async fn an_isolated_task_gets_its_own_home_token_and_proxy() {
             "private_key_file": key.to_string_lossy(),
             "api_url": server.uri(),
         },
-        "network": {"allow": ["pypi.org:443"]},
+        // Default-deny networking is covered by `a_task_whose_network_cannot_be_confined_...`
+        // here and, through the real jail, by the `symphony` crate's egress tests.
+        "network": {"mode": "allow"},
     }));
     // A workspace left by an earlier run of the task: no clone (and so no network) is needed.
     let ws = workspace(&s);
@@ -248,11 +254,7 @@ async fn an_isolated_task_gets_its_own_home_token_and_proxy() {
         trace_value(&trace, "HELPER_KEY"),
         "credential.https://github.com.helper"
     );
-    let proxy = trace_value(&trace, "HTTPS_PROXY");
-    assert!(proxy.starts_with("http://127.0.0.1:"), "{trace}");
-    if trace.contains("REFUSED_STATUS=") {
-        assert_eq!(trace_value(&trace, "REFUSED_STATUS"), "403", "{trace}");
-    }
+    assert_eq!(trace_value(&trace, "HTTPS_PROXY"), "", "{trace}");
     assert!(
         !trace.contains("operator-gh-token-must-not-leak"),
         "{trace}"
@@ -269,15 +271,21 @@ async fn an_isolated_task_gets_its_own_home_token_and_proxy() {
         events.iter().any(|e| e.contains("token [REDACTED]")),
         "{events:?}"
     );
+}
 
-    // The proxy lives only as long as the run.
-    let port: u16 = proxy.rsplit(':').next().unwrap().parse().unwrap();
+#[tokio::test]
+async fn a_task_whose_network_cannot_be_confined_does_not_start_its_agent() {
+    // No `symphony` executable for the shim (and, off Linux, no bubblewrap): proxy variables
+    // alone are no boundary, so the run fails before the app-server starts.
+    let s = setup_with(json!({"network": {"allow": ["pypi.org:443"]}}), None);
+    fs::create_dir_all(workspace(&s)).unwrap();
+    let (ctx, _rx) = task_context(None);
+    let err = s.runner.run(ctx).await.unwrap_err().to_string();
     assert!(
-        tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .is_err(),
-        "the egress proxy stopped with the run"
+        err.contains("bubblewrap") || err.contains("egress shim"),
+        "{err}"
     );
+    assert!(read(&s.trace).is_empty(), "the app-server never started");
 }
 
 fn task(id: i64) -> symphony_runtime::TaskSpec {

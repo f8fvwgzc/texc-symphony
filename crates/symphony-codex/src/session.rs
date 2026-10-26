@@ -63,6 +63,10 @@ pub struct StartOptions {
     /// The task's egress proxy: agent network traffic must go through it (see
     /// `symphony_agents::egress`). This crate does not interpret it; the agent backends do.
     pub egress: Option<EgressRoute>,
+    /// Program and arguments the local launch runs under (`<launcher...> bash -lc ...`), such
+    /// as the network confinement of a task (`symphony_agents::egress::network_jail`); empty for
+    /// a plain launch.
+    pub launcher: Vec<std::ffi::OsString>,
     /// How long [`AppServerSession::stop`] waits for a clean exit before killing the process group.
     pub stop_grace: Duration,
 }
@@ -101,6 +105,7 @@ impl StartOptions {
             task_env: Vec::new(),
             run_as: None,
             egress: None,
+            launcher: Vec::new(),
             stop_grace: DEFAULT_STOP_GRACE,
         }
     }
@@ -154,6 +159,12 @@ impl StartOptions {
     /// Routes agent traffic through the task's egress proxy (see [`Self::egress`]).
     pub fn with_egress(mut self, egress: Option<EgressRoute>) -> Self {
         self.egress = egress;
+        self
+    }
+
+    /// Runs the local launch under `launcher` (see [`Self::launcher`]).
+    pub fn with_launcher(mut self, launcher: Vec<std::ffi::OsString>) -> Self {
+        self.launcher = launcher;
         self
     }
 
@@ -239,6 +250,7 @@ impl AppServerSession {
             task_env,
             run_as,
             egress: _,
+            launcher,
             stop_grace,
         } = options;
         if let (Some(host), Some(_)) = (&worker_host, run_as) {
@@ -270,7 +282,14 @@ impl AppServerSession {
         let command = match &worker_host {
             None => {
                 let bash = find_executable("bash").ok_or(CodexError::BashNotFound)?;
-                let mut command = Command::new(bash);
+                let mut command = match launcher.split_first() {
+                    Some((program, args)) => {
+                        let mut command = Command::new(program);
+                        command.args(args).arg(bash);
+                        command
+                    }
+                    None => Command::new(bash),
+                };
                 command
                     .arg("-lc")
                     .arg(local_launch_command(&codex_command(&codex), &secret_names))

@@ -1935,7 +1935,7 @@ async fn replicas_never_run_the_same_issue_or_task_at_once() {
 
     // Released with the claim: the other replica may take the issue now.
     orch_a.terminate_running_issue("i-1", false, "test").await;
-    assert!(!orch_a.state.leases.contains("i-1"));
+    assert!(!orch_a.state.leases.contains_key("i-1"));
     let mut released = false;
     for _ in 0..100 {
         if store.lease_holder("i-1").await.unwrap().is_none() {
@@ -1960,6 +1960,77 @@ async fn replicas_never_run_the_same_issue_or_task_at_once() {
     );
     orch_b.terminate_running_issue("i-1", false, "test").await;
     orch_b.terminate_running_issue(&key, false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_that_lost_its_leases_stops_the_runs_and_leaves_the_task_to_the_new_owner() {
+    use symphony_store::TaskStatus;
+    let store = Store::open_in_memory().unwrap();
+    let started: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    a.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = a.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    orch.maybe_dispatch().await;
+    let key = format!("task:{}", task.id);
+    assert!(orch.state.running.contains_key("i-1"));
+    assert!(orch.state.running.contains_key(&key));
+
+    // `a` was cut off long enough for both leases to expire, and `b` took them.
+    for lease in ["i-1", key.as_str()] {
+        store.release_lease(lease, "a").await.unwrap();
+        assert!(
+            store
+                .acquire_lease(lease, "b", std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+    }
+    orch.renew_leases().await;
+    assert!(orch.state.running.is_empty(), "a stopped both runs");
+    assert!(orch.state.leases.is_empty());
+    tokio::time::sleep(ms(50)).await;
+    for lease in ["i-1", key.as_str()] {
+        assert_eq!(
+            store.lease_holder(lease).await.unwrap().as_deref(),
+            Some("b"),
+            "b's lease is left alone"
+        );
+    }
+    // The task is b's now: a did not put it back to `queued` (b runs it).
+    assert_eq!(
+        store.get_task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn a_lease_is_stopped_before_a_second_missed_renewal_could_let_it_expire() {
+    use std::collections::HashMap;
+    let renewed = tokio::time::Instant::now();
+    let leases = HashMap::from([("k".to_owned(), renewed + LEASE_TTL)]);
+    // One failed renewal is tolerated; at the second the lease would expire before the third.
+    assert!(expiring_leases(&leases, renewed + LEASE_RENEW_EVERY).is_empty());
+    assert_eq!(
+        expiring_leases(&leases, renewed + 2 * LEASE_RENEW_EVERY),
+        vec!["k".to_owned()]
+    );
+    // Stopped while the lease is still ours, with at least a renewal period to spare.
+    assert!(2 * LEASE_RENEW_EVERY + LEASE_RENEW_EVERY <= LEASE_TTL);
 }
 
 #[tokio::test(start_paused = true)]

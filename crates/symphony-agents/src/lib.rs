@@ -32,6 +32,7 @@ pub mod events;
 pub mod mcp;
 mod process;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -72,11 +73,19 @@ pub trait AgentSession: Send {
     async fn stop(self: Box<Self>);
 }
 
-/// The backend for one `backends.<name>` entry.
-pub fn backend_for(settings: &BackendSettings) -> Arc<dyn AgentBackend> {
+/// The backend for one `backends.<name>` entry. `symphony` is the executable whose helper
+/// subcommands agents use (`agent-tools`, `egress-shim`); `None` turns those helpers off (no
+/// tracker tools for Claude Code, and tasks with a default-deny network refuse to start).
+pub fn backend_for(settings: &BackendSettings, symphony: Option<PathBuf>) -> Arc<dyn AgentBackend> {
     match &settings.kind {
-        BackendKind::Codex => Arc::new(codex::CodexBackend::new(settings.clone())),
-        BackendKind::ClaudeCode(_) => Arc::new(claude::ClaudeCodeBackend::new(settings.clone())),
-        BackendKind::Api(_) => Arc::new(api::ApiBackend::new(settings.clone())),
+        BackendKind::Codex => {
+            Arc::new(codex::CodexBackend::new(settings.clone()).with_egress_shim(symphony))
+        }
+        BackendKind::ClaudeCode(_) => {
+            Arc::new(claude::ClaudeCodeBackend::new(settings.clone()).with_tool_bridge(symphony))
+        }
+        BackendKind::Api(_) => {
+            Arc::new(api::ApiBackend::new(settings.clone()).with_egress_shim(symphony))
+        }
     }
 }

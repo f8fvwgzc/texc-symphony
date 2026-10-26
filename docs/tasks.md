@@ -66,10 +66,10 @@ every task run: its own uid (`task_uids`, Symphony must run as root), `HOME` ins
 a GitHub App token scoped to its repository (`github_app`; used for the clone and given to the
 agent for `git push` and `gh`, redacted from events, valid one hour) and a default-deny network
 that reaches only the repository's git host on 443, the LLM gateway and `network.allow`. The
-network rule is enforced for the `api` backend's sandboxed shell; for Codex and Claude Code it is
-advisory and the pod's NetworkPolicy enforces it. A task that cannot be isolated as configured (no
-root for `task_uids`, an SSH worker) fails with `isolation_unavailable` rather than running
-unisolated. Tracker issues are not affected.
+network rule is enforced for every backend: the `api` shell runs in bubblewrap, Codex and Claude
+Code in a network jail (bubblewrap with the host's files but no network except the proxy). A
+task that cannot be isolated as configured (no root for `task_uids`, an SSH worker, no
+bubblewrap for the jail) fails rather than running unisolated. Tracker issues are not affected.
 
 ## Endpoints
 

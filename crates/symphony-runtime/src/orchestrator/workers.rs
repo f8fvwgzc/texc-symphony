@@ -310,6 +310,25 @@ impl Orchestrator<'_> {
         cleanup: bool,
         reason: &str,
     ) {
+        self.stop_running_issue(issue_id, cleanup, reason, true)
+            .await;
+    }
+
+    /// Stops a run whose dispatch lease is (or may soon be) another replica's: like
+    /// [`Self::terminate_running_issue`] without cleanup, but a task's record is left to the
+    /// replica that owns it now.
+    pub(crate) async fn abandon_running_issue(&mut self, issue_id: &str, reason: &str) {
+        self.stop_running_issue(issue_id, false, reason, false)
+            .await;
+    }
+
+    async fn stop_running_issue(
+        &mut self,
+        issue_id: &str,
+        cleanup: bool,
+        reason: &str,
+        release_task: bool,
+    ) {
         let Some(mut entry) = self.state.running.remove(issue_id) else {
             self.release_issue_claim(issue_id);
             return;
@@ -320,7 +339,7 @@ impl Orchestrator<'_> {
         entry
             .recorder
             .finish(RunStatus::Cancelled, Some(reason.to_owned()));
-        if let Some(task) = &entry.task {
+        if let Some(task) = entry.task.as_ref().filter(|_| release_task) {
             // Stopped from outside (kill switch, daily budget): queued again. A task that was
             // finished first (cancel, failure) is not running any more and stays as it is.
             self.task_release(task.id, reason);
@@ -363,7 +382,7 @@ impl Orchestrator<'_> {
             recorder.finish(RunStatus::Cancelled, Some("shutdown".into()));
         }
         // Another replica may take the work over now instead of after the lease TTL.
-        let held: Vec<String> = self.state.leases.iter().cloned().collect();
+        let held: Vec<String> = self.state.leases.keys().cloned().collect();
         for issue_id in held {
             self.drop_lease(&issue_id);
         }

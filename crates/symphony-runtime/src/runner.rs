@@ -21,6 +21,7 @@
 // Modified 2026-10-25: runs every backend through symphony_agents::AgentBackend; task runs (Part B).
 // Modified 2026-10-26: task isolation (uid, repository token, egress proxy).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,6 +130,9 @@ pub struct RunnerOptions {
     pub strip_hook_secrets: bool,
     /// Override of `agent.max_turns` (tests).
     pub max_turns: Option<u32>,
+    /// The `symphony` executable agents use for its helper subcommands (`agent-tools`,
+    /// `egress-shim`); default: the running executable.
+    pub symphony_executable: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -138,6 +142,7 @@ impl Default for RunnerOptions {
             codex_stop_grace: symphony_codex::DEFAULT_STOP_GRACE,
             strip_hook_secrets: true,
             max_turns: None,
+            symphony_executable: std::env::current_exe().ok(),
         }
     }
 }
@@ -346,7 +351,7 @@ impl AgentRunner {
         let backend_settings = settings
             .backend(Some(&name))
             .ok_or(RunError::UnknownBackend(name))?;
-        let backend = backend_for(&backend_settings);
+        let backend = backend_for(&backend_settings, self.options.symphony_executable.clone());
         let binding = self
             .tracker
             .bind_agent_tools(settings)

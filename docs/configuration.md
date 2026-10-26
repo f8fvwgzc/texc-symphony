@@ -463,19 +463,22 @@ What each part does:
 - **Default-deny network** (`network.mode: deny`). Symphony starts an egress proxy for the run
   that reaches only the repository's git host on port 443 (https; never 22), the LLM gateway
   (`LLM_GATEWAY_URL`) when one is configured, and `network.allow`; everything else gets `403`.
-  The `api` backend's shell cannot bypass it: under bubblewrap the command has no network
-  namespace of its own and reaches the proxy only through `symphony egress-shim`; under seatbelt
-  every connection but the proxy's loopback port is denied. This wins over the backend's
-  `network: true`. Codex, Claude Code and a `sandbox: none` shell only get `HTTPS_PROXY` and
-  friends, which is **advisory**: enforce egress for them with the pod's NetworkPolicy (the Helm
-  chart's `networkPolicy`). Codex and Claude Code reach their model through the proxy too, so
-  use the gateway or list the provider's host in `allow`.
+  Nothing in the task can bypass it: the `api` backend's bubblewrap shell has an empty network
+  namespace and reaches the proxy only through `symphony egress-shim`; Codex, Claude Code and a
+  `sandbox: none` shell run in the **network jail** (`bwrap --dev-bind / / --unshare-net` with
+  the shim inside: the host's files and tools, but no route out except the proxy, also for
+  every command they start); under seatbelt (macOS development) every connection but the
+  proxy's loopback port is denied. This wins over the backend's `network: true`. The jail needs
+  Linux and unprivileged user namespaces (the image's bubblewrap, and in Kubernetes a seccomp
+  profile that allows them, see [agents.md](agents.md#image-and-requirements)); where it cannot
+  run, the agent does not start (Codex, Claude Code) or the command is refused (`sandbox:
+  none`). Codex and Claude Code reach their model through the proxy too, so use the gateway or
+  list the provider's host in `allow`. The chart's `networkPolicy` adds a pod-level layer.
 
 Limits: SSH workers are not supported (`isolation_unavailable`); the token lives one hour and is
-not refreshed, so a longer run loses push access; network enforcement covers the `api` backend's
-sandboxed shell only (model calls of the `api` backend are made by Symphony itself and do not go
-through the proxy); the proxy listens on loopback, so on a shared host another local process
-could use a running task's allow-list.
+not refreshed, so a longer run loses push access; model calls of the `api` backend are made by
+Symphony itself and do not go through the proxy; the proxy also listens on loopback, so on a
+shared host another local process could use a running task's allow-list.
 
 ## Tracker kinds
 

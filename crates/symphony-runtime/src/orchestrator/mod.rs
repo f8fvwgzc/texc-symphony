@@ -108,6 +108,10 @@ fn spawn_pause_writer(
 pub const LEASE_TTL: Duration = Duration::from_secs(60);
 /// How often held leases are renewed (and, with a shared store, dead replicas' work recovered).
 pub const LEASE_RENEW_EVERY: Duration = Duration::from_secs(15);
+/// A run whose lease could expire within this window (the renewal after next might come too
+/// late) is stopped while the lease is still ours, so another replica never runs it at the same
+/// time: renewals may fail once, not twice in a row.
+pub const LEASE_STOP_WINDOW: Duration = Duration::from_secs(2 * LEASE_RENEW_EVERY.as_secs());
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
@@ -485,9 +489,11 @@ impl<'w> Orchestrator<'w> {
     /// Takes the dispatch lease of `issue_id` (kept while the issue is claimed). `false` when
     /// another live replica holds it or the store cannot be reached (dispatch then waits).
     pub(crate) async fn take_lease(&mut self, issue_id: &str) -> bool {
-        if self.state.leases.contains(issue_id) {
+        if self.state.leases.contains_key(issue_id) {
             return true;
         }
+        // The deadline counts from before the request: the stored expiry is no earlier.
+        let asked = Instant::now();
         match self
             .ctx
             .store
@@ -495,7 +501,9 @@ impl<'w> Orchestrator<'w> {
             .await
         {
             Ok(true) => {
-                self.state.leases.insert(issue_id.to_owned());
+                self.state
+                    .leases
+                    .insert(issue_id.to_owned(), asked + LEASE_TTL);
                 true
             }
             Ok(false) => {
@@ -511,7 +519,7 @@ impl<'w> Orchestrator<'w> {
 
     /// Gives up the lease of `issue_id` if this replica holds it.
     pub(crate) fn drop_lease(&mut self, issue_id: &str) {
-        if !self.state.leases.remove(issue_id) {
+        if self.state.leases.remove(issue_id).is_none() {
             return;
         }
         if task_id(issue_id).is_some() {
@@ -527,24 +535,44 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
-    /// Renews every held lease; with a shared store, also recovers the runs and tasks of
-    /// replicas whose leases expired. Re-arms itself.
+    /// Renews every held lease and stops the runs whose lease was lost (or, with a shared store,
+    /// could expire before a later renewal: another replica may then take it); with a shared
+    /// store, also recovers the runs and tasks of replicas whose leases expired. Re-arms itself.
     pub(crate) async fn renew_leases(&mut self) {
-        let keys: Vec<String> = self.state.leases.iter().cloned().collect();
+        let keys: Vec<String> = self.state.leases.keys().cloned().collect();
         if !keys.is_empty() {
+            let asked = Instant::now();
             match self
                 .ctx
                 .store
                 .renew_leases(self.ctx.replica_id.clone(), keys.clone(), LEASE_TTL)
                 .await
             {
-                Ok(held) if held < keys.len() as u64 => tracing::warn!(
-                    "Lost {} of {} dispatch leases (expired and taken by another replica)",
-                    keys.len() as u64 - held,
-                    keys.len()
-                ),
-                Ok(_) => {}
+                Ok(held) => {
+                    for key in &held {
+                        if let Some(deadline) = self.state.leases.get_mut(key) {
+                            *deadline = asked + LEASE_TTL;
+                        }
+                    }
+                    for key in keys.iter().filter(|key| !held.contains(key)) {
+                        tracing::warn!(
+                            "Stopping issue_id={key}: its dispatch lease expired and another \
+                             replica took it"
+                        );
+                        self.abandon_running_issue(key, "dispatch lease lost").await;
+                    }
+                }
                 Err(err) => tracing::warn!("Failed to renew dispatch leases: {err}"),
+            }
+            if self.ctx.store.is_shared() {
+                for key in expiring_leases(&self.state.leases, Instant::now()) {
+                    tracing::warn!(
+                        "Stopping issue_id={key}: its dispatch lease could not be renewed and \
+                         may expire before the next renewal"
+                    );
+                    self.abandon_running_issue(&key, "dispatch lease could not be renewed")
+                        .await;
+                }
             }
         }
         if self.ctx.store.is_shared() {
@@ -944,4 +972,18 @@ impl<'w> Orchestrator<'w> {
             spend,
         }
     }
+}
+
+/// Held leases that may expire within [`LEASE_STOP_WINDOW`] of `now`.
+pub(crate) fn expiring_leases(
+    leases: &std::collections::HashMap<String, Instant>,
+    now: Instant,
+) -> Vec<String> {
+    let mut keys: Vec<String> = leases
+        .iter()
+        .filter(|(_, deadline)| **deadline <= now + LEASE_STOP_WINDOW)
+        .map(|(key, _)| key.clone())
+        .collect();
+    keys.sort();
+    keys
 }

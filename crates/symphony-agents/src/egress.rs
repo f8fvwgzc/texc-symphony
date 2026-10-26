@@ -2,9 +2,9 @@
 //! owned by the runner, and the shim that carries a sandbox's traffic to it.
 //!
 //! ```text
-//! api shell in bubblewrap (--unshare-net)
+//! api shell in bubblewrap, codex and claude in the network jail (empty network namespace)
 //!   └ HTTPS_PROXY=http://127.0.0.1:3128 ─▶ egress-shim ─Unix socket─▶ EgressProxy ─▶ allowed host:port
-//! api shell in seatbelt (network denied except localhost:<port>), codex, claude
+//! api shell in seatbelt (network denied except localhost:<port>)
 //!   └ HTTPS_PROXY=http://127.0.0.1:<port> ─────────────────────────▶ EgressProxy ─▶ allowed host:port
 //! ```
 //!
@@ -18,10 +18,15 @@
 //!   bubblewrap sandbox, whose network namespace is empty: it listens on `127.0.0.1:P` there,
 //!   relays every connection to the proxy's socket, and runs `CMD` with the proxy variables.
 //!
-//! Enforcement differs by process: the sandboxed api shell has no other route out (bubblewrap)
-//! or is denied every other connection by the kernel (seatbelt). Codex, Claude Code and an
-//! unconfined shell (`sandbox: none`) only get the proxy variables, which well-behaved clients
-//! honour: there the boundary is the pod's NetworkPolicy.
+//! * [`network_jail`] is the launch prefix for Codex and Claude Code: bubblewrap with the host's
+//!   file system but an empty network namespace, and the shim inside, so the agent and every
+//!   command it runs have no route out but the proxy. It needs Linux and unprivileged user
+//!   namespaces; without them a task with a default-deny network does not start.
+//!
+//! Enforcement: the sandboxed api shell and the jailed Codex and Claude Code have no other route
+//! out (an empty network namespace), and seatbelt denies every other connection in the kernel
+//! (macOS development). Only an unconfined api shell (`sandbox: none`) is left with the proxy
+//! variables alone.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -30,11 +35,56 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use symphony_codex::EgressRoute;
+use symphony_codex::launch::find_executable;
 use symphony_core::config::HostPort;
 use symphony_core::config::isolation::url_host_port;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
+
+/// The launch prefix that confines a whole agent process (Codex, Claude Code) of a task to its
+/// egress proxy: `bwrap --dev-bind / / --unshare-net ... -- <shim> egress-shim --socket S
+/// --port 3128 --`. The agent keeps the host's file system and tools; only its network is
+/// replaced by the shim's relay to the proxy. `Err` when this cannot be enforced (not Linux, no
+/// `bwrap`, a proxy without a socket, no shim): the agent must not start then.
+pub fn network_jail(
+    route: &EgressRoute,
+    shim: Option<&Path>,
+    cwd: &Path,
+) -> Result<Vec<std::ffi::OsString>, String> {
+    const NEEDS: &str = "isolation.network.mode: deny confines Codex and Claude Code with \
+                         bubblewrap (Linux, with unprivileged user namespaces)";
+    if !cfg!(target_os = "linux") {
+        return Err(format!("{NEEDS}; this host is not Linux"));
+    }
+    let bwrap =
+        find_executable("bwrap").ok_or_else(|| format!("{NEEDS}; `bwrap` is not on PATH"))?;
+    let socket = route
+        .socket
+        .as_ref()
+        .ok_or_else(|| "the task's egress proxy has no Unix socket".to_owned())?;
+    let shim =
+        shim.ok_or_else(|| "the `symphony` executable (the egress shim) is unknown".to_owned())?;
+    let mut argv: Vec<std::ffi::OsString> = vec![bwrap.into()];
+    argv.extend(
+        [
+            "--dev-bind",
+            "/",
+            "/",
+            "--unshare-net",
+            "--die-with-parent",
+            "--chdir",
+        ]
+        .map(Into::into),
+    );
+    argv.push(cwd.into());
+    argv.push("--".into());
+    argv.push(shim.into());
+    argv.extend([SHIM_SUBCOMMAND, "--socket"].map(Into::into));
+    argv.push(socket.into());
+    argv.extend(["--port".into(), SHIM_PORT.to_string().into(), "--".into()]);
+    Ok(argv)
+}
 
 /// The hidden `symphony` subcommand that runs [`run_shim`].
 pub const SHIM_SUBCOMMAND: &str = "egress-shim";
@@ -506,6 +556,39 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+    }
+
+    #[test]
+    fn the_network_jail_runs_the_agent_under_the_shim_without_a_network() {
+        let route = EgressRoute {
+            socket: Some(PathBuf::from("/tmp/symphony-egress-1/proxy.sock")),
+            tcp: "127.0.0.1:41000".parse().unwrap(),
+        };
+        let shim = Path::new("/usr/local/bin/symphony");
+        let jail = network_jail(&route, Some(shim), Path::new("/w/.tasks/7"));
+        if !cfg!(target_os = "linux") || find_executable("bwrap").is_none() {
+            let err = jail.unwrap_err();
+            assert!(err.contains("bubblewrap"), "{err}");
+            return;
+        }
+        let argv: Vec<String> = jail
+            .unwrap()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv[1..].join(" "),
+            "--dev-bind / / --unshare-net --die-with-parent --chdir /w/.tasks/7 -- \
+             /usr/local/bin/symphony egress-shim --socket /tmp/symphony-egress-1/proxy.sock \
+             --port 3128 --"
+        );
+        // Without a socket or a shim there is nothing to relay through: refused, not unconfined.
+        let no_socket = EgressRoute {
+            socket: None,
+            ..route.clone()
+        };
+        assert!(network_jail(&no_socket, Some(shim), Path::new("/w")).is_err());
+        assert!(network_jail(&route, None, Path::new("/w")).is_err());
     }
 
     #[test]
