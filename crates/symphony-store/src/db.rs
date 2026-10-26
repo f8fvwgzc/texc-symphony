@@ -251,12 +251,15 @@ pub(crate) struct PostgresDb {
     in_transaction: bool,
     /// The last operation failed on the connection itself (not with an SQL error).
     lost: bool,
+    /// `false` while the connection is lost; a health probe reports the store as degraded.
+    healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PostgresDb {
     pub(crate) fn new(
         client: postgres::Client,
         reconnect: Box<dyn FnMut() -> Result<postgres::Client> + Send>,
+        healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             client,
@@ -264,7 +267,13 @@ impl PostgresDb {
             reconnect,
             in_transaction: false,
             lost: false,
+            healthy,
         }
+    }
+
+    fn set_healthy(&self, healthy: bool) {
+        self.healthy
+            .store(healthy, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Replaces a lost connection (prepared statements belong to the old one).
@@ -280,6 +289,7 @@ impl PostgresDb {
         self.client = (self.reconnect)()?;
         self.statements.clear();
         self.lost = false;
+        self.set_healthy(true);
         tracing::warn!("Reconnected to PostgreSQL after the connection was lost");
         Ok(())
     }
@@ -289,12 +299,16 @@ impl PostgresDb {
     fn checked<T>(&mut self, result: std::result::Result<T, postgres::Error>) -> Result<T> {
         if let Err(err) = &result {
             let state = err.code().map(postgres::error::SqlState::code);
-            self.lost |= err.is_closed()
+            let connection_lost = err.is_closed()
                 || self.client.is_closed()
                 || match state {
                     Some(code) => code.starts_with("08") || code.starts_with("57P"),
                     None => err.as_db_error().is_none(),
                 };
+            if connection_lost {
+                self.lost = true;
+                self.set_healthy(false);
+            }
         }
         Ok(result?)
     }

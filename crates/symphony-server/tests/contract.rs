@@ -243,5 +243,6 @@ async fn history_responses_match_the_contract() {
     assert_valid(&schema("Totals"), &totals);
     let (_, health) = harness.get("/api/v1/health").await;
     assert_eq!(health["store"], "sqlite");
+    assert_eq!(health["status"], "ok");
     assert_valid(&schema("Health"), &health);
 }

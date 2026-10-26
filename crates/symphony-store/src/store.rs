@@ -10,6 +10,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -61,6 +62,8 @@ struct Inner {
     label: String,
     /// `true` for PostgreSQL: other Symphony replicas may use the same database.
     shared: bool,
+    /// `false` while the (PostgreSQL) connection is lost; always `true` for SQLite.
+    healthy: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Store {
@@ -94,7 +97,7 @@ impl Store {
         // One process per SQLite file: leases of an earlier process are void.
         conn.execute("DELETE FROM leases", [])?;
         let label = path.display().to_string();
-        Store::spawn(label, Some(path), false, move || {
+        Store::spawn(label, Some(path), false, always_healthy(), move || {
             Ok(Box::new(SqliteDb(conn)))
         })
     }
@@ -104,9 +107,13 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         schema::configure(&conn, false)?;
         schema::migrate(&mut conn)?;
-        Store::spawn(":memory:".into(), None, false, move || {
-            Ok(Box::new(SqliteDb(conn)))
-        })
+        Store::spawn(
+            ":memory:".into(),
+            None,
+            false,
+            always_healthy(),
+            move || Ok(Box::new(SqliteDb(conn))),
+        )
     }
 
     /// Connect to the PostgreSQL database at `url` (`postgres://user:pass@host:port/db`, libpq
@@ -120,7 +127,9 @@ impl Store {
             reason,
         })?;
         let open_label = label.clone();
-        Store::spawn(label, None, true, move || {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let db_healthy = Arc::clone(&healthy);
+        Store::spawn(label, None, true, healthy, move || {
             let connect = move || {
                 connect_postgres(&config).map_err(|reason| StoreError::Open {
                     path: open_label.clone(),
@@ -129,7 +138,11 @@ impl Store {
             };
             let mut client = connect()?;
             schema::migrate_postgres(&mut client)?;
-            Ok(Box::new(PostgresDb::new(client, Box::new(connect))))
+            Ok(Box::new(PostgresDb::new(
+                client,
+                Box::new(connect),
+                db_healthy,
+            )))
         })
     }
 
@@ -142,6 +155,19 @@ impl Store {
     /// `false` for [`Store::disabled`].
     pub fn is_enabled(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// `true` for a PostgreSQL store (replicas may share it); `false` for SQLite and disabled.
+    pub fn is_postgres(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.shared)
+    }
+
+    /// `true` when the store's connection is currently lost (PostgreSQL only); health probes
+    /// report the store as degraded. Always `false` for SQLite and disabled stores.
+    pub fn is_degraded(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| !inner.healthy.load(Ordering::Relaxed))
     }
 
     /// `true` when other Symphony replicas may share the database (PostgreSQL): dispatch is then
@@ -161,6 +187,7 @@ impl Store {
         label: String,
         path: Option<PathBuf>,
         shared: bool,
+        healthy: Arc<AtomicBool>,
         connect: impl FnOnce() -> Result<Box<dyn Db>> + Send + 'static,
     ) -> Result<Store> {
         let (jobs, mut queue) = mpsc::channel::<Job>(STORE_QUEUE_CAPACITY);
@@ -196,6 +223,7 @@ impl Store {
                 path,
                 label,
                 shared,
+                healthy,
             })),
         })
     }
@@ -699,6 +727,11 @@ impl<T> Future for Pending<T> {
     }
 }
 
+/// A health flag for a store that never loses its connection (SQLite, in-memory).
+fn always_healthy() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
 /// Bound on opening a PostgreSQL connection (unless the URL sets `connect_timeout`).
 pub const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long unacknowledged data may stay on a PostgreSQL connection before the kernel drops it
@@ -732,13 +765,44 @@ pub(crate) fn postgres_config(url: &str) -> std::result::Result<postgres::Config
     Ok(config)
 }
 
-/// A new connection for `config` (TLS with the system roots unless `sslmode=disable`).
+/// Retries a lost connection this many times (1 s, 2 s, 4 s) before giving up, so a brief
+/// database restart or failover recovers without the whole fleet crash-looping.
+const POSTGRES_CONNECT_ATTEMPTS: u32 = 3;
+
+/// A new connection for `config`, with a short backoff, TLS with the system roots unless
+/// `sslmode=disable`, and a server-side `statement_timeout`/`lock_timeout` so a query the
+/// server itself wedges on returns instead of pinning the store thread.
 fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::Client, String> {
-    match config.get_ssl_mode() {
-        postgres::config::SslMode::Disable => config.connect(postgres::NoTls),
-        _ => config.connect(postgres_tls().map_err(|err| err.to_string())?),
+    let tls = (config.get_ssl_mode() != postgres::config::SslMode::Disable)
+        .then(postgres_tls)
+        .transpose()
+        .map_err(|err| err.to_string())?;
+    let mut last = String::new();
+    for attempt in 0..POSTGRES_CONNECT_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+        }
+        let connected = match &tls {
+            Some(tls) => config.connect(tls.clone()),
+            None => config.connect(postgres::NoTls),
+        };
+        match connected {
+            Ok(mut client) => {
+                let ms = POSTGRES_NETWORK_TIMEOUT.as_millis();
+                // A statement that runs or waits for a lock past the network timeout is aborted,
+                // so no single query pins the store thread indefinitely.
+                if let Err(err) = client.batch_execute(&format!(
+                    "SET statement_timeout = {ms}; SET lock_timeout = {ms}"
+                )) {
+                    last = err.to_string();
+                    continue;
+                }
+                return Ok(client);
+            }
+            Err(err) => last = err.to_string(),
+        }
     }
-    .map_err(|err| err.to_string())
+    Err(last)
 }
 
 /// `url` without its password, in the userinfo or a `password` parameter (for logs and errors).

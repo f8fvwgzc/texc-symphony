@@ -103,15 +103,25 @@ pub(crate) async fn issue(
 
 /// `GET /api/v1/health`: never touches the orchestrator.
 pub(crate) async fn health(State(app): State<AppState>) -> Json<Health> {
+    let store = if !app.store.is_enabled() {
+        StoreMode::Disabled
+    } else if app.store.is_postgres() {
+        StoreMode::Postgres
+    } else {
+        StoreMode::Sqlite
+    };
     Json(Health {
-        status: "ok".to_owned(),
+        // A lost database connection (PostgreSQL) shows as degraded, so a readiness probe can
+        // restart or drain the replica instead of it looking healthy while it cannot dispatch.
+        status: if app.store.is_degraded() {
+            "degraded"
+        } else {
+            "ok"
+        }
+        .to_owned(),
         version: app.config.version.clone(),
         uptime_seconds: app.started.elapsed().as_secs(),
-        store: if app.store.is_enabled() {
-            StoreMode::Sqlite
-        } else {
-            StoreMode::Disabled
-        },
+        store,
         auth_required: app.config.auth.is_enabled(),
     })
 }
