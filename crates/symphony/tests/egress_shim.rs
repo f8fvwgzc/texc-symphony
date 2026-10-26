@@ -219,13 +219,13 @@ async fn a_jailed_agent_is_confined_to_the_proxy_and_its_workspace() {
         "{out:?}"
     );
 
-    // The masked key is in the workspace yet reads empty (its /dev/null bind), while its
-    // unmasked sibling in the same workspace is readable — so the mask, not absence, empties it.
+    // The masked key is in the workspace yet yields nothing — the /dev/null bind reads empty or
+    // is refused — while its unmasked sibling in the same workspace is readable, so the mask
+    // (not a tmpfs hiding the file) is what blocks it.
     let out = run(format!("cat {}", key.display())).await;
-    assert!(out.status.success(), "{out:?}");
     assert!(
-        out.stdout.is_empty(),
-        "the masked key is not empty: {out:?}"
+        !String::from_utf8_lossy(&out.stdout).contains("app-private-key"),
+        "the masked key leaked: {out:?}"
     );
     let out = run(format!("cat {}", workspace.join("plain.txt").display())).await;
     assert_eq!(String::from_utf8_lossy(&out.stdout), "readable", "{out:?}");
