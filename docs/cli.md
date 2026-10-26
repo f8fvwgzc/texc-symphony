@@ -6,6 +6,7 @@ symphony [--i-understand-that-this-will-be-running-without-the-usual-guardrails]
          [--db-path <path> | --no-db] [path-to-WORKFLOW.md]
 symphony workspace before-remove [--branch <name>] [--repo <owner/name>]
 symphony workflow audit [path-to-WORKFLOW.md]
+symphony init -- <command> [args...]
 symphony --version | -V
 symphony --help | -h
 ```
@@ -250,17 +251,35 @@ and the findings are left out):
 ```text
 In context for every model request of a run:
   core prompt        4,288 tokens
-  tool specs           198 tokens  linear_graphql, workflow_reference
-  total              4,486 tokens
+  tool specs           241 tokens  linear_graphql, workflow_reference
+  total              4,529 tokens
   The core has Liquid tags; every branch is counted, so one run can get less.
 
 Loaded on demand with the workflow_reference tool:
-  blocked-access       216 tokens  line 205  when a required tool, auth or permission is missing
-  merging              148 tokens  line 264  when the ticket is in `Human Review` or `Merging`
-  rework               157 tokens  line 275  when the ticket is in `Rework`
-  workpad-template     139 tokens  line 319  when you create or restore the `## Codex Workpad` comment
+  blocked-access       216 tokens  line 210  when a required tool, auth or permission is missing
+  merging              148 tokens  line 269  when the ticket is in `Human Review` or `Merging`
+  rework               157 tokens  line 280  when the ticket is in `Rework`
+  workpad-template     139 tokens  line 324  when you create or restore the `## Codex Workpad` comment
   total                660 tokens  (13% of the prompt is out of the core)
 ```
+
+## `symphony init`
+
+```text
+symphony init -- <command> [args...]
+```
+
+The container image's PID 1 (its entrypoint is `symphony init -- symphony`); it replaces `tini`.
+PID 1 holds the environment the container started with, so every secret in it (API token,
+tracker tokens, LLM keys). `symphony init` first marks itself non-dumpable, so other processes of
+the same user, such as agents and hooks, cannot read its `/proc/1/environ` or memory; it refuses
+to start when that fails. It then runs the command in its own process group (handing it the
+terminal, if there is one), forwards SIGTERM, SIGINT, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2 and
+SIGWINCH to it, reaps every child that ends (orphans included), and exits with the command's
+status (`128 + n` when signal `n` ended it). It exits 1 when the command cannot be started.
+
+Do not put another init in front of it (Docker's `--init`, Compose `init: true`): that init would
+hold the same environment, readable.
 
 ## Examples
 

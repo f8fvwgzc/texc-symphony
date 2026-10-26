@@ -186,6 +186,16 @@ export interface Health {
   version: string;
   uptime_seconds: number;
   store: StoreMode;
+  /** Whether `/api/*` needs `Authorization: Bearer <token>`. */
+  auth_required: boolean;
+}
+
+/** Body of `POST /api/v1/events/tickets` (201). */
+export interface SseTicket {
+  /** Pass as `?ticket=` when opening the SSE stream; valid once. */
+  ticket: string;
+  expires_at: Timestamp;
+  expires_in_ms: number;
 }
 
 /** Payload of SSE `heartbeat` events. */

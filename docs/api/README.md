@@ -7,7 +7,13 @@ it as JSON at `GET /api/openapi.json`. This page is the human guide.
   only when `server.port` is set in `WORKFLOW.md`, `--port` is passed or `SYMPHONY_PORT` is
   set. `0` binds an ephemeral port; the binary prints the real URL on stdout
   (`Symphony listening on http://127.0.0.1:<port>/`).
-- **Auth:** none. Bind to loopback, or put an authenticating proxy in front.
+- **Auth:** when an API token is configured (`server.api_token` in `WORKFLOW.md`, or
+  `SYMPHONY_API_TOKEN`), every `/api/*` call except `GET /api/v1/health` and
+  `GET /api/openapi.json` needs `Authorization: Bearer <token>` (else `401 unauthorized`).
+  Without a token the server only binds loopback. Requests for another `Host` (DNS rebinding)
+  answer `403 host_not_allowed`; cross-origin browser writes answer `403 origin_not_allowed`.
+  The bundled dashboard asks for the token and keeps it in `sessionStorage` (or `localStorage`
+  when "Remember on this device" is ticked); "Forget token" in the header clears it.
 - **Format:** JSON (`application/json`). The one exception is the SSE stream, which is
   `text/event-stream`.
 - **Compatibility:** `state`, `refresh`, `{issue_identifier}` and the 404/405 envelopes match the
@@ -30,11 +36,20 @@ export SYMPHONY=http://127.0.0.1:4000
 | GET | `/api/v1/runs/{id}` | 200 | 400, 404 `run_not_found`, 405, 503 |
 | GET | `/api/v1/runs/{id}/events` | 200 | 400, 404, 405, 503 |
 | GET | `/api/v1/totals` | 200 | 405, 503 |
+| POST | `/api/v1/events/tickets` | 201 single-use SSE ticket | 401, 405 |
+| POST | `/api/v1/pause` / `/api/v1/resume` | 200 kill switch state | 401, 403, 405, 503 |
+| GET | `/api/v1/metrics` | 200 Prometheus text | 401, 405 |
+| POST / GET | `/api/v1/tasks` | 201 task / 200 page | 400, 401, 403, 503 `store_disabled` |
+| GET | `/api/v1/tasks/{id}` | 200 | 400, 404 `task_not_found`, 503 |
+| POST | `/api/v1/tasks/{id}/cancel` | 200 | 400, 404, 503 |
+| POST | `/api/v1/tasks/{id}/unblock` | 200 | 400, 404, 409 `task_conflict`, 503 |
+| GET | `/api/v1/tasks/{id}/events` | 200 `text/event-stream` | 404, 503 |
 | GET | `/api/openapi.json` | 200 | 405 |
 | any | anything else | — | 404 `not_found` |
 
-Because literal routes match first, the identifiers `state`, `refresh`, `health`, `events`, `runs`
-and `totals` are reserved and cannot be looked up as issues. A single trailing slash is ignored.
+Because literal routes match first, the identifiers `state`, `refresh`, `health`, `events`, `runs`,
+`totals`, `pause`, `resume`, `metrics` and `tasks` are reserved and cannot be looked up as issues.
+The task API is described in [`../tasks.md`](../tasks.md). A single trailing slash is ignored.
 `HEAD` works on every `GET` route.
 
 ## Live state
@@ -140,15 +155,22 @@ data: {"at":"2026-02-24T20:15:45Z","generation":42}
 **curl** (`-N` disables buffering):
 
 ```sh
+# With a token configured, add -H "Authorization: Bearer $SYMPHONY_API_TOKEN" to every call.
 curl -N -H 'Accept: text/event-stream' $SYMPHONY/api/v1/events
 # Only the counts, one line per snapshot:
 curl -sN $SYMPHONY/api/v1/events | sed -n 's/^data: //p' | jq -c '.counts? // empty'
 ```
 
-**Browser / JavaScript:**
+**Browser / JavaScript:** `EventSource` cannot send an `Authorization` header, so get a
+single-use ticket first (valid once, for 60 s) and pass it in the URL. The token itself never goes
+into a URL.
 
 ```js
-const source = new EventSource('/api/v1/events');
+const { ticket } = await fetch('/api/v1/events/tickets', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}` }, // omit when the server has no token
+}).then((response) => response.json());
+const source = new EventSource(`/api/v1/events?ticket=${encodeURIComponent(ticket)}`);
 
 source.addEventListener('snapshot', (event) => {
   const state = JSON.parse(event.data);
@@ -164,15 +186,15 @@ source.addEventListener('heartbeat', () => {
 });
 
 source.onerror = () => {
-  // The browser reconnects by itself (after `retry` ms) unless readyState is CLOSED.
-  if (source.readyState === EventSource.CLOSED) {
-    /* fall back to polling GET /api/v1/state */
-  }
+  // The browser's own reconnect reuses the spent ticket and fails with 401: close the stream
+  // and reconnect with a fresh ticket instead (or fall back to polling GET /api/v1/state).
+  source.close();
 };
 ```
 
-The bundled dashboard (`web/`) closes the stream on errors and manages reconnection itself, with
-exponential backoff from 1 s to 30 s. After 3 consecutive failures it polls `GET /api/v1/state`
+The bundled dashboard (`web/`) closes the stream on errors and manages reconnection itself,
+fetching a fresh ticket for every connection, with exponential backoff from 1 s to 30 s. A refused
+ticket (401) stops the retries and shows the token dialog. After 3 consecutive failures it polls `GET /api/v1/state`
 every 5 s, and it re-probes SSE every 60 s. It also treats 45 s without a snapshot or heartbeat as
 a dead stream.
 
@@ -271,7 +293,7 @@ curl -s $SYMPHONY/api/v1/totals | jq
 
 ```sh
 curl -s $SYMPHONY/api/v1/health
-# {"status":"ok","version":"0.1.0","uptime_seconds":3725,"store":"sqlite"}
+# {"status":"ok","version":"0.1.0","uptime_seconds":3725,"store":"sqlite","auth_required":true}
 
 curl -s $SYMPHONY/api/openapi.json | jq '.paths | keys'
 ```

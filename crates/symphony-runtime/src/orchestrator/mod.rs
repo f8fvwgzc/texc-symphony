@@ -9,9 +9,12 @@
 //! Time: durations (backoff, poll countdown, stall detection, runtime seconds) use tokio's monotonic
 //! clock — pausable in tests — while displayed timestamps use `Utc::now()`.
 
+// Modified 2026-10-25: spend controls and the kill switch (audit A4).
+
 mod dispatch;
 mod reconcile;
 mod retry;
+mod spend;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -24,8 +27,8 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
-use symphony_core::{ConfigError, Issue, Settings, TrackerConfigError};
-use symphony_store::{NewRun, RetryRecord, RunStatus};
+use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
+use symphony_store::{NewRun, RetryRecord, RunStatus, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -35,9 +38,12 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+pub use spend::PAUSED_CONTROL_KEY;
+pub(crate) use spend::{Pricing, SpendStop, Usage};
 pub(crate) use state::{
-    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, WorkerHandle,
-    blocker_error, candidate_issue, next_retry_attempt_from_running,
+    BlockedEntry, Counter, RetryEntry, RetryMeta, RunningEntry, State, StateSets, TaskRun,
+    WorkerHandle, blocker_error, candidate_issue, next_retry_attempt_from_running, task_id,
+    task_issue_id,
 };
 pub use state::{
     DelayType, FAILURE_RETRY_BASE_MS, HostChoice, POLL_TRANSITION_RENDER_DELAY, retry_delay,
@@ -46,15 +52,45 @@ pub use state::{
 
 use crate::handle::RuntimeCommand;
 use crate::recorder::RunRecorder;
+use crate::redact::Redactor;
 use crate::runner::hook_env_policy;
 use crate::runtime::{RuntimeContext, WorkerSet};
 use crate::snapshot::{
-    BlockedSnapshot, PollingStatus, RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot,
-    TrackerInfo,
+    BlockedSnapshot, PauseAck, PollingStatus, RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot,
+    SpendSnapshot, TrackerInfo,
 };
 use crate::tracker::FetchError;
-use crate::worker::{RunError, WorkerContext, WorkerMessage, WorkerResult};
+use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerMessage, WorkerResult};
 use crate::workspace::{WorkspaceManager, worker_hosts};
+
+/// Writes kill-switch changes to the store from one task, in order, retrying while the store is
+/// busy, so an acknowledged pause also holds after a restart. A newer change replaces a pending
+/// older one, so an old retry can never overwrite the latest state.
+fn spawn_pause_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Option<String>> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
+    tokio::spawn(async move {
+        while let Some(mut reason) = rx.recv().await {
+            let mut delay = Duration::from_millis(50);
+            loop {
+                while let Ok(newer) = rx.try_recv() {
+                    reason = newer;
+                }
+                match store.set_control(PAUSED_CONTROL_KEY, reason.clone()).await {
+                    Ok(()) => break,
+                    Err(symphony_store::StoreError::Busy) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to persist the kill switch: {err}");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
@@ -100,6 +136,65 @@ pub(crate) struct Orchestrator<'w> {
     codex_streams: StreamMap<u64, UnboundedReceiverStream<CodexEvent>>,
     shutdown: CancellationToken,
     tokens: Counter,
+    /// Task status writes, applied in order (and retried while the store is busy).
+    task_writes: mpsc::UnboundedSender<TaskWrite>,
+    /// Kill-switch changes, persisted in order by [`spawn_pause_writer`].
+    pause_writes: mpsc::UnboundedSender<Option<String>>,
+}
+
+/// A task status change for the store.
+#[derive(Debug)]
+pub(crate) enum TaskWrite {
+    Finish {
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    },
+    Release {
+        id: i64,
+        reason: String,
+    },
+}
+
+/// Applies task writes one after another, so a finish always lands before a later release of the
+/// same task, and retries a write the store refused as busy instead of dropping it (a dropped
+/// finish would leave the task `running` forever).
+fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<TaskWrite> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
+    tokio::spawn(async move {
+        while let Some(write) = rx.recv().await {
+            let mut delay = Duration::from_millis(20);
+            for _ in 0..12 {
+                let result = match &write {
+                    TaskWrite::Finish {
+                        id,
+                        status,
+                        result,
+                        error,
+                    } => store
+                        .finish_task(*id, *status, result.clone(), error.clone())
+                        .await
+                        .map(drop),
+                    TaskWrite::Release { id, reason } => {
+                        store.release_task(*id, reason.clone()).await.map(drop)
+                    }
+                };
+                match result {
+                    Err(symphony_store::StoreError::Busy) => {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to record a task status change: {err}");
+                        break;
+                    }
+                    Ok(()) => break,
+                }
+            }
+        }
+    });
+    tx
 }
 
 impl<'w> Orchestrator<'w> {
@@ -110,8 +205,10 @@ impl<'w> Orchestrator<'w> {
         shutdown: CancellationToken,
     ) -> Self {
         let settings = ctx.workflow.settings();
+        let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
+        let pause_writes = spawn_pause_writer(ctx.store.clone());
         Self {
             state: State::new(&settings),
             ctx,
@@ -124,11 +221,89 @@ impl<'w> Orchestrator<'w> {
             codex_streams: StreamMap::new(),
             shutdown,
             tokens: Counter::default(),
+            task_writes: spawn_task_writer(ctx_store),
+            pause_writes,
         }
     }
 
     pub(crate) fn settings(&self) -> Arc<Settings> {
         self.ctx.workflow.settings()
+    }
+
+    /// Records the end of a task's run (`status` final or `blocked`).
+    pub(crate) fn task_finish(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+    ) {
+        let _ = self.task_writes.send(TaskWrite::Finish {
+            id,
+            status,
+            result,
+            error,
+        });
+    }
+
+    /// Puts a running task back to `queued` (stopped from outside).
+    pub(crate) fn task_release(&self, id: i64, reason: &str) {
+        let _ = self.task_writes.send(TaskWrite::Release {
+            id,
+            reason: reason.to_owned(),
+        });
+    }
+
+    /// `<workspace.root>/.tasks/<id>`, the workspace of task `id` (see `workspace::TASK_WORKSPACES`).
+    pub(crate) fn task_workspace(&self, id: i64) -> std::path::PathBuf {
+        self.task_workspaces().join(id.to_string())
+    }
+
+    fn task_workspaces(&self) -> std::path::PathBuf {
+        self.settings()
+            .local_workspace_root(&self.ctx.workflow.workflow_file_path())
+            .join(crate::workspace::TASK_WORKSPACES)
+    }
+
+    /// Removes task `id`'s workspace in the background (its agent is already stopped). Task
+    /// workspaces run no workflow hooks.
+    pub(crate) fn remove_task_workspace(&self, id: i64) {
+        let path = self.task_workspace(id);
+        tokio::spawn(async move {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => tracing::debug!("Removed task workspace path={}", path.display()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(
+                    "Failed to remove task workspace path={}: {err}",
+                    path.display()
+                ),
+            }
+        });
+    }
+
+    /// Startup: removes the workspaces of tasks that are final or unknown (a previous process
+    /// stopped before cleaning them up).
+    pub(crate) async fn sweep_task_workspaces(&self) {
+        if !self.ctx.store.is_enabled() {
+            return;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(self.task_workspaces()).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            match self.ctx.store.get_task(id).await {
+                Ok(Some(task)) if !task.status.is_final() => {}
+                Ok(_) => self.remove_task_workspace(id),
+                Err(err) => tracing::warn!("Failed to read task {id}: {err}"),
+            }
+        }
     }
 
     pub(crate) fn workspace_manager(&self, settings: &Arc<Settings>) -> WorkspaceManager {
@@ -161,6 +336,13 @@ impl<'w> Orchestrator<'w> {
             .settings()
             .local_workspace_root(&self.ctx.workflow.workflow_file_path());
         crate::agents::reap_stale(&crate::agents::registry_dir(&root)).await;
+        self.restore_spend().await;
+        match self.ctx.store.requeue_interrupted_tasks().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Queued {count} tasks interrupted by the previous process"),
+            Err(err) => tracing::warn!("Failed to re-queue interrupted tasks: {err}"),
+        }
+        self.sweep_task_workspaces().await;
         self.restore_retry_queue().await;
         self.run_terminal_workspace_cleanup().await;
         self.schedule_tick(Duration::ZERO);
@@ -172,7 +354,8 @@ impl<'w> Orchestrator<'w> {
             biased;
             () = self.shutdown.cancelled() => false,
             Some(command) = self.cmd_rx.recv() => {
-                self.handle_command(command);
+                self.handle_command(command).await;
+                self.enforce_spend().await;
                 true
             }
             Some(timer) = self.timer_rx.recv() => {
@@ -185,6 +368,7 @@ impl<'w> Orchestrator<'w> {
             }
             Some((run_id, event)) = self.codex_streams.next(), if !self.codex_streams.is_empty() => {
                 self.handle_codex_event(run_id, event);
+                self.enforce_spend().await;
                 true
             }
             Some(joined) = self.workers.set.join_next_with_id(), if !self.workers.set.is_empty() => {
@@ -194,7 +378,7 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
-    pub(crate) fn handle_command(&mut self, command: RuntimeCommand) {
+    pub(crate) async fn handle_command(&mut self, command: RuntimeCommand) {
         match command {
             RuntimeCommand::Snapshot(reply) => {
                 let snapshot = self.snapshot();
@@ -202,6 +386,41 @@ impl<'w> Orchestrator<'w> {
             }
             RuntimeCommand::RequestRefresh(reply) => {
                 let ack = self.request_refresh();
+                let _ = reply.send(ack);
+            }
+            RuntimeCommand::CancelTask { id, reply } => {
+                let issue_id = task_issue_id(id);
+                let running = self.state.running.contains_key(&issue_id);
+                if running {
+                    tracing::info!("Cancelling task run issue_id={issue_id}");
+                    self.task_finish(
+                        id,
+                        TaskStatus::Cancelled,
+                        None,
+                        Some("cancelled by client".into()),
+                    );
+                    self.terminate_running_issue(&issue_id, false, "cancelled by client")
+                        .await;
+                } else {
+                    self.release_issue_claim(&issue_id);
+                }
+                // A cancelled task never runs again (a blocked one leaves its workspace here).
+                self.remove_task_workspace(id);
+                self.notify();
+                let _ = reply.send(running);
+            }
+            RuntimeCommand::UnblockTask { id, reply } => {
+                self.release_issue_claim(&task_issue_id(id));
+                self.schedule_tick(Duration::ZERO);
+                self.notify();
+                let _ = reply.send(());
+            }
+            RuntimeCommand::SetPaused {
+                paused,
+                reason,
+                reply,
+            } => {
+                let ack = self.set_paused(paused, reason);
                 let _ = reply.send(ack);
             }
             #[cfg(test)]
@@ -287,6 +506,160 @@ impl<'w> Orchestrator<'w> {
             coalesced,
             requested_at: Utc::now(),
             operations: vec!["poll".into(), "reconcile".into()],
+        }
+    }
+
+    // ----- spend controls ------------------------------------------------------------------------
+
+    /// Startup: the kill switch and today's usage come back from the store.
+    pub(crate) async fn restore_spend(&mut self) {
+        match self.ctx.store.control(PAUSED_CONTROL_KEY).await {
+            Ok(Some(reason)) => {
+                tracing::warn!("Dispatch is paused (kill switch engaged before restart): {reason}");
+                self.state.spend.paused = Some(reason);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("Failed to read the kill switch: {err}"),
+        }
+        let now = Utc::now();
+        let midnight = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|t| t.and_utc())
+            .unwrap_or(now);
+        let usage = match self.ctx.store.usage_since(midnight).await {
+            Ok(usage) => Usage {
+                tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                cost_micro_usd: usage.cost_micro_usd,
+            },
+            Err(err) => {
+                tracing::warn!("Failed to load today's usage: {err}");
+                Usage::default()
+            }
+        };
+        self.state.spend.seed_day(now, usage);
+    }
+
+    /// Engages (`paused`) or releases the kill switch; persisted in the store. Running agents
+    /// are stopped by the next [`Self::enforce_spend`].
+    pub(crate) fn set_paused(&mut self, paused: bool, reason: Option<String>) -> PauseAck {
+        let reason = paused.then(|| {
+            reason
+                .map(|r| r.trim().to_owned())
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "operator request".to_owned())
+        });
+        if reason != self.state.spend.paused {
+            match &reason {
+                Some(reason) => tracing::warn!("Kill switch engaged: {reason}"),
+                None => tracing::info!("Kill switch released; dispatch resumes"),
+            }
+            let _ = self.pause_writes.send(reason.clone());
+            self.state.spend.paused = reason.clone();
+            if reason.is_none() {
+                self.schedule_tick(Duration::ZERO);
+            }
+            self.notify();
+        }
+        PauseAck {
+            paused: reason.is_some(),
+            reason,
+        }
+    }
+
+    /// Stops what spending rules no longer allow: everything while paused or when today's
+    /// budget is used up (claims released, so they run again later), and each run whose issue
+    /// used up its budget (blocked).
+    pub(crate) async fn enforce_spend(&mut self) {
+        if self.state.running.is_empty() {
+            return;
+        }
+        let settings = self.settings();
+        let now = Utc::now();
+        if let Some(stop) = self.state.spend.global_stop(&settings.budget, now) {
+            let ids: Vec<String> = self.state.running.keys().cloned().collect();
+            tracing::warn!("Stopping {} running agents: {}", ids.len(), stop.reason());
+            for issue_id in ids {
+                self.terminate_running_issue(&issue_id, false, stop.reason())
+                    .await;
+            }
+            self.notify();
+            return;
+        }
+        let over: Vec<(String, String)> = self
+            .state
+            .running
+            .keys()
+            .filter_map(|issue_id| {
+                self.state
+                    .spend
+                    .issue_stop(issue_id, &settings.budget)
+                    .map(|stop| (issue_id.clone(), stop.reason().to_owned()))
+            })
+            .collect();
+        for (issue_id, reason) in over {
+            self.stop_and_block(&issue_id, reason).await;
+        }
+        let over_task_limit: Vec<(String, i64, String)> = self
+            .state
+            .running
+            .iter()
+            .filter_map(|(issue_id, entry)| {
+                let task = entry.task.as_ref()?;
+                let limit = task.max_tokens?;
+                let used = self.state.spend.issue(issue_id).tokens;
+                (used >= limit).then(|| {
+                    (
+                        issue_id.clone(),
+                        task.id,
+                        format!("task token limit exhausted: {used} of {limit} tokens used"),
+                    )
+                })
+            })
+            .collect();
+        for (issue_id, task, reason) in over_task_limit {
+            tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
+            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()));
+            self.terminate_running_issue(&issue_id, false, &reason)
+                .await;
+        }
+    }
+
+    /// Stops a running agent and blocks its issue with `error`.
+    pub(crate) async fn stop_and_block(&mut self, issue_id: &str, error: String) {
+        let Some(mut entry) = self.state.running.remove(issue_id) else {
+            return;
+        };
+        tracing::warn!(
+            "Stopping and blocking issue_id={issue_id} issue_identifier={}: {error}",
+            entry.identifier
+        );
+        self.record_session_completion_totals(&entry);
+        self.codex_streams.remove(&entry.run_id);
+        self.stop_worker(entry.worker.take()).await;
+        entry
+            .recorder
+            .finish(RunStatus::Blocked, Some(error.clone()));
+        self.block_issue_from_entry(issue_id, entry, error);
+        self.notify();
+    }
+
+    fn spend_snapshot(&mut self, settings: &Settings, now: chrono::DateTime<Utc>) -> SpendSnapshot {
+        let today = self.state.spend.today(now);
+        SpendSnapshot {
+            paused: self.state.spend.paused.is_some(),
+            stopped_reason: self
+                .state
+                .spend
+                .global_stop(&settings.budget, now)
+                .map(|stop| stop.reason().to_owned()),
+            day: now.date_naive().to_string(),
+            day_tokens: today.tokens,
+            day_cost_micro_usd: today.cost_micro_usd,
+            max_tokens_per_day: settings.budget.max_tokens_per_day,
+            max_cost_usd_per_day: settings.budget.max_cost_usd_per_day,
+            max_tokens_per_issue: settings.budget.max_tokens_per_issue,
+            max_cost_usd_per_issue: settings.budget.max_cost_usd_per_issue,
         }
     }
 
@@ -380,6 +753,7 @@ impl<'w> Orchestrator<'w> {
                 .then(a.issue_id.cmp(&b.issue_id))
         });
 
+        let spend = self.spend_snapshot(&settings, now_utc);
         Snapshot {
             generated_at: now_utc,
             generation: *self.ctx.generation.borrow(),
@@ -402,6 +776,7 @@ impl<'w> Orchestrator<'w> {
                 kind: settings.tracker.kind.clone(),
                 project_slug: settings.tracker.project_slug.clone(),
             },
+            spend,
         }
     }
 }

@@ -1,5 +1,7 @@
 //! Router assembly, shared state and cross-cutting middleware.
 
+// Modified 2026-10-25: API auth, Host/Origin guard, SSE tickets, pause/resume and metrics routes (audit A1/A4).
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -30,12 +32,25 @@ use tower_http::trace::TraceLayer;
 use crate::config::ServerConfig;
 use crate::control::{ControlPlane, StateError};
 use crate::error::{ApiError, method_not_allowed};
+use crate::security::{HostPolicy, TicketBook};
 use crate::sse::SseHub;
 use crate::view::{StatePayload, StateView};
-use crate::{api, assets, history, presenter, sse};
+use crate::{api, assets, history, presenter, security, sse, tasks};
 
 /// Path of the SSE endpoint (excluded from the request timeout and from compression).
 pub(crate) const EVENTS_PATH: &str = "/api/v1/events";
+/// Issues single-use SSE tickets (`EventSource` cannot send an `Authorization` header).
+pub(crate) const TICKETS_PATH: &str = "/api/v1/events/tickets";
+
+/// `true` for Server-Sent Events endpoints (`/api/v1/events`, `/api/v1/tasks/{id}/events`): no
+/// request timeout, and an SSE ticket may stand in for the bearer token.
+pub(crate) fn is_stream_path(path: &str) -> bool {
+    path == EVENTS_PATH
+        || path
+            .strip_prefix("/api/v1/tasks/")
+            .and_then(|rest| rest.strip_suffix("/events"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
 
 /// Content-Security-Policy for every response. The dashboard is a same-origin Vite bundle with
 /// no inline scripts; inline styles stay allowed for component libraries that set them.
@@ -60,6 +75,8 @@ pub(crate) struct Shared {
     pub(crate) hub: SseHub,
     pub(crate) sse_slots: Option<Arc<Semaphore>>,
     pub(crate) shutdown: CancellationToken,
+    pub(crate) hosts: HostPolicy,
+    pub(crate) tickets: TicketBook,
 }
 
 impl std::ops::Deref for AppState {
@@ -108,6 +125,8 @@ pub fn router(
         hub: SseHub::new(),
         sse_slots,
         shutdown,
+        hosts: HostPolicy::new(&config.host, &config.allowed_hosts),
+        tickets: TicketBook::default(),
     }));
 
     let routes = Router::new()
@@ -124,10 +143,48 @@ pub fn router(
             "/api/v1/health",
             get(api::health).fallback(method_not_allowed),
         )
+        .route(
+            "/api/v1/pause",
+            post(api::pause).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/resume",
+            post(api::resume).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/metrics",
+            get(api::metrics).fallback(method_not_allowed),
+        )
         .route(EVENTS_PATH, get(sse::events).fallback(method_not_allowed))
+        .route(
+            TICKETS_PATH,
+            post(api::issue_ticket).fallback(method_not_allowed),
+        )
         .route(
             "/api/v1/runs",
             get(history::list_runs).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks",
+            get(tasks::list)
+                .post(tasks::create)
+                .fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}",
+            get(tasks::get).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/cancel",
+            post(tasks::cancel).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/unblock",
+            post(tasks::unblock).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/{id}/events",
+            get(tasks::events).fallback(method_not_allowed),
         )
         .route(
             "/api/v1/totals",
@@ -158,6 +215,10 @@ pub fn router(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             request_timeout,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security::guard,
         ));
     if let Some(cors) = cors_layer(&config.cors_allowed_origins) {
         routes = routes.layer(cors);
@@ -212,6 +273,7 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
             .allow_origin(allow_origin)
             .allow_methods([Method::GET, Method::HEAD, Method::POST])
             .allow_headers([
+                axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
                 HeaderName::from_static("last-event-id"),
             ]),
@@ -220,7 +282,7 @@ fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
 
 /// Bound every non-streaming request by `request_timeout` (`503 request_failed` when elapsed).
 async fn request_timeout(State(app): State<AppState>, request: Request, next: Next) -> Response {
-    if request.uri().path() == EVENTS_PATH {
+    if is_stream_path(request.uri().path()) {
         return next.run(request).await;
     }
     match tokio::time::timeout(app.config.request_timeout, next.run(request)).await {

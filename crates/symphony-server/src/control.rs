@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use crate::presenter;
-use crate::view::{IssueView, RefreshAccepted, StateView};
+use crate::view::{IssueView, PauseState, RefreshAccepted, StateView};
 
 /// Why a state snapshot could not be produced. Reported **in-band** (HTTP 200) by
 /// `GET /api/v1/state` and in SSE `snapshot` events.
@@ -73,6 +73,33 @@ pub trait ControlPlane: Send + Sync + 'static {
     async fn issue(&self, identifier: &str) -> Option<IssueView> {
         let view = self.state().await.ok()?;
         presenter::issue_view(identifier, &view, &self.workspace_root())
+    }
+
+    /// The kill switch: `paused = true` stops every running agent and holds dispatch until it is
+    /// released. Answered within `refresh_timeout`. The default reports the orchestrator as
+    /// unavailable (control planes without spend controls).
+    async fn set_paused(
+        &self,
+        _paused: bool,
+        _reason: Option<String>,
+    ) -> Result<PauseState, Unavailable> {
+        Err(Unavailable)
+    }
+
+    /// Stops task `id` if it runs (`Ok(true)`) or releases it if it is blocked. The default
+    /// reports the orchestrator as unavailable.
+    async fn cancel_task(&self, _id: i64) -> Result<bool, Unavailable> {
+        Err(Unavailable)
+    }
+
+    /// Lets a re-queued blocked task run again (releases its claim and polls now).
+    async fn unblock_task(&self, _id: i64) -> Result<(), Unavailable> {
+        Err(Unavailable)
+    }
+
+    /// Names of the configured `backends` (task validation); `None` skips the check.
+    fn backend_names(&self) -> Option<Vec<String>> {
+        None
     }
 
     /// Change notifications: a receiver whose value is the orchestrator **generation**, a counter

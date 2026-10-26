@@ -10,6 +10,7 @@
 //! - [`control`]: `symphony_server::ControlPlane` over `symphony_runtime::RuntimeHandle`.
 //! - [`memory_seed`]: `tracker.provider.issues` for the memory tracker.
 //! - [`before_remove`]: closes a workspace branch's open PRs from the `before_remove` hook.
+//! - [`hardening`] / [`init`]: non-dumpable secrets, and the container image's PID 1.
 //! - [`version`]: the reported version (with the optional `-nightly` suffix).
 
 #![warn(missing_docs)]
@@ -20,6 +21,8 @@ pub mod before_remove;
 pub mod cli;
 pub mod control;
 pub mod dashboard;
+pub mod hardening;
+pub mod init;
 pub mod logging;
 pub mod memory_seed;
 pub mod rotating;

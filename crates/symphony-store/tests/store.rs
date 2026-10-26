@@ -708,3 +708,280 @@ async fn clones_share_one_database() {
     drop(store);
     assert!(other.get_run(id).await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn usage_is_summed_per_issue_and_since_a_time_with_cost() {
+    let store = memory();
+    let now = Utc::now();
+    let old = store
+        .start_run(NewRun {
+            started_at: Some(now - ChronoDuration::days(2)),
+            ..new_run("MT-1")
+        })
+        .await
+        .unwrap();
+    let today = store.start_run(new_run("MT-1")).await.unwrap();
+    let other = store.start_run(new_run("MT-2")).await.unwrap();
+    let tokens = |n: u64| TokenUsage {
+        input: n,
+        output: n,
+        total: 2 * n,
+    };
+    store.update_usage(old, tokens(100), 1_000).await.unwrap();
+    store.update_usage(today, tokens(10), 50).await.unwrap();
+    store.update_usage(other, tokens(1), 5).await.unwrap();
+
+    let issue = store.issue_usage("id-MT-1").await.unwrap();
+    assert_eq!(issue.tokens.total, 220);
+    assert_eq!(issue.cost_micro_usd, 1_050);
+    let day = store
+        .usage_since(now - ChronoDuration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(day.tokens.total, 22);
+    assert_eq!(day.cost_micro_usd, 55);
+    let run = store.get_run(today).await.unwrap().unwrap();
+    assert_eq!(run.cost_micro_usd, 50);
+    assert_eq!(store.totals().await.unwrap().cost_micro_usd, 1_055);
+    assert!(matches!(
+        store.update_usage(RunId(999), tokens(1), 1).await,
+        Err(StoreError::RunNotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn control_values_survive_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.control("paused").await.unwrap(), None);
+    store
+        .set_control("paused", Some("operator".into()))
+        .await
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(
+        store.control("paused").await.unwrap().as_deref(),
+        Some("operator")
+    );
+    store.set_control("paused", None).await.unwrap();
+    assert_eq!(store.control("paused").await.unwrap(), None);
+    assert_eq!(Store::disabled().control("paused").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn payload_retention_clears_old_payloads_but_keeps_events() {
+    let store = memory();
+    let run = store.start_run(new_run("MT-1")).await.unwrap();
+    store
+        .append_event(
+            run,
+            "notification",
+            Some("cmd".into()),
+            Some(json!({"out": "x"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .prune_payloads(Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(store.prune_payloads(Duration::ZERO).await.unwrap(), 1);
+    let events = store.list_events(run, None, None).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload, None);
+    assert_eq!(events[0].message.as_deref(), Some("cmd"));
+}
+
+#[test]
+fn a_full_queue_refuses_work_instead_of_growing() {
+    // No runtime is driving replies here; the database thread drains the queue as fast as it
+    // can, so flood it from many threads and expect either success or `Busy`, never a panic.
+    let store = memory();
+    let mut busy = 0;
+    let pending: Vec<_> = (0..symphony_store::STORE_QUEUE_CAPACITY * 3)
+        .map(|_| store.flush())
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    for op in pending {
+        match runtime.block_on(op) {
+            Ok(()) => {}
+            Err(StoreError::Busy) => busy += 1,
+            Err(other) => panic!("unexpected {other}"),
+        }
+    }
+    assert!(busy <= symphony_store::STORE_QUEUE_CAPACITY * 2, "{busy}");
+}
+
+fn task(prompt: &str) -> symphony_store::NewTask {
+    symphony_store::NewTask {
+        title: Some("t".into()),
+        prompt: prompt.into(),
+        metadata: Some(json!({"ticket": 7})),
+        limits: symphony_store::TaskLimits {
+            max_tokens: Some(1000),
+            timeout_ms: None,
+        },
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn tasks_move_through_their_lifecycle() {
+    use symphony_store::{TaskQuery, TaskStatus};
+    let store = memory();
+    let created = store.create_task(task("Summarize README")).await.unwrap();
+    assert_eq!(created.status, TaskStatus::Queued);
+    assert_eq!(created.identifier, format!("task-{}", created.id));
+    assert_eq!(created.metadata, Some(json!({"ticket": 7})));
+    assert_eq!(created.limits.max_tokens, Some(1000));
+
+    let queued = store.queued_tasks(10).await.unwrap();
+    assert_eq!(queued.len(), 1);
+    let running = store.start_task(created.id).await.unwrap().unwrap();
+    assert_eq!((running.status, running.attempts), (TaskStatus::Running, 1));
+    assert!(running.started_at.is_some());
+    assert_eq!(
+        store.start_task(created.id).await.unwrap(),
+        None,
+        "claimed once"
+    );
+    assert!(store.queued_tasks(10).await.unwrap().is_empty());
+
+    let blocked = store
+        .finish_task(
+            created.id,
+            TaskStatus::Blocked,
+            None,
+            Some("needs input".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    assert_eq!(blocked.finished_at, None);
+    let requeued = store
+        .requeue_task(created.id, Some("Use the main branch.".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(requeued.status, TaskStatus::Queued);
+    assert!(
+        requeued
+            .prompt
+            .ends_with("Operator reply:\nUse the main branch.")
+    );
+    assert_eq!(requeued.error, None);
+
+    store.start_task(created.id).await.unwrap().unwrap();
+    let done = store
+        .finish_task(
+            created.id,
+            TaskStatus::Succeeded,
+            Some("All good".into()),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Succeeded);
+    assert_eq!(done.result.as_deref(), Some("All good"));
+    assert!(done.finished_at.is_some());
+    assert!(matches!(
+        store.requeue_task(created.id, None).await,
+        Err(StoreError::InvalidArgument(_))
+    ));
+    assert_eq!(
+        store
+            .finish_task(created.id, TaskStatus::Failed, None, None)
+            .await
+            .unwrap(),
+        None,
+        "only running tasks finish"
+    );
+
+    let other = store.create_task(task("second")).await.unwrap();
+    let cancelled = store
+        .cancel_task(other.id, "not needed")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled.status, TaskStatus::Cancelled);
+    assert_eq!(cancelled.error.as_deref(), Some("not needed"));
+    // Final tasks are returned unchanged.
+    let again = store.cancel_task(created.id, "x").await.unwrap().unwrap();
+    assert_eq!(again.status, TaskStatus::Succeeded);
+    assert_eq!(store.cancel_task(999, "x").await.unwrap(), None);
+
+    let page = store
+        .list_tasks(TaskQuery {
+            limit: Some(1),
+            ..TaskQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks[0].id, other.id);
+    assert_eq!(page.next_before_id, Some(other.id));
+    let succeeded = store
+        .list_tasks(TaskQuery {
+            status: Some(TaskStatus::Succeeded),
+            ..TaskQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(succeeded.tasks.len(), 1);
+}
+
+#[tokio::test]
+async fn interrupted_tasks_are_queued_again_and_a_disabled_store_holds_none() {
+    use symphony_store::TaskStatus;
+    let store = memory();
+    let created = store.create_task(task("x")).await.unwrap();
+    store.start_task(created.id).await.unwrap();
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
+    let task_now = store.get_task(created.id).await.unwrap().unwrap();
+    assert_eq!(task_now.status, TaskStatus::Queued);
+    assert!(store.create_task(task("  ")).await.is_err());
+    assert!(matches!(
+        Store::disabled().create_task(task("x")).await,
+        Err(StoreError::Unavailable)
+    ));
+}
+
+#[tokio::test]
+async fn unblocking_cannot_grow_a_prompt_past_the_limit() {
+    use symphony_store::{MAX_TASK_PROMPT_BYTES, NewTask, TaskStatus};
+    let store = memory();
+    let task = store
+        .create_task(NewTask {
+            prompt: "x".repeat(MAX_TASK_PROMPT_BYTES - 10),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    store.start_task(task.id).await.unwrap();
+    store
+        .finish_task(
+            task.id,
+            TaskStatus::Blocked,
+            None,
+            Some("needs input".into()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .requeue_task(task.id, Some("a reply that is too long".into()))
+            .await,
+        Err(StoreError::InvalidArgument(_))
+    ));
+    let still = store.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(still.status, TaskStatus::Blocked);
+}

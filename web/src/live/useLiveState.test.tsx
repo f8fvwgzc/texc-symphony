@@ -26,7 +26,9 @@ describe('useLiveState', () => {
       <Probe api={api} options={{ createEventSource: FakeEventSource.factory }} />,
     );
     expect(screen.getByText('connecting:0:-')).toBeInTheDocument();
-    await act(() => FakeEventSource.latest().snapshot(makeSnapshot(), 9));
+    const es = await FakeEventSource.opened();
+    expect(es.url).toBe('/api/v1/events?ticket=ticket-1');
+    await act(() => es.snapshot(makeSnapshot(), 9));
     expect(screen.getByText('live:1:9')).toBeInTheDocument();
     // Preact 11 runs passive-effect cleanups after paint; act() flushes them.
     await act(() => {

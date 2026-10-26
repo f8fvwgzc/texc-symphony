@@ -15,6 +15,7 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::spend::{Pricing, Spend};
 use crate::recorder::RunRecorder;
 use crate::snapshot::{CodexMessage, CodexTotals};
 use crate::workspace::worker_hosts;
@@ -36,6 +37,28 @@ pub(crate) struct WorkerHandle {
     pub abort: AbortHandle,
     /// Resolves (with an error) once the worker future has been dropped (finished or aborted).
     pub done: oneshot::Receiver<()>,
+}
+
+/// Issue id prefix of task runs (`task:<id>`); tracker ids never look like this.
+pub(crate) const TASK_ID_PREFIX: &str = "task:";
+
+/// The task id of a task run's issue id.
+pub(crate) fn task_id(issue_id: &str) -> Option<i64> {
+    issue_id.strip_prefix(TASK_ID_PREFIX)?.parse().ok()
+}
+
+/// The issue id of a task's runs.
+pub(crate) fn task_issue_id(id: i64) -> String {
+    format!("{TASK_ID_PREFIX}{id}")
+}
+
+/// The task a running entry executes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TaskRun {
+    pub id: i64,
+    pub max_tokens: Option<u64>,
+    /// Final agent message, once the worker reported it.
+    pub result: Option<String>,
 }
 
 /// One running agent (`RunningEntry`).
@@ -61,6 +84,12 @@ pub(crate) struct RunningEntry {
     pub started_at: DateTime<Utc>,
     pub started: Instant,
     pub recorder: RunRecorder,
+    /// Token prices fixed at dispatch.
+    pub pricing: Pricing,
+    /// Cost of `tokens.totals` at `pricing`, in micro-USD.
+    pub cost_micro_usd: u64,
+    /// Set for task runs.
+    pub task: Option<TaskRun>,
 }
 
 /// One blocked issue (`BlockedEntry`).
@@ -251,6 +280,8 @@ pub(crate) struct State {
     pub retry_attempts: HashMap<String, RetryEntry>,
     pub codex_totals: CodexTotals,
     pub codex_rate_limits: Option<Value>,
+    /// Budget counters and the kill switch.
+    pub spend: Spend,
 }
 
 impl State {
@@ -445,6 +476,17 @@ impl RunningEntry {
         self.last_activity = now;
         let delta = self.tokens.apply(event.token_usage.as_ref());
         (delta, new_turn)
+    }
+
+    /// Re-prices the cumulative tokens; returns the cost added since the last call.
+    pub(crate) fn reprice(&mut self) -> u64 {
+        let totals = self.tokens.totals;
+        let cost = self
+            .pricing
+            .cost_micro_usd(totals.input_tokens, totals.output_tokens);
+        let delta = cost.saturating_sub(self.cost_micro_usd);
+        self.cost_micro_usd = cost.max(self.cost_micro_usd);
+        delta
     }
 
     pub(crate) fn is_blocker(&self) -> bool {

@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use crate::security::Auth;
+
 /// Default bind host (loopback, as the spec recommends).
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 /// Default `snapshot_timeout` (Elixir `snapshot_timeout_ms` 15 000).
@@ -30,9 +32,14 @@ pub struct ServerConfig {
     /// TCP port (`server.port` / `--port`); `0` binds an ephemeral port (see
     /// [`BoundServer::local_addr`](crate::BoundServer::local_addr)).
     pub port: u16,
-    /// Origins allowed by CORS (`*` allows any). Empty (the default) sends no CORS headers, so
-    /// browsers only allow same-origin use.
+    /// Origins allowed by CORS and for browser writes (`*` allows any). Empty (the default)
+    /// sends no CORS headers, so browsers only allow same-origin use.
     pub cors_allowed_origins: Vec<String>,
+    /// How API requests authenticate ([`Auth::disabled`] by default, which [`serve`](crate::serve)
+    /// accepts only on a loopback address).
+    pub auth: Auth,
+    /// `Host` names accepted besides loopback and `host` itself (`*` accepts any).
+    pub allowed_hosts: Vec<String>,
     /// Maximum concurrent `GET /api/v1/events` streams; further clients get
     /// `503 request_failed`. `0` means unlimited.
     pub max_sse_clients: usize,
@@ -59,6 +66,8 @@ impl Default for ServerConfig {
             host: DEFAULT_HOST.to_owned(),
             port: 0,
             cors_allowed_origins: Vec::new(),
+            auth: Auth::disabled(),
+            allowed_hosts: Vec::new(),
             max_sse_clients: DEFAULT_MAX_SSE_CLIENTS,
             snapshot_timeout: DEFAULT_SNAPSHOT_TIMEOUT,
             refresh_timeout: DEFAULT_REFRESH_TIMEOUT,

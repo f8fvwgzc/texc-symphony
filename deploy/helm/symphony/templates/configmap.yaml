@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "symphony.fullname" . }}-workflow
+  labels:
+    {{- include "symphony.labels" . | nindent 4 }}
+data:
+  WORKFLOW.md: |
+    {{- .Values.workflow | nindent 4 }}

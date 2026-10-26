@@ -202,6 +202,8 @@ pub struct RunRecord {
     pub duration_ms: Option<i64>,
     /// Latest cumulative token usage for the run.
     pub tokens: TokenUsage,
+    /// Cost of `tokens` in micro-USD at the prices configured when the run started.
+    pub cost_micro_usd: u64,
 }
 
 /// One entry of a run's event log.
@@ -234,6 +236,17 @@ pub struct TotalsRecord {
     pub tokens: TokenUsage,
     /// Sum of `duration_ms` over finished runs.
     pub runtime_ms: u64,
+    /// Sum of run costs in micro-USD.
+    pub cost_micro_usd: u64,
+}
+
+/// Token and cost totals over a set of runs (budget accounting).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    /// Summed token counters.
+    pub tokens: TokenUsage,
+    /// Summed cost in micro-USD.
+    pub cost_micro_usd: u64,
 }
 
 /// Filters and cursor for `Store::list_runs`. Deserializable from query strings
@@ -247,6 +260,9 @@ pub struct RunQuery {
     pub before_id: Option<i64>,
     /// Only runs for this issue identifier (exact match).
     pub issue_identifier: Option<String>,
+    /// Only runs for this issue id (exact match; task runs: `task:<id>`).
+    #[serde(default)]
+    pub issue_id: Option<String>,
     /// Only runs with this status.
     pub status: Option<RunStatus>,
 }
@@ -336,6 +352,7 @@ mod tests {
                 output: 8,
                 total: 12,
             },
+            cost_micro_usd: 90,
         };
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["id"], 7);
@@ -361,10 +378,11 @@ mod tests {
             "finished_at",
             "duration_ms",
             "tokens",
+            "cost_micro_usd",
         ] {
             assert!(keys.iter().any(|k| *k == key), "missing {key}");
         }
-        assert_eq!(keys.len(), 14);
+        assert_eq!(keys.len(), 15);
 
         let query: RunQuery =
             serde_json::from_value(serde_json::json!({"status": "failed", "limit": 10})).unwrap();

@@ -8,8 +8,10 @@ const DEFAULT_API_URL = 'http://127.0.0.1:4000';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'SYMPHONY_');
   const apiUrl = env['SYMPHONY_API_URL'] ?? DEFAULT_API_URL;
+  // `changeOrigin` rewrites `Host` to the API; `Origin` must follow, or the server's
+  // cross-origin write check refuses the dashboard's POSTs.
   const proxy = {
-    '/api': { target: apiUrl, changeOrigin: true },
+    '/api': { target: apiUrl, changeOrigin: true, headers: { origin: new URL(apiUrl).origin } },
   };
 
   return {

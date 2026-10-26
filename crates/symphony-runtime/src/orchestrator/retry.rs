@@ -65,6 +65,9 @@ impl Orchestrator<'_> {
     pub(crate) fn release_issue_claim(&mut self, issue_id: &str) {
         self.state.claimed.remove(issue_id);
         self.state.blocked.remove(issue_id);
+        // Bookkeeping sets must not grow with every issue ever seen.
+        self.state.completed.remove(issue_id);
+        self.state.spend.forget_issue(issue_id);
         self.remove_retry_entry(issue_id);
     }
 
@@ -265,6 +268,20 @@ impl Orchestrator<'_> {
             error: Some("no available orchestrator slots".into()),
             ..meta
         };
+        if let Some(stop) = self.spend_stop_for(&issue).await {
+            if let SpendStop::IssueExhausted(reason) = &stop {
+                tracing::warn!("Blocking {}: {reason}", issue_context(&issue));
+                self.block_for_budget(issue_id, &issue, reason.clone());
+                return;
+            }
+            let meta = RetryMeta {
+                identifier: issue.identifier.clone().or(meta.identifier.clone()),
+                error: Some(stop.reason().to_owned()),
+                ..meta
+            };
+            self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::Failure);
+            return;
+        }
         if self.state.available_slots() == 0
             || !self.state.state_slots_available(&issue, &settings)
             || host == HostChoice::NoCapacity

@@ -5,9 +5,10 @@ Symphony is one self-contained binary (`symphony`) with the web dashboard embedd
 it as a plain binary, in Docker, and under systemd, plus reverse proxies, backups and upgrades.
 
 > [!WARNING]
-> Symphony runs coding agents unattended, and its HTTP API has no authentication. Run it in a
-> trusted environment, keep the HTTP port on loopback or behind an authenticating proxy, and give
-> agents only the credentials they need.
+> Symphony runs coding agents unattended. Run it in a trusted environment and give agents only the
+> credentials they need. The HTTP API needs a bearer token (`server.api_token` or
+> `SYMPHONY_API_TOKEN`) on any non-loopback bind; Symphony refuses to start without one. Do not put
+> an HTTP basic-auth proxy in front: it uses the same `Authorization` header as the token.
 
 ## Command line and environment
 
@@ -31,6 +32,9 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
 | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`) |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
+| `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
+| `SYMPHONY_API_TOKEN` | unset | API bearer token when `server.api_token` is not set; required for a non-loopback `SYMPHONY_HOST` |
+| `LLM_*` | unset | the platform LLM connection contract: provider, endpoint, key file, model, gateway ([configuration.md](configuration.md#llm-connection-contract)) |
 | `SYMPHONY_LOG_FORMAT` | `text` | `json` for one JSON object per line on stdout (the log file stays text) |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info` or `symphony=debug,info` |
 | `SYMPHONY_SSH_CONFIG` | | SSH client config for `worker.ssh_hosts` |
@@ -38,7 +42,16 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 
 The HTTP server serves the dashboard at `/`, the API under `/api/v1` (see
 [`api/README.md`](api/README.md)) and a liveness probe at `GET /api/v1/health`, which never touches
-the orchestrator.
+the orchestrator and needs no token. The `Host` allow-list still applies to it: a probe from
+outside the container must use a loopback name or one listed in `server.allowed_hosts` (a
+`0.0.0.0` bind host is not added to the list).
+
+**Exposure.** Symphony refuses to bind a non-loopback address unless an API token is configured
+(`server.api_token` or `SYMPHONY_API_TOKEN`). With a token, every other `/api/*` call needs
+`Authorization: Bearer <token>`; the dashboard asks for it. Requests whose `Host` is not loopback,
+the bind address or a `server.allowed_hosts` entry are refused, and browser writes from other
+origins are refused. Use `budget:` in `WORKFLOW.md` and the kill switch (`POST /api/v1/pause`) to
+cap spending.
 
 ## Runtime requirements
 
@@ -55,7 +68,8 @@ Release assets are raw executables plus checksums, named
 are static (musl) and run on any distribution.
 
 ```sh
-version=v0.1.0 target=linux_x86_64          # or linux_arm64, macos_arm64, macos_x86_64
+version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/f8fvwgzc/texc-symphony/releases/latest | sed 's|.*/||')   # or a tag, e.g. v0.1.0
+target=linux_x86_64                          # or linux_arm64, macos_arm64, macos_x86_64
 base=https://github.com/f8fvwgzc/texc-symphony/releases/download/$version
 curl -fL -O "$base/symphony-$version-$target" -O "$base/symphony-$version-$target.sha256"
 shasum -a 256 -c "symphony-$version-$target.sha256"
@@ -87,16 +101,39 @@ dashboard.
 ## Option 2: Docker (any OS, amd64 or arm64)
 
 The image `ghcr.io/f8fvwgzc/texc-symphony` bundles the binary, git, ssh, Node.js and the Codex
-CLI, runs as uid 10001 under `tini`, keeps history and logs on `/data` and workspaces on
-`/workspaces`. See [`docker/README.md`](../docker/README.md) for Compose, Apple Silicon/Intel,
-Linux servers, Codex login and multi-arch builds. In short:
+CLI, runs as uid 10001 under its own init (`symphony init`), keeps history and logs on `/data`
+and workspaces on `/workspaces`. See [`docker/README.md`](../docker/README.md) for Compose,
+Apple Silicon/Intel, Linux servers, Codex login and multi-arch builds. In short:
 
 ```sh
 cd docker && cp .env.example .env && mkdir -p config && cp WORKFLOW.example.md config/WORKFLOW.md
 docker compose up -d
 ```
 
-## Option 3: systemd (Linux server, binary install)
+## Option 3: Kubernetes (Helm)
+
+The chart in [`deploy/helm/symphony`](../deploy/helm/symphony) runs one replica with the image,
+`WORKFLOW.md` from values (a ConfigMap at `/config`), persistent volumes for `/data` and
+`/workspaces`, the API token from a Secret, and the platform LLM connection contract
+([configuration.md](configuration.md#llm-connection-contract)):
+
+```sh
+kubectl create secret generic symphony-api-token --from-literal=token="$(openssl rand -hex 32)"
+kubectl create configmap llm-config --from-literal=LLM_GATEWAY_URL=http://attache-gateway:8080 \
+  --from-literal=LLM_MODEL=claude-sonnet-4-5          # usually shared by every core
+kubectl create secret generic llm-credentials --from-file=gateway-token=./gateway-token
+helm install symphony deploy/helm/symphony --set acknowledgeGuardrails=true \
+  --set global.llm.gatewayUrl=http://attache-gateway:8080
+```
+
+- `global.llm.*` (`provider`, `baseUrl`, `model`, `modelSmall`, `timeoutSecs`, `maxRetries`,
+  `gatewayUrl`) set `LLM_*` explicitly and win over the `llm-config` ConfigMap. Set
+  `global.llm.gatewayUrl` in gateway mode so only the gateway token is mounted.
+- Credentials are files under `/var/run/secrets/llm` (Secret `llm-credentials`, keys `api-key`
+  and `gateway-token`, both optional). Set `global.llm.apiKeySecretKey=""` for keyless servers.
+- The pod runs as uid 10001 with no capabilities. `make helm-check` lints and renders the chart.
+
+## Option 4: systemd (Linux server, binary install)
 
 Create a service user and directories:
 
@@ -233,6 +270,22 @@ hooks. Logs rotate at 10 MiB × 5 files under `<SYMPHONY_LOGS_ROOT>/log/`.
 3. Restart. Database migrations are applied automatically and exactly once at startup. Runs that
    were in flight are closed as `cancelled` ("interrupted by restart"), and still-active issues
    are picked up again from the tracker.
+
+### Changes that need action (security hardening and agent backends)
+
+| Change | What to do |
+|---|---|
+| A non-loopback `server.host`/`SYMPHONY_HOST` (the Docker image: `0.0.0.0`) refuses to start without an API token. | Set `SYMPHONY_API_TOKEN` (or `server.api_token`); clients send `Authorization: Bearer`, the dashboard asks once. |
+| Requests with another `Host` get `403 host_not_allowed`; cross-origin browser writes are refused. | List proxy names in `server.allowed_hosts`, other origins in `server.allowed_origins`. Remove HTTP basic auth in front (it uses the same header). |
+| The image no longer passes `--i-understand-that-this-will-be-running-without-the-usual-guardrails`. | Review the sandbox settings, then pass the flag (Compose override, `docker run` args, Helm `acknowledgeGuardrails: true`). |
+| Shipped `WORKFLOW.md` examples use Codex's safe defaults (no network in the turn sandbox, escalations rejected). | Re-enable `turn_sandbox_policy.networkAccess` deliberately if agents need to push or install. |
+| Tracker tools are scoped to the configured repository/project, `DELETE` and admin paths are off. | `tracker.agent_tools.methods` / `allow_admin_paths` to widen them. GitHub and GitLab need `required_labels` or `provider.allowed_authors`. |
+| Raw event payloads expire after 7 days; recorded events no longer keep the `raw` message copy. | `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS=0` keeps payloads with their runs. |
+| `api` backends: `sandbox: none` and `sandbox: seatbelt` need `unconfined: true`, and `none` refuses an explicit `network: false`; `auto` is bubblewrap only (seatbelt must be chosen explicitly, for development). | Install bubblewrap with unprivileged user namespaces, or set `unconfined: true` knowingly. |
+| `claude_code` backends always run with `--setting-sources user --strict-mcp-config`; `extra_args` may not change them. | Move project settings the operator wants into the Symphony user's own Claude settings. |
+| The `LLM_*` contract configures Codex's provider (OpenAI-compatible or gateway) unless `codex.provider` is set; it never changes `agent.backend`. | Set `codex.provider` to keep a different provider; set `agent.backend: llm` to use the built-in loop. The startup log names what the contract configures. |
+| The image's entrypoint is `symphony init -- symphony` (was `tini -- symphony`): tini's `/proc/1/environ` exposed every secret to agents. | If you override the entrypoint (Kubernetes `command:`, Compose `entrypoint:`), start it with `symphony init -- symphony`. Do not enable Docker's `--init` / Compose `init: true`. |
+| Task identifiers are `task-<id>` (was `TASK-<id>`); task workspaces live in `<workspace.root>/.tasks/<id>` and are removed when the task ends. | Update clients that matched on the identifier. |
 
 Downgrades: an older binary refuses to open a database written by a newer schema
 (`store_schema_too_new`). Restore the pre-upgrade backup, or start the old version with

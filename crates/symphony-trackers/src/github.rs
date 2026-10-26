@@ -6,13 +6,19 @@
 //!   `X-GitHub-Api-Version: 2022-11-28`, `User-Agent: symphony`.
 //! - States: only `open`/`closed` map to the API `state` filter (`all` for both); anything else reads
 //!   nothing. Pages of 100 sorted by creation, stopping at the first short page.
-//! - Pull requests come back from the Issues API and are kept with `dispatchable: false`.
-//! - One agent tool, `github_api` (raw REST passthrough).
+//! - Pull requests come back from the Issues API and are kept with `dispatchable: false`; so are
+//!   issues opened by anyone outside `provider.allowed_authors` when that list is set.
+//! - One agent tool, `github_api`: a REST passthrough limited to `/repos/{owner}/{repo}` of the
+//!   configured repository, the `tracker.agent_tools` methods, and no [`ADMIN_SUBPATHS`] unless
+//!   `allow_admin_paths` (see [`crate::scope`]).
+
+// Modified 2026-10-25: scoped `github_api` and `allowed_authors` routing (audit A2).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use symphony_core::config::schema::AgentToolSettings;
 use symphony_core::config::tracker::validate_tracker;
 use symphony_core::config::{
     GitHubSettings, TrackerSettings, resolve_github, secret_environment_names,
@@ -22,9 +28,10 @@ use symphony_core::{EnvSource, Issue, TrackerConfigError};
 
 use crate::error::{Provider, TrackerError};
 use crate::rest::{
-    RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
+    RestCall, RestResponse, RestToolMessages, RestToolSpec, encode_unreserved, map_status,
     normalize_candidate_page, opt_string, parse_positive_id, present_str, query_pairs, state_set,
 };
+use crate::scope::{self, Denied};
 use crate::tool::{ToolContext, ToolResult};
 use crate::transport::{HttpClient, HttpRequest, Method};
 use crate::{MAX_PAGES, Tracker};
@@ -34,11 +41,43 @@ pub const PAGE_SIZE: usize = 100;
 /// `X-GitHub-Api-Version` header value.
 pub const API_VERSION: &str = "2022-11-28";
 
+/// Repository subresources (below `/repos/{owner}/{repo}/`) that need
+/// `tracker.agent_tools.allow_admin_paths`: webhooks, keys, access, secrets and variables, Actions
+/// permissions and runners, environments, branch protection and rulesets, ownership and security
+/// settings. `*` matches one segment (branch names may span several, so `protection` is also
+/// matched anywhere below `branches/`).
+pub const ADMIN_SUBPATHS: &[&str] = &[
+    "hooks",
+    "keys",
+    "collaborators",
+    "invitations",
+    "teams",
+    "actions/secrets",
+    "actions/variables",
+    "actions/permissions",
+    "actions/runners",
+    "actions/runner-groups",
+    "actions/oidc",
+    "dependabot/secrets",
+    "codespaces/secrets",
+    "environments",
+    "rulesets",
+    "transfer",
+    "vulnerability-alerts",
+    "automated-security-fixes",
+    "private-vulnerability-reporting",
+    "code-security-configuration",
+    "pages",
+    "autolinks",
+    "interaction-limits",
+    "properties",
+];
+
 /// The `github_api` tool.
 pub static TOOL: RestToolSpec = RestToolSpec {
     provider: Provider::Github,
     name: "github_api",
-    description: "Execute a GitHub REST API request using Symphony's configured auth.\n",
+    description: "Execute a GitHub REST API request for the configured repository (paths under /repos/{owner}/{repo}) using Symphony's configured auth.\n",
     methods: &["GET", "POST", "PATCH", "PUT", "DELETE"],
     method_description: "GitHub REST method.",
     path_description: "GitHub REST path such as /repos/owner/repo/issues/1/comments.",
@@ -199,6 +238,53 @@ pub fn normalize_issue(raw: &Value, repo: &str) -> Option<Issue> {
     })
 }
 
+/// `normalize_issue`, then `dispatchable: false` when `allowed_authors` is set and the issue's
+/// `user.login` is not in it (case-insensitive).
+fn normalize_routed(raw: &Value, settings: &GitHubSettings) -> Option<Issue> {
+    let mut issue = normalize_issue(raw, &settings.repo)?;
+    if !settings.allowed_authors.is_empty() {
+        let author = raw
+            .pointer("/user/login")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        if !author.is_some_and(|a| settings.allowed_authors.contains(&a)) {
+            issue.dispatchable = false;
+        }
+    }
+    Some(issue)
+}
+
+/// The `github_api` scope: `/repos/{owner}/{repo}` of the configured repository (owner and name
+/// compared case-insensitively, no encoded `/`), the bare repository resource read-only, no
+/// [`ADMIN_SUBPATHS`] — the last two unless `allow_admin_paths`.
+pub fn check_scope(
+    settings: &GitHubSettings,
+    call: &RestCall,
+    policy: &AgentToolSettings,
+) -> Result<(), Denied> {
+    let segments = scope::split_path(TOOL.name, &call.path)?;
+    scope::refuse_encoded_slashes(TOOL.name, &segments)?;
+    let (owner, name) = settings
+        .repo
+        .split_once('/')
+        .unwrap_or((&settings.repo, ""));
+    let scope_text = format!("paths under /repos/{}", settings.repo);
+    match segments.as_slice() {
+        [repos, o, n, rest @ ..] if repos.is("repos") && o.is(owner) && n.is(name) => {
+            scope::check_scope_root(TOOL.name, rest, call.method, policy, "the repository")?;
+            let protection = matches!(rest.first(), Some(first) if first.is("branches"))
+                && rest.iter().skip(2).any(|s| s.is("protection"));
+            if !policy.allow_admin_paths
+                && (protection || scope::matches_admin(rest, ADMIN_SUBPATHS))
+            {
+                return Err(scope::admin_path(TOOL.name, &call.path));
+            }
+            Ok(())
+        }
+        _ => Err(scope::out_of_scope(TOOL.name, &scope_text)),
+    }
+}
+
 fn extract_labels(labels: Option<&Value>) -> Vec<String> {
     let Some(labels) = labels.and_then(Value::as_array) else {
         return Vec::new();
@@ -249,7 +335,7 @@ impl Tracker for GitHubTracker {
                 &raw,
                 "GitHub issue",
                 &requested,
-                |item| normalize_issue(item, &resolved.repo),
+                |item| normalize_routed(item, &resolved),
             ));
             if raw.len() < PAGE_SIZE {
                 return Ok(issues);
@@ -277,7 +363,7 @@ impl Tracker for GitHubTracker {
             match self.get(&resolved, &path, Map::new(), true).await? {
                 None => {}
                 Some(raw @ Value::Object(_)) => issues.push(
-                    normalize_issue(&raw, &resolved.repo)
+                    normalize_routed(&raw, &resolved)
                         .ok_or(TrackerError::UnknownPayload(Provider::Github))?,
                 ),
                 Some(_) => return Err(TrackerError::UnknownPayload(Provider::Github)),
@@ -292,8 +378,8 @@ impl Tracker for GitHubTracker {
         secret_environment_names(settings)
     }
 
-    fn agent_tool_specs(&self) -> Vec<Value> {
-        vec![TOOL.spec()]
+    fn agent_tool_specs(&self, settings: &TrackerSettings) -> Vec<Value> {
+        vec![TOOL.spec(&settings.agent_tools)]
     }
 
     async fn execute_agent_tool(
@@ -309,14 +395,18 @@ impl Tracker for GitHubTracker {
             Ok(call) => call,
             Err(err) => return TOOL.argument_error(err),
         };
+        let resolved = match self.settings(&ctx.settings) {
+            Ok(resolved) => resolved,
+            Err(err) => return TOOL.client_error(&err),
+        };
+        let policy = &ctx.settings.agent_tools;
+        if let Err(denied) = scope::check_method(&TOOL, call.method, policy)
+            .and_then(|()| check_scope(&resolved, &call, policy))
+        {
+            return denied.tool_result();
+        }
         match self
-            .request(
-                &ctx.settings,
-                call.method,
-                &call.path,
-                &call.query,
-                call.body,
-            )
+            .perform(&resolved, call.method, &call.path, &call.query, call.body)
             .await
         {
             Ok(response) => TOOL.response(&response),

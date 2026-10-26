@@ -35,6 +35,14 @@ pub enum ServerError {
     /// The server task panicked or was aborted.
     #[error("server_task_failed: {0}")]
     Task(String),
+    /// A non-loopback address was requested without API authentication.
+    #[error(
+        "auth_required: refusing to serve the API on {addr} without an API token; set server.api_token (or SYMPHONY_API_TOKEN), or bind 127.0.0.1"
+    )]
+    AuthRequired {
+        /// The requested address.
+        addr: SocketAddr,
+    },
 }
 
 /// An error answered with `{"error": {"code", "message"}}`.
@@ -56,6 +64,16 @@ pub(crate) enum ApiError {
     StoreDisabled,
     /// `request_failed` with the given status and message.
     RequestFailed(StatusCode, String),
+    /// 401 `unauthorized`: missing or invalid API token / SSE ticket.
+    Unauthorized,
+    /// 403 `host_not_allowed`: the `Host` header names another site (DNS rebinding).
+    HostNotAllowed,
+    /// 403 `origin_not_allowed`: a browser write from another origin.
+    OriginNotAllowed,
+    /// 404 `task_not_found`.
+    TaskNotFound,
+    /// 409 `task_conflict`: the task is not in a state that allows the action.
+    Conflict(String),
 }
 
 impl ApiError {
@@ -72,14 +90,18 @@ impl ApiError {
 
     pub(crate) fn status(&self) -> StatusCode {
         match self {
-            ApiError::NotFound | ApiError::IssueNotFound | ApiError::RunNotFound => {
-                StatusCode::NOT_FOUND
-            }
+            ApiError::NotFound
+            | ApiError::IssueNotFound
+            | ApiError::RunNotFound
+            | ApiError::TaskNotFound => StatusCode::NOT_FOUND,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             ApiError::OrchestratorUnavailable | ApiError::StoreDisabled => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             ApiError::InvalidParameter(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::HostNotAllowed | ApiError::OriginNotAllowed => StatusCode::FORBIDDEN,
             ApiError::RequestFailed(status, _) => *status,
         }
     }
@@ -104,6 +126,17 @@ impl ApiError {
             ApiError::RequestFailed(_, message) => {
                 ErrorEnvelope::new("request_failed", message.clone())
             }
+            ApiError::Unauthorized => {
+                ErrorEnvelope::new("unauthorized", "Missing or invalid API token")
+            }
+            ApiError::HostNotAllowed => {
+                ErrorEnvelope::new("host_not_allowed", "Host header is not allowed")
+            }
+            ApiError::OriginNotAllowed => {
+                ErrorEnvelope::new("origin_not_allowed", "Cross-origin request refused")
+            }
+            ApiError::TaskNotFound => ErrorEnvelope::new("task_not_found", "Task not found"),
+            ApiError::Conflict(message) => ErrorEnvelope::new("task_conflict", message.clone()),
         }
     }
 }

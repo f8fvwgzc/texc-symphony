@@ -99,3 +99,35 @@ impl Tracker for MemoryTracker {
         Vec::new()
     }
 }
+
+/// The `none` adapter: no tracker at all (work arrives through the task API). Never has issues
+/// and offers no agent tools.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoTracker;
+
+#[async_trait]
+impl Tracker for NoTracker {
+    fn kind(&self) -> &'static str {
+        "none"
+    }
+
+    async fn fetch_issues_by_states(
+        &self,
+        _settings: &TrackerSettings,
+        _states: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_issues_by_ids(
+        &self,
+        _settings: &TrackerSettings,
+        _ids: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        Ok(Vec::new())
+    }
+
+    fn secret_environment_names(&self, _settings: &TrackerSettings) -> Vec<String> {
+        Vec::new()
+    }
+}

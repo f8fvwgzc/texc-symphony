@@ -29,6 +29,7 @@
 //! - [`ssh`]: SSH argv construction, `host:port` parsing and the Codex [`SshLauncher`].
 //! - [`process`]: hook processes in their own process groups, killed on timeout.
 //! - [`tracker`]: adapter selection and per-read timeouts.
+//! - [`redact`]: secret scrubbing for recorded and served run events.
 
 #![warn(missing_docs)]
 
@@ -38,6 +39,7 @@ pub mod humanize;
 pub mod orchestrator;
 pub mod process;
 mod recorder;
+pub mod redact;
 pub mod runner;
 pub mod runtime;
 pub mod snapshot;
@@ -61,12 +63,13 @@ pub use runner::{
 };
 pub use runtime::{RestartPolicy, Runtime, RuntimeError, RuntimeOptions};
 pub use snapshot::{
-    BlockedSnapshot, CodexMessage, CodexTotals, IssueSnapshot, IssueStatus, PollingStatus,
-    RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot, TrackerInfo,
+    BlockedSnapshot, CodexMessage, CodexTotals, IssueSnapshot, IssueStatus, PauseAck,
+    PollingStatus, RefreshAck, RetrySnapshot, RunningSnapshot, Snapshot, SpendSnapshot,
+    TrackerInfo,
 };
 pub use ssh::{SshConfig, SshError, SshLauncher};
 pub use tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
 pub use worker::{
-    FnWorkerFactory, RunError, WorkerContext, WorkerFactory, WorkerReporter, WorkerResult,
+    FnWorkerFactory, RunError, TaskSpec, WorkerContext, WorkerFactory, WorkerReporter, WorkerResult,
 };
 pub use workspace::{IssueContext, WorkspaceError, WorkspaceManager};

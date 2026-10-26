@@ -326,7 +326,8 @@ async fn turn_timeout_resets_on_stream_updates_and_fires_after_silence() {
     let options = h.options_for(
         &ws,
         fixture_command("stream_updates.sh"),
-        json!({"turn_timeout_ms": 250}),
+        // 0.15 s gaps, 0.75 s in total: only a reset on every update keeps the turn alive.
+        json!({"turn_timeout_ms": 500}),
     );
     run(
         options,

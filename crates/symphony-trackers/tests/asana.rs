@@ -97,7 +97,7 @@ async fn adapter_validates_asana_config_delegates_reads_and_advertises_asana_api
         tracker.validate_config(&tracker_settings(t)),
         Err(C::InvalidAsanaStates.into())
     );
-    let specs = tracker.agent_tool_specs();
+    let specs = tracker.agent_tool_specs(&settings(json!({})));
     assert_eq!(specs.len(), 1);
     assert_eq!(specs[0]["name"], "asana_api");
     assert_eq!(
@@ -107,14 +107,16 @@ async fn adapter_validates_asana_config_delegates_reads_and_advertises_asana_api
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/api/1.0/users/me"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"gid": "me"}})))
+        .and(path("/api/1.0/projects/project-1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": {"gid": "project-1"}})),
+        )
         .mount(&server)
         .await;
     let (ok, _) = run_tool(
         &tracker_for(&server),
         "asana_api",
-        json!({"method": "GET", "path": "/users/me"}),
+        json!({"method": "GET", "path": "/projects/project-1"}),
         &settings(json!({})),
     )
     .await;
@@ -411,7 +413,14 @@ async fn asana_api_preserves_rest_status_and_body_while_rejecting_unsafe_argumen
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/api/1.0/tasks/404"))
+        .and(path("/api/1.0/tasks/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "42", "memberships": [{"project": {"gid": "project-1"}}]
+        }})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/tasks/42/missing"))
         .respond_with(ResponseTemplate::new(404).set_body_json(json!({"errors": []})))
         .mount(&server)
         .await;
@@ -436,14 +445,20 @@ async fn asana_api_preserves_rest_status_and_body_while_rejecting_unsafe_argumen
     );
     assert_eq!(result.content_items[0].kind, "inputText");
     assert_eq!(result.content_items[0].text, result.output);
-    let request = &server.received_requests().await.unwrap()[0];
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "membership lookup, then the call");
+    assert_eq!(
+        query_of(&requests[0]),
+        vec![("opt_fields".into(), "memberships.project.gid".into())]
+    );
+    let request = &requests[1];
     assert_eq!(query_of(request), vec![("opt_fields".into(), "gid".into())]);
     assert_eq!(json_body(request), json!({"data": {"text": "hello"}}));
 
     let (ok, output) = run_tool(
         &tracker,
         "asana_api",
-        json!({"method": "GET", "path": "/tasks/404"}),
+        json!({"method": "GET", "path": "/tasks/42/missing"}),
         &s,
     )
     .await;
@@ -496,7 +511,7 @@ async fn asana_api_reports_unsupported_tools_malformed_calls_and_client_failures
     let (ok, output) = run_tool(
         &tracker,
         "asana_api",
-        json!({"method": "GET", "path": "/users/me"}),
+        json!({"method": "GET", "path": "/projects/project-1"}),
         &settings(json!({"api_key": 123})),
     )
     .await;
@@ -508,7 +523,7 @@ async fn asana_api_reports_unsupported_tools_malformed_calls_and_client_failures
     let (ok, output) = run_tool(
         &tracker,
         "asana_api",
-        json!({"method": "GET", "path": "/users/me"}),
+        json!({"method": "GET", "path": "/projects/project-1"}),
         &settings(json!({"project_gid": 123})),
     )
     .await;
@@ -538,4 +553,339 @@ async fn tracker_binds_asana_tools_and_token_env_names_from_provider_config() {
         symphony_trackers::validate_config(&workflow.tracker, &deps),
         Ok(())
     );
+}
+
+// ---- agent tool scope (2026-10-25 audit A2) ----
+
+#[test]
+fn asana_api_scope_classifies_paths() {
+    use symphony_core::config::schema::AgentToolSettings;
+    use symphony_trackers::asana::ScopeTarget;
+    use symphony_trackers::rest::RestCall;
+    use symphony_trackers::transport::Method;
+
+    let resolved = resolved(&settings(json!({})));
+    let policy = AgentToolSettings::default();
+    let check = |method, path: &str, body: Option<Value>| {
+        asana::check_scope(
+            &resolved,
+            &RestCall {
+                method,
+                path: path.into(),
+                query: Default::default(),
+                body,
+            },
+            &policy,
+        )
+        .map_err(|denied| denied.rule)
+    };
+    assert_eq!(
+        check(Method::Get, "/projects/project-1/tasks", None),
+        Ok(vec![ScopeTarget::Project])
+    );
+    assert_eq!(
+        check(Method::Post, "/tasks/42/stories", None),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
+    assert_eq!(
+        check(Method::Post, "/sections/s-1/addTask", None),
+        Ok(vec![ScopeTarget::Section("s-1".into())])
+    );
+    // Every task the body names must be verified as well.
+    assert_eq!(
+        check(
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": "77", "insert_before": "78"}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Section("s-1".into()),
+            ScopeTarget::Task("77".into()),
+            ScopeTarget::Task("78".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/addDependencies",
+            Some(json!({"data": {"dependencies": ["5", {"gid": "6"}]}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Task("42".into()),
+            ScopeTarget::Task("5".into()),
+            ScopeTarget::Task("6".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/setParent",
+            Some(json!({"data": {"parent": "9"}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Task("42".into()),
+            ScopeTarget::Task("9".into())
+        ])
+    );
+    // Numbers and single {gid} objects are references too; `null` clears the parent.
+    assert_eq!(
+        check(
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": 77, "insert_after": {"gid": "78"}}}))
+        ),
+        Ok(vec![
+            ScopeTarget::Section("s-1".into()),
+            ScopeTarget::Task("77".into()),
+            ScopeTarget::Task("78".into()),
+        ])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/setParent",
+            Some(json!({"data": {"parent": null}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"name": "s"}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks/42/addProject",
+            Some(json!({"data": {"project": "project-1"}}))
+        ),
+        Ok(vec![ScopeTarget::Task("42".into())])
+    );
+    assert_eq!(
+        check(
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"name": "n", "projects": ["project-1"]}}))
+        ),
+        Ok(vec![ScopeTarget::Project])
+    );
+    for (method, path, body, rule) in [
+        (
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"projects": ["other"]}})),
+            "body_out_of_scope",
+        ),
+        // Listing the configured project next to another one would file the task there too.
+        (
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"projects": ["project-1", "other"]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks",
+            Some(json!({"data": {"projects": []}})),
+            "body_out_of_scope",
+        ),
+        (Method::Get, "/tasks", None, "body_out_of_scope"),
+        // A reference of an unexpected shape is refused instead of skipped.
+        (
+            Method::Post,
+            "/sections/s-1/addTask",
+            Some(json!({"data": {"task": true}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addDependencies",
+            Some(json!({"data": {"dependencies": ["5", {"name": "x"}]}})),
+            "body_out_of_scope",
+        ),
+        // Subtasks and new tasks may not be filed into other projects.
+        (
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"projects": ["other"]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/subtasks",
+            Some(json!({"data": {"memberships": [{"project": "other"}]}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks",
+            Some(
+                json!({"data": {"projects": ["project-1"], "memberships": [{"project": "other"}]}}),
+            ),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addProject",
+            Some(json!({"data": {"project": "other"}})),
+            "body_out_of_scope",
+        ),
+        (
+            Method::Post,
+            "/tasks/42/addProject",
+            None,
+            "body_out_of_scope",
+        ),
+        (Method::Get, "/users/me", None, "path_out_of_scope"),
+        (
+            Method::Get,
+            "/workspaces/1/tasks",
+            None,
+            "path_out_of_scope",
+        ),
+        (
+            Method::Get,
+            "/projects/other/tasks",
+            None,
+            "path_out_of_scope",
+        ),
+        (Method::Get, "/stories/1", None, "path_out_of_scope"),
+        (Method::Put, "/projects/project-1", None, "admin_path"),
+        (
+            Method::Post,
+            "/projects/project-1/addMembers",
+            None,
+            "admin_path",
+        ),
+        (Method::Put, "/sections/s-1", None, "admin_path"),
+        (Method::Get, "/tasks/42/../../users/me", None, "unsafe_path"),
+    ] {
+        assert_eq!(check(method, path, body), Err(rule), "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn asana_api_checks_task_and_section_membership_before_writing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/tasks/outside"))
+        .and(query_param("opt_fields", "memberships.project.gid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "outside", "memberships": [{"project": {"gid": "other-project"}}]
+        }})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/tasks/42"))
+        .and(query_param("opt_fields", "memberships.project.gid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "42", "memberships": [{"project": {"gid": "project-1"}}]
+        }})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/tasks/gone"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"errors": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/sections/s-in"))
+        .and(query_param("opt_fields", "project.gid"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "s-in", "project": {"gid": "project-1"}
+        }})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/1.0/sections/s-out"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {
+            "gid": "s-out", "project": {"gid": "other-project"}
+        }})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/1.0/sections/s-in/addTask"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/1.0/tasks"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"data": {"gid": "new"}})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Writes that must never be sent.
+    for denied_path in [
+        "/api/1.0/tasks/outside/stories",
+        "/api/1.0/tasks/gone/stories",
+        "/api/1.0/sections/s-out/addTask",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(denied_path))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+    let tracker = tracker_for(&server);
+    let s = settings(json!({}));
+    for path in [
+        "/tasks/outside/stories",
+        "/tasks/gone/stories",
+        "/sections/s-out/addTask",
+    ] {
+        let (ok, output) = run_tool(
+            &tracker,
+            "asana_api",
+            json!({"method": "POST", "path": path, "body": {"data": {"text": "x"}}}),
+            &s,
+        )
+        .await;
+        assert!(!ok, "{path}");
+        assert_eq!(output["error"]["rule"], "path_out_of_scope", "{path}");
+    }
+    let (ok, _) = run_tool(
+        &tracker,
+        "asana_api",
+        json!({"method": "POST", "path": "/sections/s-in/addTask", "body": {"data": {"task": "42"}}}),
+        &s,
+    )
+    .await;
+    assert!(ok);
+    // A foreign task moved into an in-project section is refused (it would then pass the
+    // membership check of /tasks/{gid}).
+    let (ok, output) = run_tool(
+        &tracker,
+        "asana_api",
+        json!({"method": "POST", "path": "/sections/s-in/addTask", "body": {"data": {"task": "outside"}}}),
+        &s,
+    )
+    .await;
+    assert!(!ok);
+    assert_eq!(output["error"]["rule"], "path_out_of_scope");
+    let (ok, _) = run_tool(
+        &tracker,
+        "asana_api",
+        json!({"method": "POST", "path": "/tasks", "body": {"data": {"name": "n", "projects": ["project-1"]}}}),
+        &s,
+    )
+    .await;
+    assert!(ok);
+    let (ok, output) = run_tool(
+        &tracker,
+        "asana_api",
+        json!({"method": "DELETE", "path": "/tasks/42"}),
+        &s,
+    )
+    .await;
+    assert!(!ok);
+    assert_eq!(output["error"]["rule"], "method_not_allowed");
+    server.verify().await;
 }

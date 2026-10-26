@@ -6,6 +6,7 @@ const LABELS: Record<ConnectionStatus, string> = {
   live: 'Live',
   polling: 'Polling',
   offline: 'Offline',
+  unauthorized: 'Token needed',
 };
 
 const DESCRIPTIONS: Record<ConnectionStatus, string> = {
@@ -13,6 +14,7 @@ const DESCRIPTIONS: Record<ConnectionStatus, string> = {
   live: 'Receiving live updates over Server-Sent Events.',
   polling: 'Event stream unavailable; refreshing every few seconds.',
   offline: 'Cannot reach the Symphony server.',
+  unauthorized: 'The Symphony server requires an API token.',
 };
 
 const DOT_CLASS: Record<ConnectionStatus, string> = {
@@ -20,6 +22,7 @@ const DOT_CLASS: Record<ConnectionStatus, string> = {
   live: 'bg-ok',
   polling: 'bg-warn',
   offline: 'bg-destructive',
+  unauthorized: 'bg-destructive',
 };
 
 /** How the dashboard is currently receiving state. The status is also exposed as `data-status`. */

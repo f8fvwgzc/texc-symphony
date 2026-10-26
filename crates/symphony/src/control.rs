@@ -1,18 +1,21 @@
 //! [`symphony_server::ControlPlane`] over the runtime's [`RuntimeHandle`] (the binary is the only
 //! crate that knows both; the server never depends on the runtime).
 
+// Modified 2026-10-25: redacted messages, spend view and the kill switch (audit A1/A4).
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use symphony_core::WorkflowStore;
+use symphony_core::{ProcessEnv, WorkflowStore};
+use symphony_runtime::redact::Redactor;
 use symphony_runtime::{
-    BlockedSnapshot, RefreshError, RetrySnapshot, RunningSnapshot, RuntimeHandle, Snapshot,
-    SnapshotError, humanize_codex_message,
+    BlockedSnapshot, CodexMessage, RefreshError, RetrySnapshot, RunningSnapshot, RuntimeHandle,
+    Snapshot, SnapshotError, humanize_codex_message,
 };
 use symphony_server::{
-    BlockedEntry, CodexTotals, ControlPlane, RefreshAccepted, RetryEntry, RunningEntry, StateError,
-    StateView, TokenCounts, Unavailable, presenter,
+    BlockedEntry, CodexTotals, ControlPlane, PauseState, RefreshAccepted, RetryEntry, RunningEntry,
+    SpendView, StateError, StateView, TokenCounts, Unavailable, presenter,
 };
 use tokio::sync::watch;
 
@@ -30,7 +33,18 @@ impl RuntimeControlPlane {
     }
 }
 
-fn running_entry(row: &RunningSnapshot) -> RunningEntry {
+/// The humanized last message, with known secrets and credential-shaped text redacted (it
+/// reaches every client of `/api/v1/state` and the SSE stream).
+fn last_message(redactor: &Redactor, message: Option<&CodexMessage>) -> Option<String> {
+    let text = humanize_codex_message(Some(message?));
+    Some(redactor.redact_str(&text).into_owned())
+}
+
+fn usd(micro: u64) -> f64 {
+    micro as f64 / 1_000_000.0
+}
+
+fn running_entry(row: &RunningSnapshot, redactor: &Redactor) -> RunningEntry {
     RunningEntry {
         issue_id: row.issue_id.clone(),
         issue_identifier: row.identifier.clone(),
@@ -41,10 +55,7 @@ fn running_entry(row: &RunningSnapshot) -> RunningEntry {
         session_id: row.session_id.clone(),
         turn_count: row.turn_count,
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: row
-            .last_codex_message
-            .as_ref()
-            .map(|m| humanize_codex_message(Some(m))),
+        last_message: last_message(redactor, row.last_codex_message.as_ref()),
         started_at: Some(row.started_at),
         last_event_at: row.last_codex_timestamp,
         tokens: TokenCounts {
@@ -68,7 +79,7 @@ fn retry_entry(row: &RetrySnapshot, now: DateTime<Utc>) -> RetryEntry {
     }
 }
 
-fn blocked_entry(row: &BlockedSnapshot) -> BlockedEntry {
+fn blocked_entry(row: &BlockedSnapshot, redactor: &Redactor) -> BlockedEntry {
     BlockedEntry {
         issue_id: row.issue_id.clone(),
         issue_identifier: row.identifier.clone(),
@@ -80,24 +91,40 @@ fn blocked_entry(row: &BlockedSnapshot) -> BlockedEntry {
         session_id: row.session_id.clone(),
         blocked_at: Some(row.blocked_at),
         last_event: row.last_codex_event.map(|e| e.as_str().to_owned()),
-        last_message: row
-            .last_codex_message
-            .as_ref()
-            .map(|m| humanize_codex_message(Some(m))),
+        last_message: last_message(redactor, row.last_codex_message.as_ref()),
         last_event_at: row.last_codex_timestamp,
     }
 }
 
-/// Projects a runtime [`Snapshot`] onto the API's [`StateView`] (`due_at` relative to `now`).
+/// Projects a runtime [`Snapshot`] onto the API's [`StateView`] (`due_at` relative to `now`),
+/// redacting credential-shaped text in messages.
 pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
+    state_view_redacted(snapshot, now, &Redactor::patterns_only())
+}
+
+/// [`state_view`] with `redactor` (the live control plane passes one built from the settings, so
+/// configured secret values are redacted too).
+pub fn state_view_redacted(
+    snapshot: &Snapshot,
+    now: DateTime<Utc>,
+    redactor: &Redactor,
+) -> StateView {
     StateView {
-        running: snapshot.running.iter().map(running_entry).collect(),
+        running: snapshot
+            .running
+            .iter()
+            .map(|row| running_entry(row, redactor))
+            .collect(),
         retrying: snapshot
             .retrying
             .iter()
             .map(|row| retry_entry(row, now))
             .collect(),
-        blocked: snapshot.blocked.iter().map(blocked_entry).collect(),
+        blocked: snapshot
+            .blocked
+            .iter()
+            .map(|row| blocked_entry(row, redactor))
+            .collect(),
         codex_totals: CodexTotals {
             input_tokens: snapshot.codex_totals.input_tokens,
             output_tokens: snapshot.codex_totals.output_tokens,
@@ -106,6 +133,18 @@ pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
             seconds_running: snapshot.codex_totals.seconds_running as f64,
         },
         rate_limits: snapshot.rate_limits.clone(),
+        spend: Some(Box::new(SpendView {
+            paused: snapshot.spend.paused,
+            stopped_reason: snapshot.spend.stopped_reason.clone(),
+            day: snapshot.spend.day.clone(),
+            day_tokens: snapshot.spend.day_tokens,
+            day_cost_usd: usd(snapshot.spend.day_cost_micro_usd),
+            total_cost_usd: usd(snapshot.codex_totals.cost_micro_usd),
+            max_tokens_per_day: snapshot.spend.max_tokens_per_day,
+            max_cost_usd_per_day: snapshot.spend.max_cost_usd_per_day,
+            max_tokens_per_issue: snapshot.spend.max_tokens_per_issue,
+            max_cost_usd_per_issue: snapshot.spend.max_cost_usd_per_issue,
+        })),
     }
 }
 
@@ -113,7 +152,10 @@ pub fn state_view(snapshot: &Snapshot, now: DateTime<Utc>) -> StateView {
 impl ControlPlane for RuntimeControlPlane {
     async fn state(&self) -> Result<StateView, StateError> {
         match self.handle.snapshot().await {
-            Ok(snapshot) => Ok(state_view(&snapshot, Utc::now())),
+            Ok(snapshot) => {
+                let redactor = Redactor::from_settings(&self.workflow.settings(), &ProcessEnv);
+                Ok(state_view_redacted(&snapshot, Utc::now(), &redactor))
+            }
             Err(SnapshotError::Timeout) => Err(StateError::Timeout),
             Err(SnapshotError::Unavailable) => Err(StateError::Unavailable),
         }
@@ -133,6 +175,37 @@ impl ControlPlane for RuntimeControlPlane {
 
     fn workspace_root(&self) -> String {
         self.workflow.settings().workspace.root.clone()
+    }
+
+    async fn cancel_task(&self, id: i64) -> Result<bool, Unavailable> {
+        self.handle.cancel_task(id).await.map_err(|_| Unavailable)
+    }
+
+    async fn unblock_task(&self, id: i64) -> Result<(), Unavailable> {
+        self.handle.unblock_task(id).await.map_err(|_| Unavailable)
+    }
+
+    fn backend_names(&self) -> Option<Vec<String>> {
+        let settings = self.workflow.settings();
+        let mut names: Vec<String> = settings.backends.keys().cloned().collect();
+        if !names.iter().any(|n| n == "codex") {
+            names.push("codex".to_owned());
+        }
+        Some(names)
+    }
+
+    async fn set_paused(
+        &self,
+        paused: bool,
+        reason: Option<String>,
+    ) -> Result<PauseState, Unavailable> {
+        match self.handle.set_paused(paused, reason).await {
+            Ok(ack) => Ok(PauseState {
+                paused: ack.paused,
+                reason: ack.reason,
+            }),
+            Err(RefreshError::Unavailable | RefreshError::Timeout) => Err(Unavailable),
+        }
     }
 
     fn changes(&self) -> watch::Receiver<u64> {
@@ -219,6 +292,7 @@ mod tests {
                 output_tokens: 8,
                 total_tokens: 12,
                 seconds_running: 42,
+                cost_micro_usd: 0,
             },
             rate_limits: Some(json!({"limit_id": "codex"})),
             polling: PollingStatus {
@@ -229,6 +303,7 @@ mod tests {
             max_concurrent_agents: 10,
             workspace_root: "/tmp/ws".into(),
             tracker: TrackerInfo::default(),
+            spend: Default::default(),
         }
     }
 

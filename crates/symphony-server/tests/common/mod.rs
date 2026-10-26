@@ -69,6 +69,7 @@ pub fn static_snapshot() -> StateView {
             seconds_running: 42.5,
         },
         rate_limits: Some(json!({"primary": {"remaining": 11}})),
+        spend: None,
     }
 }
 

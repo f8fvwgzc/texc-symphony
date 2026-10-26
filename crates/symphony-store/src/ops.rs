@@ -1,6 +1,8 @@
 //! Synchronous SQL operations. They run on the store's database thread; every function takes the
 //! connection it should use and all timestamps are passed in by the caller.
 
+// Modified 2026-10-25: run costs, usage sums, control values, payload retention (audit A1/A4).
+
 use chrono::{DateTime, Utc};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, params_from_iter};
@@ -8,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params, 
 use crate::error::{Result, StoreError};
 use crate::model::{
     MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES, NewRun, PruneStats, RetryRecord, RunEvent, RunId,
-    RunPage, RunQuery, RunRecord, RunStatus, TokenUsage, TotalsRecord, effective_event_limit,
+    RunPage, RunQuery, RunRecord, RunStatus, TokenUsage, TotalsRecord, UsageTotals,
+    effective_event_limit,
 };
 
 /// Error text recorded on runs that were still `running` when the process restarted.
@@ -16,9 +19,12 @@ pub const INTERRUPTED_ERROR: &str = "interrupted by restart";
 /// Event kind appended to runs closed by `mark_interrupted_runs`.
 pub const INTERRUPTED_EVENT_KIND: &str = "run_interrupted";
 
-const RUN_COLUMNS: &str = "id, issue_id, issue_identifier, issue_title, attempt, worker_host, \
+const RUN_COLUMNS: &str = "runs.id, issue_id, issue_identifier, issue_title, attempt, worker_host, \
      workspace_path, status, error, turns, started_at, finished_at, duration_ms, \
-     input_tokens, output_tokens, total_tokens";
+     input_tokens, output_tokens, total_tokens, COALESCE(run_costs.cost_micro_usd, 0)";
+
+/// `runs` with their cost (kept in `run_costs`, see migration 0003).
+const RUNS_WITH_COST: &str = "runs LEFT JOIN run_costs ON run_costs.run_id = runs.id";
 
 /// An event as submitted by a caller (before a seq is allocated).
 #[derive(Debug, Clone)]
@@ -115,6 +121,83 @@ pub(crate) fn update_tokens(conn: &Connection, run_id: RunId, tokens: TokenUsage
     Ok(())
 }
 
+/// Replaces the run's cumulative token usage and cost.
+pub(crate) fn update_usage(
+    conn: &Connection,
+    run_id: RunId,
+    tokens: TokenUsage,
+    cost_micro_usd: u64,
+) -> Result<()> {
+    update_tokens(conn, run_id, tokens)?;
+    conn.prepare_cached(
+        "INSERT INTO run_costs (run_id, cost_micro_usd) VALUES (?1, ?2) \
+         ON CONFLICT (run_id) DO UPDATE SET cost_micro_usd = excluded.cost_micro_usd",
+    )?
+    .execute(params![run_id.0, to_sql_u64(cost_micro_usd)])?;
+    Ok(())
+}
+
+const USAGE_COLUMNS: &str = "COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+     COALESCE(SUM(total_tokens), 0), COALESCE(SUM(run_costs.cost_micro_usd), 0)";
+
+fn usage_from_row(row: &Row<'_>) -> rusqlite::Result<UsageTotals> {
+    Ok(UsageTotals {
+        tokens: TokenUsage {
+            input: clamp_u64(row.get(0)?),
+            output: clamp_u64(row.get(1)?),
+            total: clamp_u64(row.get(2)?),
+        },
+        cost_micro_usd: clamp_u64(row.get(3)?),
+    })
+}
+
+/// Usage of the runs that started at or after `since`.
+pub(crate) fn usage_since(conn: &Connection, since: DateTime<Utc>) -> Result<UsageTotals> {
+    let sql = format!("SELECT {USAGE_COLUMNS} FROM {RUNS_WITH_COST} WHERE started_at >= ?1");
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([since.timestamp_millis()], usage_from_row)?)
+}
+
+/// Usage of every retained run of `issue_id`.
+pub(crate) fn issue_usage(conn: &Connection, issue_id: &str) -> Result<UsageTotals> {
+    let sql = format!("SELECT {USAGE_COLUMNS} FROM {RUNS_WITH_COST} WHERE issue_id = ?1");
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([issue_id], usage_from_row)?)
+}
+
+/// A value of the `control` table.
+pub(crate) fn get_control(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT value FROM control WHERE key = ?1")?
+        .query_row([key], |row| row.get(0))
+        .optional()?)
+}
+
+/// Sets (`Some`) or removes (`None`) a value of the `control` table.
+pub(crate) fn set_control(conn: &Connection, key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => conn
+            .prepare_cached("INSERT OR REPLACE INTO control (key, value) VALUES (?1, ?2)")?
+            .execute(params![key, value])?,
+        None => conn
+            .prepare_cached("DELETE FROM control WHERE key = ?1")?
+            .execute([key])?,
+    };
+    Ok(())
+}
+
+/// Clears the payloads (raw agent messages, command output) of events recorded before `cutoff`;
+/// kinds and messages stay. Returns the number of events changed.
+pub(crate) fn prune_payloads(conn: &Connection, cutoff: DateTime<Utc>) -> Result<u64> {
+    let changed = conn.execute(
+        "UPDATE run_events SET payload = NULL WHERE payload IS NOT NULL AND at < ?1",
+        [cutoff.timestamp_millis()],
+    )?;
+    Ok(changed as u64)
+}
+
 pub(crate) fn increment_turns(conn: &Connection, run_id: RunId) -> Result<u32> {
     let turns: Option<i64> = conn
         .prepare_cached("UPDATE runs SET turns = turns + 1 WHERE id = ?1 RETURNING turns")?
@@ -154,27 +237,21 @@ pub(crate) fn finish_run(
         ));
     }
     let now_ms = now.timestamp_millis();
-    let sql = format!(
-        "UPDATE runs SET status = ?2, error = ?3, finished_at = ?4, \
-         duration_ms = MAX(0, ?4 - started_at) WHERE id = ?1 AND status = 'running' \
-         RETURNING {RUN_COLUMNS}"
-    );
-    let finished = conn
-        .prepare_cached(&sql)?
-        .query_row(
-            params![run_id.0, status.as_str(), error, now_ms],
-            run_from_row,
-        )
-        .optional()?;
-    match finished {
-        Some(record) => Ok(record),
-        None if get_run(conn, run_id)?.is_some() => Err(StoreError::RunAlreadyFinished(run_id)),
+    let changed = conn
+        .prepare_cached(
+            "UPDATE runs SET status = ?2, error = ?3, finished_at = ?4, \
+             duration_ms = MAX(0, ?4 - started_at) WHERE id = ?1 AND status = 'running'",
+        )?
+        .execute(params![run_id.0, status.as_str(), error, now_ms])?;
+    match get_run(conn, run_id)? {
+        Some(record) if changed > 0 => Ok(record),
+        Some(_) => Err(StoreError::RunAlreadyFinished(run_id)),
         None => Err(StoreError::RunNotFound(run_id)),
     }
 }
 
 pub(crate) fn get_run(conn: &Connection, run_id: RunId) -> Result<Option<RunRecord>> {
-    let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1");
+    let sql = format!("SELECT {RUN_COLUMNS} FROM {RUNS_WITH_COST} WHERE runs.id = ?1");
     Ok(conn
         .prepare_cached(&sql)?
         .query_row([run_id.0], run_from_row)
@@ -186,12 +263,16 @@ pub(crate) fn list_runs(conn: &Connection, query: &RunQuery) -> Result<RunPage> 
     let mut clauses: Vec<&str> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
     if let Some(before) = query.before_id {
-        clauses.push("id < ?");
+        clauses.push("runs.id < ?");
         values.push(Value::Integer(before));
     }
     if let Some(identifier) = &query.issue_identifier {
         clauses.push("issue_identifier = ?");
         values.push(Value::Text(identifier.clone()));
+    }
+    if let Some(issue_id) = &query.issue_id {
+        clauses.push("issue_id = ?");
+        values.push(Value::Text(issue_id.clone()));
     }
     if let Some(status) = query.status {
         clauses.push("status = ?");
@@ -204,7 +285,9 @@ pub(crate) fn list_runs(conn: &Connection, query: &RunQuery) -> Result<RunPage> 
     };
     // Fetch one extra row to know whether another page exists.
     values.push(Value::Integer(i64::from(limit) + 1));
-    let sql = format!("SELECT {RUN_COLUMNS} FROM runs {where_sql} ORDER BY id DESC LIMIT ?");
+    let sql = format!(
+        "SELECT {RUN_COLUMNS} FROM {RUNS_WITH_COST} {where_sql} ORDER BY runs.id DESC LIMIT ?"
+    );
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut runs = stmt
         .query_map(params_from_iter(values), run_from_row)?
@@ -250,8 +333,9 @@ pub(crate) fn totals(conn: &Connection) -> Result<TotalsRecord> {
              COALESCE(SUM(input_tokens), 0), \
              COALESCE(SUM(output_tokens), 0), \
              COALESCE(SUM(total_tokens), 0), \
-             COALESCE(SUM(MAX(duration_ms, 0)), 0) \
-             FROM runs",
+             COALESCE(SUM(MAX(duration_ms, 0)), 0), \
+             COALESCE(SUM(run_costs.cost_micro_usd), 0) \
+             FROM runs LEFT JOIN run_costs ON run_costs.run_id = runs.id",
         )?
         .query_row([], |row| {
             Ok(TotalsRecord {
@@ -264,6 +348,7 @@ pub(crate) fn totals(conn: &Connection) -> Result<TotalsRecord> {
                     total: clamp_u64(row.get(5)?),
                 },
                 runtime_ms: clamp_u64(row.get(6)?),
+                cost_micro_usd: clamp_u64(row.get(7)?),
             })
         })?;
     Ok(record)
@@ -345,6 +430,7 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
             output: clamp_u64(row.get(14)?),
             total: clamp_u64(row.get(15)?),
         },
+        cost_micro_usd: clamp_u64(row.get(16)?),
     })
 }
 

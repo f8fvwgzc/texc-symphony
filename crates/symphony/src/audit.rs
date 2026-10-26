@@ -15,7 +15,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use symphony_core::reference::{self, REFERENCE_TOOL, closes_fence, fence_opener};
-use symphony_core::{ConfigError, LoadedWorkflow, prompt, workflow};
+use symphony_core::{ConfigError, LoadedWorkflow, ProcessEnv, config, prompt, workflow};
 use symphony_trackers::{TrackerDeps, tracker_for_kind};
 
 /// A fenced block in the core at or above this estimate is reported.
@@ -62,17 +62,19 @@ fn is_heading(line: &str) -> bool {
         && trimmed[hashes..].chars().next().is_none_or(|c| c == ' ')
 }
 
-/// The tracker's agent tool specs for the workflow's `tracker.kind` (`Err` explains why none).
+/// The tracker's agent tool specs for the workflow's `tracker.kind`, under its `tracker.agent_tools`
+/// scope (`Err` explains why none). Settings are cast without the startup validation, so missing
+/// tracker credentials do not stop the count.
 pub fn tracker_tool_specs(workflow: &LoadedWorkflow) -> Result<Vec<Value>, String> {
-    let kind = workflow
-        .config
-        .get("tracker")
-        .and_then(|tracker| tracker.get("kind"))
-        .and_then(Value::as_str)
+    let settings = config::parse(&workflow.config, &ProcessEnv).map_err(|e| e.user_message())?;
+    let kind = settings
+        .tracker
+        .kind
+        .as_deref()
         .ok_or("tracker.kind is not set")?;
     let deps = TrackerDeps::new().map_err(|e| e.to_string())?;
     tracker_for_kind(kind, &deps)
-        .map(|tracker| tracker.agent_tool_specs())
+        .map(|tracker| tracker.agent_tool_specs(&settings.tracker))
         .map_err(|e| e.to_string())
 }
 

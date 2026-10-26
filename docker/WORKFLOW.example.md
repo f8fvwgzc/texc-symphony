@@ -20,11 +20,16 @@ agent:
   max_concurrent_agents: 4
   max_turns: 20
 codex:
+  # Safe defaults: no network inside the turn sandbox, sandbox escalations rejected. Opt in only
+  # if your workflow needs it, e.g. `turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}`.
   command: codex app-server
   thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+server:
+  # The container binds 0.0.0.0, so the API needs a token: set SYMPHONY_API_TOKEN in docker/.env.
+  api_token: $SYMPHONY_API_TOKEN
+budget:
+  max_tokens_per_issue: 5000000
+  max_tokens_per_day: 50000000
 ---
 
 You are working on tracker issue `{{ issue.identifier }}`: {{ issue.title }}

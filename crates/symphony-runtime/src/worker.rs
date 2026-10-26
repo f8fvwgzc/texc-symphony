@@ -9,6 +9,8 @@
 //! the Elixir monitor `DOWN`). Cancellation is cooperative through `cancel`; a worker that does not
 //! finish within the grace period is aborted (dropped).
 
+// Modified 2026-10-25: backend selection and task specs on the worker context (Part B).
+
 use std::future::Future;
 use std::time::Duration;
 
@@ -31,6 +33,8 @@ pub(crate) enum WorkerMessage {
         worker_host: Option<String>,
         workspace_path: String,
     },
+    /// The final agent message of a task run (its result).
+    TaskResult { run_id: u64, result: String },
 }
 
 /// Reports runtime facts about one run to the orchestrator. Sends never block or fail.
@@ -56,6 +60,16 @@ impl WorkerReporter {
         }
     }
 
+    /// Reports the result text of a task run.
+    pub fn task_result(&self, result: &str) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(WorkerMessage::TaskResult {
+                run_id: self.run_id,
+                result: result.to_owned(),
+            });
+        }
+    }
+
     /// Reports where the workspace lives (sent once, after the workspace is created).
     pub fn runtime_info(&self, worker_host: Option<&str>, workspace_path: &str) {
         if let Some(tx) = &self.tx {
@@ -66,6 +80,22 @@ impl WorkerReporter {
             });
         }
     }
+}
+
+/// A task from the task API (`POST /api/v1/tasks`), run instead of a tracker issue.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskSpec {
+    /// Task id.
+    pub id: i64,
+    /// The prompt, sent as-is (wrapped by the backend's `prompt_template`, if any).
+    pub prompt: String,
+    /// Repository cloned into the fresh workspace (`https://`, `ssh://` or `git@host:path`);
+    /// `None` leaves the workspace empty.
+    pub repo: Option<String>,
+    /// Branch or tag to clone.
+    pub branch: Option<String>,
+    /// Wall-clock limit of the run in ms.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Everything a worker needs for one dispatch.
@@ -87,6 +117,10 @@ pub struct WorkerContext {
     pub cancel: CancellationToken,
     /// How long the worker may take to wind down after `cancel` fires before it is aborted.
     pub cancel_grace: Duration,
+    /// `backends` entry to run (`None`: `agent.backend`).
+    pub backend: Option<String>,
+    /// Set when this run executes a task instead of a tracker issue.
+    pub task: Option<TaskSpec>,
 }
 
 impl WorkerContext {
@@ -102,6 +136,8 @@ impl WorkerContext {
             reporter: WorkerReporter::detached(),
             cancel: CancellationToken::new(),
             cancel_grace: Duration::from_secs(5),
+            backend: None,
+            task: None,
         }
     }
 }
@@ -124,6 +160,15 @@ pub enum RunError {
     /// The tracker's agent tools could not be bound.
     #[error("tool_binding_failed: {0}")]
     ToolBinding(TrackerError),
+    /// The run names a backend that `backends` does not define.
+    #[error("unknown_backend: {0}")]
+    UnknownBackend(String),
+    /// A task ran longer than its `timeout_ms`.
+    #[error("task_timeout: {0}ms")]
+    TaskTimeout(u64),
+    /// A task's repository could not be cloned.
+    #[error("task_clone_failed: {0}")]
+    TaskClone(String),
     /// The run was cancelled by the orchestrator.
     #[error("cancelled")]
     Cancelled,

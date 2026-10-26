@@ -1,13 +1,22 @@
 //! Reconciliation of running and blocked issues, stall detection, workspace cleanup and the startup
 //! terminal cleanup (B.6, B.7).
 
+// Modified 2026-10-25: task runs are kept out of tracker reconciliation (Part B).
+
 use super::*;
 
 impl Orchestrator<'_> {
     /// `reconcile_running_issues/1`: stall detection, then a tracker refresh of running issues.
     pub(crate) async fn reconcile_running_issues(&mut self) {
         self.reconcile_stalled_running_issues().await;
-        let mut ids: Vec<String> = self.state.running.keys().cloned().collect();
+        // Task runs have no tracker issue to refresh.
+        let mut ids: Vec<String> = self
+            .state
+            .running
+            .keys()
+            .filter(|id| task_id(id).is_none())
+            .cloned()
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -132,6 +141,11 @@ impl Orchestrator<'_> {
                     "Issue stalled: issue_id={id} issue_identifier={identifier} session_id={session_id} elapsed_ms={elapsed_ms}; restarting with backoff"
                 );
                 let error = format!("stalled for {elapsed_ms}ms without codex activity");
+                if let Some(task) = task_id(&id) {
+                    self.task_finish(task, TaskStatus::Failed, None, Some(error.clone()));
+                    self.terminate_running_issue(&id, false, &error).await;
+                    continue;
+                }
                 let next = next_retry_attempt_from_running(entry);
                 // G8 fix: keep the host and workspace so the retry prefers the same machine.
                 let meta = RetryMeta {
@@ -147,9 +161,17 @@ impl Orchestrator<'_> {
         }
     }
 
-    /// `reconcile_blocked_issues/1` (B.6.4). Blocked issues are never auto-retried.
+    /// `reconcile_blocked_issues/1` (B.6.4). Blocked issues are never auto-retried, except that an
+    /// issue blocked by its budget is released once the (possibly raised) budget allows it again.
     pub(crate) async fn reconcile_blocked_issues(&mut self) {
-        let mut ids: Vec<String> = self.state.blocked.keys().cloned().collect();
+        // Blocked tasks wait for `POST /api/v1/tasks/{id}/unblock`, not for a tracker change.
+        let mut ids: Vec<String> = self
+            .state
+            .blocked
+            .keys()
+            .filter(|id| task_id(id).is_none())
+            .cloned()
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -168,7 +190,33 @@ impl Orchestrator<'_> {
                     );
                     self.release_issue_claim(id);
                 }
+                // After the refresh, so terminal issues were cleaned up first.
+                self.release_affordable_budget_blocks(&settings.budget);
             }
+        }
+    }
+
+    /// Releases the issues blocked by an exhausted issue budget that the (possibly raised)
+    /// budget allows again; the next poll dispatches them normally.
+    pub(crate) fn release_affordable_budget_blocks(
+        &mut self,
+        budget: &symphony_core::config::BudgetSettings,
+    ) {
+        let affordable: Vec<String> = self
+            .state
+            .blocked
+            .iter()
+            .filter(|(id, entry)| {
+                // Blocked tasks wait for an explicit unblock.
+                task_id(id).is_none()
+                    && spend::is_issue_budget_error(&entry.error)
+                    && self.state.spend.issue_stop(id, budget).is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in affordable {
+            tracing::info!("Issue budget allows issue_id={id} again; releasing its block");
+            self.release_issue_claim(&id);
         }
     }
 

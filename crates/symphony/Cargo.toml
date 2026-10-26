@@ -19,6 +19,7 @@ name = "symphony"
 path = "src/main.rs"
 
 [dependencies]
+symphony-agents = { workspace = true }
 symphony-core = { workspace = true }
 symphony-trackers = { workspace = true }
 symphony-codex = { workspace = true }
@@ -30,15 +31,17 @@ chrono = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# io-std: `symphony agent-tools` serves MCP on stdin/stdout.
+tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-segmentation = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# Terminal size (`tcgetwinsize`) without `unsafe`; same version as the other crates.
-rustix = { version = "1.1.5", features = ["termios"] }
+# Terminal size (`tcgetwinsize`) and `PR_SET_DUMPABLE` without `unsafe`; same version as the
+# other crates.
+rustix = { version = "1.1.5", features = ["process", "termios"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

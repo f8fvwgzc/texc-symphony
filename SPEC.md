@@ -61,7 +61,13 @@ Important boundary:
 
 - Rich web UI or multi-tenant control plane.
 - Prescribing a specific dashboard or terminal UI implementation.
-- General-purpose workflow engine or distributed job scheduler.
+- General-purpose workflow engine or distributed job scheduler. (Implementations MAY accept
+  one-off tasks without a tracker through an API, as long as they run through the same
+  orchestrator, workspaces, limits and agent backends as tracker issues; see the task API
+  extension below.)
+- Mandating a single coding agent. Implementations MAY drive other agent backends than the Codex
+  app-server (other agent CLIs, or their own agent loop over a model API) if they map them onto
+  the same session/turn/event model.
 - Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
   workflow prompt and agent tooling.)
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
@@ -1513,6 +1519,10 @@ Enablement (extension):
 - Positive `server.port` values bind that port.
 - Implementations SHOULD bind loopback by default (`127.0.0.1` or host equivalent) unless explicitly
   configured otherwise.
+- Implementations SHOULD require authentication before serving the API on a non-loopback address,
+  SHOULD refuse requests whose `Host` names neither loopback nor a configured name (DNS rebinding),
+  and SHOULD refuse cross-origin browser writes. The API exposes agent output, so it MUST NOT be
+  readable by arbitrary web pages.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 
@@ -1661,6 +1671,30 @@ API design notes:
 - API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
   logic.
+
+### 13.8 OPTIONAL Task API and Agent Backend Extensions
+
+Task API (extension of 13.7):
+
+- `POST /api/v1/tasks` queues a task: a prompt, optionally a repository to clone into a fresh
+  workspace (none: an empty workspace, for non-coding work), a backend name, limits (tokens,
+  wall-clock time) and submitter metadata. Tasks are dispatched by the same orchestrator, count
+  against the same concurrency and spend limits, and are recorded as runs.
+- A task runs one agent turn; its final agent message is its result. It never retries on its own.
+  A task blocked on operator input or approval stays blocked until a client re-queues it
+  (`unblock`, optionally with a reply appended to its prompt). Clients can cancel and watch
+  (Server-Sent Events) a task.
+- Task repositories MUST be restricted to network transports (no local paths, `file://` or git
+  transport helpers), and tasks MUST NOT run the workflow's issue hooks.
+
+Agent backends:
+
+- An implementation MAY offer several backends (`backends:` in front matter, selected by
+  `agent.backend` or per task) as long as each maps onto start session / run turn / stream events
+  / report usage / stop, keeps the workspace-cwd and root rules of section 9, and removes
+  host-side secrets from agent child environments.
+- A backend that executes tools itself (instead of the agent CLI) MUST confine file access to the
+  workspace and SHOULD confine shell commands with an OS sandbox.
 
 ## 14. Failure Model and Recovery Strategy
 

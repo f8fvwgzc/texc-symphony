@@ -11,6 +11,11 @@ use crate::store::Store;
 pub const ENV_DB_PATH: &str = "SYMPHONY_DB_PATH";
 /// Env var with the retention window in whole days (`0` keeps history forever).
 pub const ENV_RETENTION_DAYS: &str = "SYMPHONY_DB_RETENTION_DAYS";
+/// Env var with the payload retention window in whole days (`0` keeps payloads as long as the
+/// runs). Event payloads hold raw agent messages and command output, so they expire sooner.
+pub const ENV_PAYLOAD_RETENTION_DAYS: &str = "SYMPHONY_DB_PAYLOAD_RETENTION_DAYS";
+/// Payload retention window used when [`ENV_PAYLOAD_RETENTION_DAYS`] is unset.
+pub const DEFAULT_PAYLOAD_RETENTION_DAYS: u32 = 7;
 /// Database path used when [`ENV_DB_PATH`] is unset.
 pub const DEFAULT_DB_PATH: &str = "./data/symphony.db";
 /// Retention window used when [`ENV_RETENTION_DAYS`] is unset.
@@ -40,6 +45,8 @@ pub struct StoreConfig {
     pub location: StoreLocation,
     /// Retention window; `None` keeps history forever.
     pub retention: Option<Duration>,
+    /// Payload retention window; `None` keeps payloads as long as their runs.
+    pub payload_retention: Option<Duration>,
 }
 
 impl Default for StoreConfig {
@@ -47,6 +54,7 @@ impl Default for StoreConfig {
         StoreConfig {
             location: StoreLocation::File(PathBuf::from(DEFAULT_DB_PATH)),
             retention: Some(days(DEFAULT_RETENTION_DAYS)),
+            payload_retention: Some(days(DEFAULT_PAYLOAD_RETENTION_DAYS)),
         }
     }
 }
@@ -70,21 +78,20 @@ impl StoreConfig {
                 }
             }
         };
-        let retention = match lookup(ENV_RETENTION_DAYS).as_deref().map(str::trim) {
-            None | Some("") => Some(days(DEFAULT_RETENTION_DAYS)),
+        let window = |name: &str, default: u32| match lookup(name).as_deref().map(str::trim) {
+            None | Some("") => Ok(Some(days(default))),
             Some(raw) => match raw.parse::<u32>() {
-                Ok(0) => None,
-                Ok(n) => Some(days(n)),
-                Err(_) => {
-                    return Err(StoreError::InvalidConfig(format!(
-                        "{ENV_RETENTION_DAYS} must be a non-negative integer number of days, got {raw:?}"
-                    )));
-                }
+                Ok(0) => Ok(None),
+                Ok(n) => Ok(Some(days(n))),
+                Err(_) => Err(StoreError::InvalidConfig(format!(
+                    "{name} must be a non-negative integer number of days, got {raw:?}"
+                ))),
             },
         };
         Ok(StoreConfig {
             location,
-            retention,
+            retention: window(ENV_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)?,
+            payload_retention: window(ENV_PAYLOAD_RETENTION_DAYS, DEFAULT_PAYLOAD_RETENTION_DAYS)?,
         })
     }
 
@@ -156,6 +163,27 @@ mod tests {
         assert!(cfg.open().unwrap().is_enabled());
         let disabled = config(&[(ENV_DB_PATH, "off")]).unwrap().open().unwrap();
         assert!(!disabled.is_enabled());
+    }
+
+    #[test]
+    fn payload_retention_defaults_to_a_week() {
+        assert_eq!(
+            config(&[]).unwrap().payload_retention,
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        assert_eq!(
+            config(&[(ENV_PAYLOAD_RETENTION_DAYS, "2")])
+                .unwrap()
+                .payload_retention,
+            Some(Duration::from_secs(2 * 86_400))
+        );
+        assert_eq!(
+            config(&[(ENV_PAYLOAD_RETENTION_DAYS, "0")])
+                .unwrap()
+                .payload_retention,
+            None
+        );
+        assert!(config(&[(ENV_PAYLOAD_RETENTION_DAYS, "x")]).is_err());
     }
 
     #[test]

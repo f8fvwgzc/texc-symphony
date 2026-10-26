@@ -12,10 +12,12 @@ symphony-core = { workspace = true }
 symphony-trackers = { workspace = true }
 symphony-codex = { workspace = true }
 symphony-store = { workspace = true }
+symphony-agents = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

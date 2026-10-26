@@ -73,11 +73,24 @@ fn filter(id: &str) -> HashSet<String> {
 
 #[test]
 fn tool_specs_advertises_the_linear_graphql_input_contract() {
-    let specs = offline().agent_tool_specs();
+    let specs = offline().agent_tool_specs(&linear_settings(json!({})));
     assert_eq!(specs.len(), 1);
     let spec = &specs[0];
     assert_eq!(spec["name"], "linear_graphql");
     assert!(spec["description"].as_str().unwrap().contains("Linear"));
+    assert!(
+        spec["description"]
+            .as_str()
+            .unwrap()
+            .ends_with("Allowed mutations: commentCreate, commentUpdate, issueUpdate, attachmentCreate, attachmentLinkURL, attachmentLinkGitHubPR, attachmentLinkGitHubIssue, issueRelationCreate.\n")
+    );
+    let custom = linear_settings(json!({"agent_tools": {"linear_mutations": []}}));
+    assert!(
+        offline().agent_tool_specs(&custom)[0]["description"]
+            .as_str()
+            .unwrap()
+            .ends_with("Allowed mutations: none.\n")
+    );
     assert_eq!(spec["inputSchema"]["type"], "object");
     assert_eq!(spec["inputSchema"]["required"], json!(["query"]));
     let props = spec["inputSchema"]["properties"].as_object().unwrap();
@@ -429,7 +442,7 @@ async fn linear_adapter_delegates_reads_and_advertises_its_native_agent_tool() {
             .unwrap()),
         ["issue-1"]
     );
-    assert_eq!(tracker.agent_tool_specs()[0]["name"], "linear_graphql");
+    assert_eq!(tracker.agent_tool_specs(&s)[0]["name"], "linear_graphql");
 }
 
 // ---- workspace_and_config_test.exs ----
@@ -857,4 +870,91 @@ fn validation_and_secret_names_follow_core() {
     );
     let binding = ToolBinding::bind(Arc::new(offline()), s);
     assert_eq!(binding.secret_environment_names(), ["LINEAR_API_KEY"]);
+}
+
+// ---- mutation allow-list (2026-10-25 audit A2) ----
+
+#[tokio::test]
+async fn linear_graphql_refuses_mutations_outside_the_allow_list_without_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {}})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let tracker = tracker_for(&server);
+    let s = linear_settings(json!({}));
+    for (document, rule) in [
+        (
+            "mutation { issueDelete(id: \"1\") { success } }",
+            "mutation_not_allowed",
+        ),
+        (
+            "mutation M { ok: commentCreate(input: {}) { success } gone: teamDelete(id: \"t\") { success } }",
+            "mutation_not_allowed",
+        ),
+        (
+            "query A { viewer { id } }\nmutation B { ...Evil }\nfragment Evil on Mutation { apiKeyCreate(input: {}) { success } }",
+            "mutation_not_allowed",
+        ),
+        ("subscription { issues { id } }", "subscription_not_allowed"),
+        ("mutation { commentCreate(", "unparseable_document"),
+    ] {
+        let (ok, output) =
+            run_tool(&tracker, "linear_graphql", json!({"query": document}), &s).await;
+        assert!(!ok, "{document}");
+        assert_eq!(output["error"]["rule"], rule, "{document}");
+    }
+    let (_, output) = run_tool(
+        &tracker,
+        "linear_graphql",
+        json!(
+            "mutation { a: issueDelete(id: 1) { success } b: commentCreate(input: {}) { success } }"
+        ),
+        &s,
+    )
+    .await;
+    let message = output["error"]["message"].as_str().unwrap();
+    assert!(message.contains("may not run issueDelete:"), "{message}");
+    assert!(
+        message.contains("tracker.agent_tools.linear_mutations"),
+        "{message}"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn linear_graphql_runs_allowed_mutations_and_honors_a_custom_allow_list() {
+    let server = graphql_server(json!({"data": {"commentCreate": {"success": true}}})).await;
+    let tracker = tracker_for(&server);
+    let document = "mutation C($id: String!) { commentCreate(input: {issueId: $id, body: \"mutation { issueDelete }\"}) { success } __typename }";
+    let (ok, _) = run_tool(
+        &tracker,
+        "linear_graphql",
+        json!({"query": document, "variables": {"id": "i-1"}}),
+        &linear_settings(json!({})),
+    )
+    .await;
+    assert!(ok);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let custom = linear_settings(json!({"agent_tools": {"linear_mutations": ["issueArchive"]}}));
+    let (ok, output) = run_tool(
+        &tracker,
+        "linear_graphql",
+        json!({"query": document}),
+        &custom,
+    )
+    .await;
+    assert!(!ok);
+    assert_eq!(output["error"]["rule"], "mutation_not_allowed");
+    let (ok, _) = run_tool(
+        &tracker,
+        "linear_graphql",
+        json!({"query": "mutation { issueArchive(id: \"1\") { success } }"}),
+        &custom,
+    )
+    .await;
+    assert!(ok);
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

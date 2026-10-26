@@ -14,8 +14,8 @@ info:
 
     **Routing rules** (in priority order, first match wins):
 
-    1. Literal routes: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/health`, `/api/v1/events`,
-       `/api/v1/runs`, `/api/v1/totals`, `/api/openapi.json`. Their names are therefore reserved and
+    1. Literal routes: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/pause`, `/api/v1/resume`,
+       `/api/v1/metrics`, `/api/v1/health`, `/api/v1/events`, `/api/v1/events/tickets`, `/api/v1/tasks`, `/api/v1/runs`, `/api/v1/totals`, `/api/openapi.json`. Their names are therefore reserved and
        can never be looked up as issue identifiers.
     2. `/api/v1/runs/{id}` and `/api/v1/runs/{id}/events`.
     3. `/api/v1/{issue_identifier}` (exactly one path segment, URL-decoded, case-sensitive).
@@ -28,7 +28,25 @@ info:
        (e.g. `/unknown`, `/api/v1/a/b`, `POST /favicon.png`).
 
     A single trailing slash is ignored (`/api/v1/state/` == `/api/v1/state`). Request bodies are
-    ignored everywhere. There is no authentication: bind to loopback or put a proxy in front.
+    ignored unless an operation documents one.
+
+    **Security.**
+
+    * **Authentication.** When an API token is configured (`server.api_token` in WORKFLOW.md, or
+      `SYMPHONY_API_TOKEN`), every `/api/*` request except `GET /api/v1/health` and
+      `GET /api/openapi.json` needs `Authorization: Bearer <token>`; otherwise it answers `401`
+      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. Without a token the API is
+      open, and Symphony refuses to bind anything but a loopback address (`auth_required` at
+      startup). The dashboard shell and its assets are public; the dashboard asks for the token.
+    * **SSE tickets.** A browser `EventSource` cannot send headers, so clients first call
+      `POST /api/v1/events/tickets` (authenticated) and open the stream with `?ticket=<ticket>`.
+      A ticket is valid once, for 60 s, and only on stream endpoints.
+    * **Host allow-list.** Requests whose `Host` is not loopback (`localhost`, `*.localhost`,
+      `127.0.0.1`, `[::1]`), the bind address or a `server.allowed_hosts` entry answer `403`
+      `host_not_allowed` (protection against DNS rebinding).
+    * **Origin check.** Browser writes (`POST`) whose `Origin` is neither the request's own origin
+      nor a `server.allowed_origins` entry, or that are marked `Sec-Fetch-Site: cross-site`,
+      answer `403` `origin_not_allowed`.
 
     **Timestamps.** RFC 3339 / ISO 8601 UTC with a `Z` suffix, truncated to whole seconds
     (`2026-02-24T20:15:30Z`), except `requested_at` on refresh and the run-history timestamps,
@@ -37,17 +55,21 @@ info:
     **Errors.** Every non-2xx response uses the envelope
     `{"error": {"code": "<machine code>", "message": "<human text>"}}`. Codes:
     `not_found`, `method_not_allowed`, `issue_not_found`, `orchestrator_unavailable`,
-    `run_not_found`, `invalid_parameter`, `store_disabled`, `request_failed`.
+    `run_not_found`, `invalid_parameter`, `store_disabled`, `request_failed`, `unauthorized`,
+    `host_not_allowed`, `origin_not_allowed`, `task_not_found`, `task_conflict`.
     `GET /api/v1/state` never fails with an error status: snapshot failures are reported inside a
     `200` body (`snapshot_timeout`, `snapshot_unavailable`).
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-security: []
+security:
+  - bearerAuth: []
 servers:
   - url: http://127.0.0.1:4000
     description: Local orchestrator (port comes from `server.port` or `--port`)
 tags:
+  - name: tasks
+    description: Work assigned directly by products, without a tracker issue (needs the run-history store).
   - name: state
     description: Live orchestrator state (Elixir compatible).
   - name: control
@@ -124,12 +146,85 @@ paths:
               example:
                 error: { code: orchestrator_unavailable, message: Orchestrator is unavailable }
 
+  /api/v1/pause:
+    post:
+      tags: [control]
+      operationId: pauseDispatch
+      summary: Engage the kill switch
+      description: |
+        Stops every running agent (their claims are released, so they run again after resume)
+        and holds all dispatch, including retries, until `POST /api/v1/resume`. The state survives
+        restarts (it is kept in the run-history store). `reason` is stored and reported in
+        `spend.stopped_reason`.
+      parameters:
+        - name: reason
+          in: query
+          required: false
+          schema: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Kill switch engaged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseState' }
+              example: { paused: true, reason: runaway spend }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '503':
+          description: Orchestrator is not running (or did not answer within 5 s).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/resume:
+    post:
+      tags: [control]
+      operationId: resumeDispatch
+      summary: Release the kill switch
+      responses:
+        '200':
+          description: Dispatch resumes (a poll is scheduled immediately).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PauseState' }
+              example: { paused: false, reason: null }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+        '503':
+          description: Orchestrator is not running (or did not answer within 5 s).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/metrics:
+    get:
+      tags: [meta]
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus text format (0.0.4): `symphony_up`, `symphony_running_agents`,
+        `symphony_retrying_issues`, `symphony_blocked_issues`, `symphony_input_tokens`,
+        `symphony_output_tokens` and, with spend controls, `symphony_cost_usd`,
+        `symphony_day_tokens`, `symphony_day_cost_usd`, `symphony_dispatch_paused`,
+        `symphony_dispatch_stopped`. Needs the API token like every other endpoint.
+      responses:
+        '200':
+          description: Metrics.
+          content:
+            text/plain:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+
   /api/v1/health:
     get:
       tags: [meta]
       operationId: getHealth
       summary: Liveness and build information
-      description: Cheap check that never touches the orchestrator. Always `200` while the process serves HTTP.
+      description: Cheap check that never touches the orchestrator. Always `200` while the process serves HTTP. Never needs the API token.
+      security: []
       responses:
         '200':
           description: Server is up.
@@ -142,6 +237,7 @@ paths:
                 version: 0.1.0
                 uptime_seconds: 3725
                 store: sqlite
+                auth_required: true
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
 
@@ -182,6 +278,12 @@ paths:
 
         ```
       parameters:
+        - name: ticket
+          in: query
+          required: false
+          description: Single-use ticket from `POST /api/v1/events/tickets`, for clients that cannot send `Authorization` (browser `EventSource`).
+          schema:
+            type: string
         - name: Last-Event-ID
           in: header
           required: false
@@ -215,8 +317,189 @@ paths:
                     properties:
                       at: { $ref: '#/components/schemas/Timestamp' }
                       generation: { type: integer, minimum: 0, description: 'Latest generation (same as the last snapshot `id`).' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/events/tickets:
+    post:
+      tags: [live]
+      operationId: createStreamTicket
+      summary: Single-use ticket for opening an SSE stream
+      description: |
+        Returns a ticket to pass as `?ticket=` when opening a stream endpoint with a client that
+        cannot send headers. Valid once, for 60 s. Works (and is harmless) without auth too.
+      responses:
+        '201':
+          description: Ticket issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SseTicket'
+              example:
+                ticket: 6f1c0d3e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d
+                expires_at: '2026-02-24T20:16:30.123456Z'
+                expires_in_ms: 60000
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/tasks:
+    post:
+      tags: [tasks]
+      operationId: createTask
+      summary: Queue a task
+      description: |
+        Queues work for an agent without a tracker issue. The task runs once, in a fresh workspace
+        (empty, or a shallow clone of `repo`), on `backend` (default `agent.backend`), with the
+        prompt sent as-is (wrapped by the backend's `prompt_template`). Its final agent message
+        becomes `result`. Runs are recorded under the identifier `task-<id>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskCreate' }
+            example:
+              title: Summarize the README
+              prompt: Read README.md and write a five-line summary.
+              repo: https://github.com/f8fvwgzc/texc-symphony
+              backend: local
+              limits: { max_tokens: 200000, timeout_ms: 600000 }
+              metadata: { ticket: PROD-17 }
+      responses:
+        '201':
+          description: Task queued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+    get:
+      tags: [tasks]
+      operationId: listTasks
+      summary: Tasks, newest first (keyset pagination)
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { name: before_id, in: query, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: status, in: query, required: false, schema: { $ref: '#/components/schemas/TaskStatus' } }
+      responses:
+        '200':
+          description: One page of tasks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPage' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}:
+    get:
+      tags: [tasks]
+      operationId: getTask
+      summary: One task
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      responses:
+        '200':
+          description: The task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}/cancel:
+    post:
+      tags: [tasks]
+      operationId: cancelTask
+      summary: Cancel a task
+      description: Stops a running task (through the orchestrator) or cancels a queued or blocked one. Final tasks are returned unchanged.
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      responses:
+        '200':
+          description: The task after cancellation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503':
+          description: Store disabled, or a running task could not be stopped because the orchestrator is unavailable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/tasks/{id}/unblock:
+    post:
+      tags: [tasks]
+      operationId: unblockTask
+      summary: Re-queue a blocked or failed task
+      description: The optional `message` (the operator's answer) is appended to the prompt as `Operator reply:`. Other statuses answer `409 task_conflict`.
+      parameters: [{ $ref: '#/components/parameters/TaskId' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskUnblock' }
+      responses:
+        '200':
+          description: The re-queued task.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '409':
+          description: The task is neither blocked nor failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                error: { code: task_conflict, message: 'task 3 is running; only blocked or failed tasks can be unblocked' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/{id}/events:
+    get:
+      tags: [tasks]
+      operationId: streamTask
+      summary: Watch a task (Server-Sent Events)
+      description: |
+        Starts with `retry: 3000`, then sends `event: task` (data: `Task`) whenever the record
+        changes and `event: run_event` (data: `RunEvent`, `id: <run_id>-<seq>`) for every event
+        its runs record. Comment keep-alives every 15 s. The stream ends once the task is
+        `succeeded`, `failed` or `cancelled` and every event was sent. Browsers authenticate with
+        `?ticket=` (see `POST /api/v1/events/tickets`).
+      parameters:
+        - { $ref: '#/components/parameters/TaskId' }
+        - name: ticket
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema: { type: string }
+              x-sse-events:
+                task:
+                  schema: { $ref: '#/components/schemas/Task' }
+                run_event:
+                  schema: { $ref: '#/components/schemas/RunEvent' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/TaskNotFound' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
 
   /api/v1/runs:
     get:
@@ -267,6 +550,7 @@ paths:
                     finished_at: '2026-02-24T20:31:40.250Z'
                     duration_ms: 1288246
                     tokens: { input: 18230, output: 2207, total: 20437 }
+                    cost_micro_usd: 44858
                 next_before_id: 42
         '400':
           $ref: '#/components/responses/InvalidParameter'
@@ -369,6 +653,7 @@ paths:
                 runs_failed: 21
                 tokens: { input: 1830211, output: 220407, total: 2050618 }
                 runtime_ms: 48210933
+                cost_micro_usd: 1520331
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '503':
@@ -414,6 +699,7 @@ paths:
       tags: [meta]
       operationId: getOpenApi
       summary: This document, as JSON
+      security: []
       responses:
         '200':
           description: OpenAPI 3.1 document.
@@ -425,7 +711,19 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The API token (`server.api_token` / `SYMPHONY_API_TOKEN`). Not required when the server runs without one (loopback only).
+
   parameters:
+    TaskId:
+      name: id
+      in: path
+      required: true
+      description: Task id (positive integer). Non-integers answer `400 invalid_parameter`.
+      schema: { type: integer, minimum: 1 }
     RunId:
       name: id
       in: path
@@ -434,6 +732,25 @@ components:
       schema: { type: integer, minimum: 1 }
 
   responses:
+    Unauthorized:
+      description: Missing or invalid API token (or SSE ticket).
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, const: 'Bearer realm="symphony"' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: unauthorized, message: Missing or invalid API token }
+    Forbidden:
+      description: The `Host` header is not allowed (`host_not_allowed`), or a browser write came from another origin (`origin_not_allowed`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: origin_not_allowed, message: Cross-origin request refused }
     MethodNotAllowed:
       description: The path exists but does not support this method.
       content:
@@ -458,6 +775,14 @@ components:
             $ref: '#/components/schemas/ErrorEnvelope'
           example:
             error: { code: invalid_parameter, message: 'limit must be an integer between 1 and 200' }
+    TaskNotFound:
+      description: No task with this id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            error: { code: task_not_found, message: Task not found }
     StoreDisabled:
       description: Run history persistence is disabled in this process.
       content:
@@ -484,7 +809,7 @@ components:
         code:
           type: string
           description: Stable machine-readable code.
-          examples: [not_found, method_not_allowed, issue_not_found, orchestrator_unavailable, run_not_found, invalid_parameter, store_disabled, request_failed]
+          examples: [not_found, method_not_allowed, issue_not_found, orchestrator_unavailable, run_not_found, invalid_parameter, store_disabled, request_failed, unauthorized, host_not_allowed, origin_not_allowed, task_not_found, task_conflict]
         message:
           type: string
           description: Human-readable text (not localized, may change).
@@ -553,6 +878,35 @@ components:
           $ref: '#/components/schemas/CodexTotals'
         rate_limits:
           $ref: '#/components/schemas/RateLimits'
+        spend:
+          $ref: '#/components/schemas/Spend'
+
+    Spend:
+      type: object
+      description: |
+        Spend controls (new in the Rust port; absent when the orchestrator does not report them).
+        Tokens count input + output. Costs use the `budget` prices in WORKFLOW.md.
+      required: [paused, stopped_reason, day, day_tokens, day_cost_usd, total_cost_usd, max_tokens_per_day, max_cost_usd_per_day, max_tokens_per_issue, max_cost_usd_per_issue]
+      additionalProperties: false
+      properties:
+        paused: { type: boolean, description: 'Kill switch engaged (`POST /api/v1/pause`).' }
+        stopped_reason: { type: [string, 'null'], description: 'Why dispatch is held: the kill switch or an exhausted daily budget.' }
+        day: { type: string, format: date, description: 'UTC day of the `day_*` counters.' }
+        day_tokens: { type: integer, minimum: 0 }
+        day_cost_usd: { type: number, minimum: 0 }
+        total_cost_usd: { type: number, minimum: 0, description: 'All runs of this process.' }
+        max_tokens_per_day: { type: [integer, 'null'], minimum: 1 }
+        max_cost_usd_per_day: { type: [number, 'null'] }
+        max_tokens_per_issue: { type: [integer, 'null'], minimum: 1 }
+        max_cost_usd_per_issue: { type: [number, 'null'] }
+
+    PauseState:
+      type: object
+      required: [paused, reason]
+      additionalProperties: false
+      properties:
+        paused: { type: boolean }
+        reason: { type: [string, 'null'] }
 
     CodexTotals:
       type: object
@@ -744,9 +1098,10 @@ components:
 
     Health:
       type: object
-      required: [status, version, uptime_seconds, store]
+      required: [status, version, uptime_seconds, store, auth_required]
       additionalProperties: false
       properties:
+        auth_required: { type: boolean, description: 'Whether `/api/*` needs `Authorization: Bearer <token>`.' }
         status: { type: string, const: ok }
         version: { type: string, description: 'Crate version of the `symphony` binary.' }
         uptime_seconds: { type: integer, minimum: 0, description: 'Whole seconds since the HTTP server started.' }
@@ -754,6 +1109,84 @@ components:
           type: string
           enum: [sqlite, disabled]
           description: Whether run history endpoints are available.
+
+    TaskStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, cancelled, blocked]
+
+    TaskLimits:
+      type: object
+      required: [max_tokens, timeout_ms]
+      additionalProperties: false
+      properties:
+        max_tokens: { type: [integer, 'null'], minimum: 1, description: 'Tokens (input + output) across the task''s runs; the run fails when it is reached.' }
+        timeout_ms: { type: [integer, 'null'], minimum: 1, description: 'Wall-clock limit of one run.' }
+
+    TaskCreate:
+      type: object
+      required: [prompt]
+      additionalProperties: false
+      properties:
+        title: { type: [string, 'null'], maxLength: 200 }
+        prompt: { type: string, minLength: 1, description: 'What the agent should do (at most 256 KiB).' }
+        repo: { type: [string, 'null'], description: '`https://` or `ssh://` URL or `user@host:path`, shallow-cloned into the workspace. Omit for an empty workspace (non-coding tasks).' }
+        branch: { type: [string, 'null'], description: 'Branch or tag to clone (needs `repo`).' }
+        backend: { type: [string, 'null'], description: 'A `backends` entry of WORKFLOW.md; default `agent.backend`.' }
+        limits:
+          type: [object, 'null']
+          additionalProperties: false
+          properties:
+            max_tokens: { type: [integer, 'null'], minimum: 1 }
+            timeout_ms: { type: [integer, 'null'], minimum: 1 }
+        metadata: { type: [object, 'null'], description: 'Free-form JSON kept with the task (at most 16 KiB).' }
+
+    TaskUnblock:
+      type: object
+      additionalProperties: false
+      properties:
+        message: { type: [string, 'null'], description: 'Operator reply appended to the prompt.' }
+
+    Task:
+      type: object
+      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, status, result, error, attempts, created_at, updated_at, started_at, finished_at]
+      additionalProperties: false
+      properties:
+        id: { type: integer, minimum: 1 }
+        identifier: { type: string, description: '`task-<id>`: the identifier of its runs and live entries.' }
+        title: { type: [string, 'null'] }
+        prompt: { type: string }
+        repo: { type: [string, 'null'] }
+        branch: { type: [string, 'null'] }
+        backend: { type: [string, 'null'] }
+        limits: { $ref: '#/components/schemas/TaskLimits' }
+        metadata: { type: [object, 'null'] }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        result: { type: [string, 'null'], description: 'Final agent message of a succeeded task.' }
+        error: { type: [string, 'null'] }
+        attempts: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+
+    TaskPage:
+      type: object
+      required: [tasks, next_before_id]
+      additionalProperties: false
+      properties:
+        tasks:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        next_before_id: { type: [integer, 'null'] }
+
+    SseTicket:
+      type: object
+      required: [ticket, expires_at, expires_in_ms]
+      additionalProperties: false
+      properties:
+        ticket: { type: string, description: 'Pass as `?ticket=` to a stream endpoint; valid once.' }
+        expires_at: { type: string, format: date-time }
+        expires_in_ms: { type: integer, minimum: 0 }
 
     RunStatus:
       type: string
@@ -771,7 +1204,7 @@ components:
     RunRecord:
       type: object
       description: One agent run (one attempt of one issue).
-      required: [id, issue_id, issue_identifier, issue_title, attempt, worker_host, workspace_path, status, error, turns, started_at, finished_at, duration_ms, tokens]
+      required: [id, issue_id, issue_identifier, issue_title, attempt, worker_host, workspace_path, status, error, turns, started_at, finished_at, duration_ms, tokens, cost_micro_usd]
       additionalProperties: false
       properties:
         id: { type: integer, minimum: 1 }
@@ -788,6 +1221,7 @@ components:
         finished_at: { type: [string, 'null'], format: date-time, description: '`null` while `status` is `running`.' }
         duration_ms: { type: [integer, 'null'], minimum: 0, description: '`finished_at - started_at`; `null` while running.' }
         tokens: { $ref: '#/components/schemas/RunTokens' }
+        cost_micro_usd: { type: integer, minimum: 0, description: 'Cost of `tokens` in micro-USD at the `budget` prices in force when the run started (`0` without prices).' }
 
     RunList:
       type: object
@@ -830,7 +1264,7 @@ components:
 
     Totals:
       type: object
-      required: [runs_total, runs_succeeded, runs_failed, tokens, runtime_ms]
+      required: [runs_total, runs_succeeded, runs_failed, tokens, runtime_ms, cost_micro_usd]
       additionalProperties: false
       properties:
         runs_total: { type: integer, minimum: 0 }
@@ -838,6 +1272,7 @@ components:
         runs_failed: { type: integer, minimum: 0 }
         tokens: { $ref: '#/components/schemas/RunTokens' }
         runtime_ms: { type: integer, minimum: 0, description: 'Sum of `duration_ms` of finished runs.' }
+        cost_micro_usd: { type: integer, minimum: 0, description: 'Sum of run costs in micro-USD.' }
 
   examples:
     StateSnapshot:
@@ -927,3 +1362,4 @@ components:
         finished_at: '2026-02-24T20:31:40.250Z'
         duration_ms: 1288246
         tokens: { input: 18230, output: 2207, total: 20437 }
+        cost_micro_usd: 44858

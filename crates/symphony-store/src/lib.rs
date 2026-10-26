@@ -32,17 +32,23 @@ mod model;
 mod ops;
 mod schema;
 mod store;
+mod tasks;
 
 pub use config::{
-    DEFAULT_DB_PATH, DEFAULT_KEEP_MIN_RUNS, DEFAULT_PRUNE_INTERVAL, DEFAULT_RETENTION_DAYS,
-    ENV_DB_PATH, ENV_RETENTION_DAYS, StoreConfig, StoreLocation,
+    DEFAULT_DB_PATH, DEFAULT_KEEP_MIN_RUNS, DEFAULT_PAYLOAD_RETENTION_DAYS, DEFAULT_PRUNE_INTERVAL,
+    DEFAULT_RETENTION_DAYS, ENV_DB_PATH, ENV_PAYLOAD_RETENTION_DAYS, ENV_RETENTION_DAYS,
+    StoreConfig, StoreLocation,
 };
 pub use error::{Result, StoreError};
 pub use model::{
     DEFAULT_EVENT_LIMIT, DEFAULT_RUN_LIMIT, MAX_EVENT_LIMIT, MAX_MESSAGE_BYTES, MAX_PAYLOAD_BYTES,
     MAX_RUN_LIMIT, NewRun, PruneStats, RetryRecord, RunEvent, RunId, RunPage, RunQuery, RunRecord,
-    RunStatus, TokenUsage, TotalsRecord,
+    RunStatus, TokenUsage, TotalsRecord, UsageTotals,
 };
 pub use ops::{INTERRUPTED_ERROR, INTERRUPTED_EVENT_KIND};
 pub use schema::{BUSY_TIMEOUT, SCHEMA_VERSION};
-pub use store::{Pending, Store};
+pub use store::{Pending, STORE_QUEUE_CAPACITY, Store};
+pub use tasks::{
+    DEFAULT_TASK_LIMIT, MAX_TASK_LIMIT, MAX_TASK_PROMPT_BYTES, MAX_TASK_RESULT_BYTES, NewTask,
+    TaskLimits, TaskPage, TaskQuery, TaskRecord, TaskStatus, task_identifier,
+};

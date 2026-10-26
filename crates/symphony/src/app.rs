@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use symphony_core::WorkflowStore;
 use symphony_runtime::{Runtime, RuntimeError, RuntimeOptions};
-use symphony_server::{BoundServer, ServerConfig};
+use symphony_server::{Auth, BoundServer, ServerConfig};
 use symphony_store::{
     DEFAULT_KEEP_MIN_RUNS, DEFAULT_PRUNE_INTERVAL, ENV_DB_PATH, Store, StoreConfig, StoreLocation,
 };
@@ -74,6 +74,32 @@ pub fn main() -> ExitCode {
             Err(message) => fail(&message),
         },
         Ok(Command::Run(invocation)) => run(invocation),
+        Ok(Command::Init { command }) => crate::init::run(&command),
+        Ok(Command::AgentTools { socket }) => {
+            #[cfg(unix)]
+            let served = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(symphony_agents::mcp::serve_stdio(
+                            &socket,
+                            tokio::io::stdin(),
+                            tokio::io::stdout(),
+                        ))
+                        .map_err(|err| err.to_string())
+                });
+            #[cfg(not(unix))]
+            let served: Result<(), String> = Err(format!(
+                "agent-tools needs Unix sockets; {} is unavailable",
+                socket.display()
+            ));
+            match served {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => fail(&format!("symphony agent-tools: {err}")),
+            }
+        }
     }
 }
 
@@ -94,6 +120,8 @@ fn fail(message: &str) -> ExitCode {
 
 /// Boots Symphony for a validated invocation and blocks until it stops.
 pub fn run(invocation: Invocation) -> ExitCode {
+    // Before anything reads a secret; a failure is logged once logging is up.
+    let protected = crate::hardening::protect_secrets();
     let workflow_path = invocation.workflow.display().to_string();
     let workflow = match WorkflowStore::start(Some(invocation.workflow.clone())) {
         Ok(workflow) => workflow,
@@ -112,6 +140,9 @@ pub fn run(invocation: Invocation) -> ExitCode {
     let dashboard_enabled = workflow.settings().observability.dashboard_enabled && stdout_is_tty;
     let console = (!dashboard_enabled).then_some(console_format);
     let logging = logging::init(&invocation.logs_root, console);
+    if let Err(err) = protected {
+        tracing::warn!("Failed to mark the process non-dumpable: {err}");
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,6 +169,7 @@ fn store_config(choice: &DbChoice) -> Result<StoreConfig, String> {
         DbChoice::Disabled => Ok(StoreConfig {
             location: StoreLocation::Disabled,
             retention: None,
+            payload_retention: None,
         }),
         DbChoice::Path(path) => StoreConfig::from_lookup(|name| {
             if name == ENV_DB_PATH {
@@ -173,8 +205,9 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
         }
         Err(err) => tracing::warn!("Failed to close interrupted runs: {err}"),
     }
-    if let Some(retention) = config.retention {
-        prune(&store, retention).await;
+    if config.retention.is_some() || config.payload_retention.is_some() {
+        let (retention, payloads) = (config.retention, config.payload_retention);
+        prune(&store, retention, payloads).await;
         let store = store.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
@@ -184,7 +217,7 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
             loop {
                 tokio::select! {
                     () = cancel.cancelled() => break,
-                    _ = interval.tick() => prune(&store, retention).await,
+                    _ = interval.tick() => prune(&store, retention, payloads).await,
                 }
             }
         });
@@ -192,7 +225,17 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
     Ok(store)
 }
 
-async fn prune(store: &Store, retention: Duration) {
+async fn prune(store: &Store, retention: Option<Duration>, payloads: Option<Duration>) {
+    if let Some(payloads) = payloads {
+        match store.prune_payloads(payloads).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Cleared expired event payloads count={count}"),
+            Err(err) => tracing::warn!("Failed to clear expired event payloads: {err}"),
+        }
+    }
+    let Some(retention) = retention else {
+        return;
+    };
     match store.prune(retention, DEFAULT_KEEP_MIN_RUNS).await {
         Ok(stats) if stats.runs_deleted > 0 => tracing::info!(
             "Pruned run history runs_deleted={} events_deleted={}",
@@ -316,6 +359,19 @@ async fn serve_until_stopped(
     };
 
     let settings = workflow.settings();
+    // Say what the LLM connection contract changes, so it is never a silent switch.
+    match symphony_core::config::llm::describe(&settings) {
+        Some(line) => tracing::info!("{line}"),
+        None => {
+            let stray = symphony_core::config::llm::stray_variables(&symphony_core::ProcessEnv);
+            if !stray.is_empty() {
+                tracing::warn!(
+                    "Ignoring {} without LLM_PROVIDER or LLM_GATEWAY_URL (the LLM connection contract is off)",
+                    stray.join(", ")
+                );
+            }
+        }
+    }
     let host = invocation
         .host
         .clone()
@@ -325,6 +381,13 @@ async fn serve_until_stopped(
     if let Some(port) = configured_port {
         let config = ServerConfig {
             version: version().to_owned(),
+            auth: settings
+                .server
+                .api_token
+                .as_deref()
+                .map_or_else(Auth::disabled, Auth::token),
+            allowed_hosts: settings.server.allowed_hosts.clone(),
+            cors_allowed_origins: settings.server.allowed_origins.clone(),
             ..ServerConfig::new(host.clone(), port)
         };
         let control = Arc::new(RuntimeControlPlane::new(
@@ -463,7 +526,8 @@ mod tests {
             store_config(&DbChoice::Disabled).unwrap(),
             StoreConfig {
                 location: StoreLocation::Disabled,
-                retention: None
+                retention: None,
+                payload_retention: None,
             }
         );
         assert_eq!(

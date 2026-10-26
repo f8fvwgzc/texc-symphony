@@ -40,12 +40,17 @@ agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
-  approval_policy: never
+  # Safe defaults (docs/configuration.md#codex): Codex only sees a filtered environment, sandbox
+  # escalations and MCP prompts are rejected, and turns run in a workspace-write sandbox without
+  # network access. Loosen these deliberately, one at a time, if your workflow needs it, e.g.
+  #   turn_sandbox_policy: {type: workspaceWrite, networkAccess: true}   # git push, package installs
+  command: codex --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+budget:
+  # Spend controls (docs/configuration.md#budget). Prices turn tokens into cost; set them to your
+  # provider's rates to make the cost limits meaningful.
+  max_tokens_per_issue: 5000000
+  max_tokens_per_day: 50000000
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`

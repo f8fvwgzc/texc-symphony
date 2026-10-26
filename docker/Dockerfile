@@ -10,15 +10,25 @@
 # Build from the repository root (see docker/README.md):
 #   docker buildx build -f docker/Dockerfile -t symphony:dev --load .
 #   docker buildx build -f docker/Dockerfile --platform linux/amd64,linux/arm64 -t <image> --push .
+#
+# Modified 2026-10-25: the default command no longer acknowledges the guardrails banner (audit A3);
+# the image also carries the Claude Code CLI and bubblewrap for the `api` backend's shell sandbox.
+# Modified 2026-10-26: `symphony init` replaces tini as PID 1, so PID 1's environment (every secret
+# the container starts with) is not readable to agents running as the same user.
 
 ARG RUST_VERSION=1.99.0
 ARG NODE_VERSION=22
 ARG DEBIAN_RELEASE=bookworm
 ARG XX_VERSION=1.9.0
-# Set to "false" to leave Node.js and the Codex CLI out of the image (bring your own agent).
+# Set to "false" to leave Node.js and the agent CLIs (Codex, Claude Code) out of the image; the
+# built-in `api` backend needs neither.
 ARG INSTALL_CODEX=true
 # Pinned @openai/codex npm version (bump deliberately; agents speak its app-server protocol).
 ARG CODEX_VERSION=0.160.0
+# Set to "false" to leave the Claude Code CLI out (it needs INSTALL_CODEX=true for Node.js).
+ARG INSTALL_CLAUDE_CODE=true
+# Pinned @anthropic-ai/claude-code npm version (the `claude_code` backend parses its stream-json).
+ARG CLAUDE_CODE_VERSION=2.1.310
 
 # ---------------------------------------------------------------------------------------------
 # Cross-compilation helpers (xx-cargo, xx-apt-get, xx-clang, xx-verify).
@@ -91,6 +101,8 @@ RUN --mount=type=cache,id=symphony-cargo-registry-${TARGETPLATFORM},target=/usr/
 FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-${DEBIAN_RELEASE}-slim AS codex-npm
 ARG TARGETARCH
 ARG CODEX_VERSION
+ARG INSTALL_CLAUDE_CODE
+ARG CLAUDE_CODE_VERSION
 RUN set -eu; \
     case "$TARGETARCH" in \
       amd64) cpu=x64 ;; \
@@ -100,6 +112,13 @@ RUN set -eu; \
     npm install --global --prefix /out/opt/codex --os=linux --cpu="$cpu" \
       --no-audit --no-fund --omit=dev "@openai/codex@${CODEX_VERSION}"; \
     test -n "$(find /out/opt/codex/lib/node_modules -path "*linux-${cpu}*" -print -quit)"; \
+    if [ "$INSTALL_CLAUDE_CODE" = "true" ]; then \
+      npm install --global --prefix /out/opt/claude --os=linux --cpu="$cpu" \
+        --no-audit --no-fund --omit=dev "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
+      test -e /out/opt/claude/bin/claude; \
+    else \
+      mkdir -p /out/opt/claude/bin; \
+    fi; \
     mkdir -p /out/usr/local/lib/node_modules /out/usr/local/bin; \
     cp -a /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /out/usr/local/lib/node_modules/; \
     ln -s ../lib/node_modules/npm/bin/npm-cli.js /out/usr/local/bin/npm; \
@@ -124,6 +143,8 @@ ARG REVISION=unknown
 ARG CREATED=""
 ARG CODEX_VERSION
 ARG INSTALL_CODEX
+ARG CLAUDE_CODE_VERSION
+ARG INSTALL_CLAUDE_CODE
 LABEL org.opencontainers.image.title="symphony" \
       org.opencontainers.image.description="Symphony: turn tracker work into isolated, autonomous coding-agent runs" \
       org.opencontainers.image.source="https://github.com/f8fvwgzc/texc-symphony" \
@@ -136,24 +157,27 @@ LABEL org.opencontainers.image.title="symphony" \
       org.opencontainers.image.created="${CREATED}" \
       org.opencontainers.image.base.name="docker.io/library/debian:bookworm-slim" \
       dev.symphony.codex.installed="${INSTALL_CODEX}" \
-      dev.symphony.codex.version="${CODEX_VERSION}"
+      dev.symphony.codex.version="${CODEX_VERSION}" \
+      dev.symphony.claude-code.installed="${INSTALL_CLAUDE_CODE}" \
+      dev.symphony.claude-code.version="${CLAUDE_CODE_VERSION}"
 
-# git/bash/ssh for workspace hooks, SSH workers and agents; tini as PID 1 so signals reach
-# symphony and zombie hook/agent processes are reaped; wget for the health check.
+# git/bash/ssh for workspace hooks, SSH workers and agents; wget for the health check; bubblewrap
+# confines the `api` backend's shell tool (it needs user namespaces; see docker/README.md).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      bash ca-certificates git openssh-client tini wget && \
+      bash bubblewrap ca-certificates git openssh-client wget && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 symphony && \
     useradd --uid 10001 --gid 10001 --home-dir /home/symphony --create-home \
       --shell /bin/bash symphony && \
-    install -d -o symphony -g symphony -m 0750 /data /workspaces /srv/symphony /home/symphony/.codex && \
+    install -d -o symphony -g symphony -m 0750 /data /workspaces /srv/symphony /home/symphony/.codex \
+      /home/symphony/.claude && \
     install -d -m 0755 /config
 
 COPY --from=codex / /
 COPY --from=rust /out/symphony /usr/local/bin/symphony
 
-ENV PATH=/opt/codex/bin:$PATH \
+ENV PATH=/opt/codex/bin:/opt/claude/bin:$PATH \
     SYMPHONY_HOST=0.0.0.0 \
     SYMPHONY_PORT=4000 \
     SYMPHONY_DB_PATH=/data/symphony.db \
@@ -164,8 +188,17 @@ WORKDIR /srv/symphony
 VOLUME ["/data", "/workspaces"]
 EXPOSE 4000
 
+# Docker runs the probe with the container's whole environment (every secret) as uid 10001, and
+# its processes are dumpable: `exec env -i` hands wget an empty environment, so only the brief
+# sh/env start-up holds it, not the request.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -q -T 4 -O /dev/null "http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health" || exit 1
+  CMD ["sh", "-c", "exec env -i wget -q -T 4 -O /dev/null \"http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health\""]
 
-ENTRYPOINT ["tini", "--", "symphony"]
-CMD ["--i-understand-that-this-will-be-running-without-the-usual-guardrails", "/config/WORKFLOW.md"]
+# `symphony init` is PID 1: it forwards signals to symphony and reaps orphaned hook and agent
+# processes like tini did, and it keeps its environment unreadable to them (tini's was readable
+# through /proc/1/environ). Do not add Docker's `--init`: tini would hold the secrets again.
+ENTRYPOINT ["symphony", "init", "--", "symphony"]
+# Deliberately not pre-acknowledged: an operator who has reviewed the sandbox settings in
+# WORKFLOW.md passes --i-understand-that-this-will-be-running-without-the-usual-guardrails
+# (see docker/README.md). The API also needs SYMPHONY_API_TOKEN, because the image binds 0.0.0.0.
+CMD ["/config/WORKFLOW.md"]

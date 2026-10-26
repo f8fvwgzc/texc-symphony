@@ -171,12 +171,14 @@ fn parser() -> Result<liquid::Parser, PromptError> {
 }
 
 /// Renders `source` with Solid's error classes; errors name `template` (the operator's text, which
-/// differs from `source` when reference placeholders were substituted).
+/// differs from `source` when reference placeholders were substituted). `prompt`, when given, is the
+/// `prompt` variable of a backend's `prompt_template`.
 fn render_template(
     source: &str,
     template: &str,
     issue: &Issue,
     attempt: Option<u32>,
+    prompt: Option<&str>,
 ) -> Result<String, PromptError> {
     let parsed = parser()?.parse(source).map_err(|e| {
         let message = e.to_string();
@@ -196,6 +198,9 @@ fn render_template(
         attempt.map_or(LiquidValue::Nil, |a| LiquidValue::scalar(i64::from(a))),
     );
     globals.insert("issue".into(), LiquidValue::Object(issue_to_liquid(issue)));
+    if let Some(prompt) = prompt {
+        globals.insert("prompt".into(), LiquidValue::scalar(prompt.to_owned()));
+    }
     parsed
         .render(&globals)
         .map_err(|e| PromptError::TemplateRender(e.to_string()))
@@ -227,7 +232,7 @@ pub fn render_run_prompt(
     })?;
     let placeholders = reference::Placeholders::new();
     let source = reference::placeholder_template(template, &sections, placeholders);
-    let rendered = render_template(&source, template, issue, attempt)?;
+    let rendered = render_template(&source, template, issue, attempt, None)?;
     let (prompt, references) = reference::cut(&rendered, &sections, placeholders).ok_or_else(|| {
         PromptError::TemplateRender(
             "reference sections did not render in place: a reference marker is inside a Liquid block or tag".into(),
@@ -244,6 +249,17 @@ pub fn render_prompt(
     attempt: Option<u32>,
 ) -> Result<String, PromptError> {
     render_run_prompt(template, issue, attempt).map(|run| run.prompt)
+}
+
+/// Renders a backend's `prompt_template` around an already rendered `prompt`: the template sees
+/// `prompt`, `issue` and `attempt` (strict, like [`render_prompt`]).
+pub fn render_backend_prompt(
+    template: &str,
+    prompt: &str,
+    issue: &Issue,
+    attempt: Option<u32>,
+) -> Result<String, PromptError> {
+    render_template(template, template, issue, attempt, Some(prompt))
 }
 
 /// Load-time check of a prompt body's reference markers. `first_line` is the file line of the body's

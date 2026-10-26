@@ -33,11 +33,12 @@ WEB_DEPS := web/node_modules/.modules.yaml
 .DEFAULT_GOAL := all
 
 .PHONY: help all ci setup fmt fmt-check lint test web web-deps web-check build run \
-        docker docker-multiarch pr-body-check clean
+        docker docker-multiarch pr-body-check helm-check clean
 
 help:
 	@echo "Targets: all (fmt-check lint test web-check), fmt, fmt-check, lint, test, web, web-check,"
-	@echo "         build, run, docker, docker-multiarch, pr-body-check FILE=<path>, setup, clean"
+	@echo "         build, run, docker, docker-multiarch, pr-body-check FILE=<path>, helm-check,"
+	@echo "         setup, clean"
 
 all: fmt-check lint test web-check
 
@@ -84,6 +85,10 @@ build: web
 run: build
 	./target/release/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails \
 		--port $(PORT) $(RUN_ARGS) $(WORKFLOW)
+
+# Needs helm 3 on PATH; CI runs it in the `helm` job.
+helm-check:
+	deploy/helm/test.sh
 
 pr-body-check:
 	@test -n "$(FILE)" || { echo "usage: make pr-body-check FILE=/path/to/pr_body.md" >&2; exit 2; }

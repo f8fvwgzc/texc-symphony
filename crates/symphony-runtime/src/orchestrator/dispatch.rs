@@ -1,16 +1,20 @@
 //! Poll cycle: preflight, candidate fetch, revalidation and dispatch (B.2.7, B.4).
 
+// Modified 2026-10-25: budget gating, redaction and pricing at dispatch (audit A1/A4).
+
 use super::*;
 
 impl Orchestrator<'_> {
     /// `maybe_dispatch/1`: reconcile, validate config, fetch candidates, dispatch in priority order.
     pub(crate) async fn maybe_dispatch(&mut self) {
+        self.enforce_spend().await;
         self.reconcile_running_issues().await;
         self.reconcile_blocked_issues().await;
         if let Err(err) = self.ctx.workflow.force_reload() {
             log_preflight_error(&err);
             return;
         }
+        self.dispatch_tasks().await;
         let settings = self.settings();
         let issues = match self
             .ctx
@@ -27,6 +31,10 @@ impl Orchestrator<'_> {
         if self.state.available_slots() == 0 {
             return;
         }
+        if let Some(stop) = self.state.spend.global_stop(&settings.budget, Utc::now()) {
+            tracing::info!("Not dispatching new work: {}", stop.reason());
+            return;
+        }
         let sets = StateSets::from_settings(&settings);
         for issue in sort_issues_for_dispatch(issues) {
             if self.state.should_dispatch(&issue, &settings, &sets) {
@@ -41,9 +49,63 @@ impl Orchestrator<'_> {
         attempt: Option<u32>,
         preferred: Option<&str>,
     ) {
+        if let Some(stop) = self.spend_stop_for(&issue).await {
+            if let (SpendStop::IssueExhausted(reason), Some(id)) = (&stop, issue.id.as_deref()) {
+                tracing::warn!("Blocking {}: {reason}", issue_context(&issue));
+                self.block_for_budget(id, &issue, reason.clone());
+            }
+            return;
+        }
         if let Revalidation::Ok(refreshed) = self.refresh_issue_for_dispatch(&issue).await {
             self.do_dispatch_issue(refreshed, attempt, preferred);
         }
+    }
+
+    /// What stops `issue` from being dispatched now, after loading its stored usage once.
+    pub(crate) async fn spend_stop_for(&mut self, issue: &Issue) -> Option<SpendStop> {
+        let issue_id = issue.id.as_deref()?;
+        let budget = &self.settings().budget;
+        let per_issue =
+            budget.max_tokens_per_issue.is_some() || budget.max_cost_usd_per_issue.is_some();
+        if per_issue && !self.state.spend.knows_issue(issue_id) {
+            let usage = match self.ctx.store.issue_usage(issue_id).await {
+                Ok(usage) => Usage {
+                    tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                    cost_micro_usd: usage.cost_micro_usd,
+                },
+                Err(err) => {
+                    tracing::warn!("Failed to load the usage of issue_id={issue_id}: {err}");
+                    Usage::default()
+                }
+            };
+            self.state.spend.seed_issue(issue_id, usage);
+        }
+        self.state.spend.stop_for(issue_id, budget, Utc::now())
+    }
+
+    /// Blocks a not-running issue whose budget is used up (it stays visible in `blocked`).
+    pub(crate) fn block_for_budget(&mut self, issue_id: &str, issue: &Issue, error: String) {
+        self.remove_retry_entry(issue_id);
+        self.state.claimed.insert(issue_id.to_owned());
+        self.state.blocked.insert(
+            issue_id.to_owned(),
+            BlockedEntry {
+                identifier: issue
+                    .identifier
+                    .clone()
+                    .unwrap_or_else(|| issue_id.to_owned()),
+                issue: Some(issue.clone()),
+                worker_host: None,
+                workspace_path: None,
+                session_id: None,
+                error,
+                blocked_at: Utc::now(),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+            },
+        );
+        self.notify();
     }
 
     /// `revalidate_issue_for_dispatch/3`: one `fetch_issues_by_ids([id])` right before dispatch.
@@ -107,10 +169,118 @@ impl Orchestrator<'_> {
                 false
             }
             choice => {
-                self.spawn_issue_on_worker_host(issue, attempt, choice.host());
+                self.spawn_issue_on_worker_host(issue, attempt, choice.host(), RunPlan::default());
                 true
             }
         }
+    }
+
+    /// Starts queued tasks from the task API while slots are free (local runs, oldest first).
+    pub(crate) async fn dispatch_tasks(&mut self) {
+        if !self.ctx.store.is_enabled() {
+            return;
+        }
+        let settings = self.settings();
+        let slots = self.state.available_slots();
+        if slots == 0
+            || self
+                .state
+                .spend
+                .global_stop(&settings.budget, Utc::now())
+                .is_some()
+        {
+            return;
+        }
+        let queued = match self
+            .ctx
+            .store
+            .queued_tasks(u32::try_from(slots).unwrap_or(u32::MAX))
+            .await
+        {
+            Ok(queued) => queued,
+            Err(err) => {
+                tracing::warn!("Failed to read the task queue: {err}");
+                return;
+            }
+        };
+        for task in queued {
+            if self.state.available_slots() == 0 {
+                break;
+            }
+            let issue_id = task_issue_id(task.id);
+            if self.state.running.contains_key(&issue_id) || self.state.claimed.contains(&issue_id)
+            {
+                continue;
+            }
+            let issue = task_issue(&task);
+            let Ok(Some(task)) = self.ctx.store.start_task(task.id).await else {
+                continue;
+            };
+            let refusal = if settings.backend(task.backend.as_deref()).is_none() {
+                Some(format!(
+                    "unknown backend {:?}",
+                    task.backend.as_deref().unwrap_or(&settings.agent.backend)
+                ))
+            } else {
+                self.task_spend_stop(&issue, task.limits.max_tokens).await
+            };
+            if let Some(error) = refusal {
+                tracing::warn!("Not running {}: {error}", issue_context(&issue));
+                self.task_finish(task.id, TaskStatus::Failed, None, Some(error));
+                continue;
+            }
+            let plan = RunPlan {
+                backend: task.backend.clone(),
+                task: Some((
+                    TaskSpec {
+                        id: task.id,
+                        prompt: task.prompt.clone(),
+                        repo: task.repo.clone(),
+                        branch: task.branch.clone(),
+                        timeout_ms: task.limits.timeout_ms,
+                    },
+                    task.limits.max_tokens,
+                )),
+            };
+            self.spawn_issue_on_worker_host(issue, None, None, plan);
+        }
+    }
+
+    /// Why a task may not start: its own token limit or the per-issue budget is used up (history
+    /// is loaded first). The daily budget and the kill switch are checked by the caller.
+    pub(crate) async fn task_spend_stop(
+        &mut self,
+        issue: &Issue,
+        max_tokens: Option<u64>,
+    ) -> Option<String> {
+        let issue_id = issue.id.as_deref()?;
+        if !self.state.spend.knows_issue(issue_id) {
+            let usage = self
+                .ctx
+                .store
+                .issue_usage(issue_id)
+                .await
+                .unwrap_or_default();
+            self.state.spend.seed_issue(
+                issue_id,
+                Usage {
+                    tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                    cost_micro_usd: usage.cost_micro_usd,
+                },
+            );
+        }
+        if let Some(limit) = max_tokens {
+            let used = self.state.spend.issue(issue_id).tokens;
+            if used >= limit {
+                return Some(format!(
+                    "task token limit exhausted: {used} of {limit} tokens used"
+                ));
+            }
+        }
+        self.state
+            .spend
+            .issue_stop(issue_id, &self.settings().budget)
+            .map(|stop| stop.reason().to_owned())
     }
 
     pub(crate) fn spawn_issue_on_worker_host(
@@ -118,6 +288,7 @@ impl Orchestrator<'_> {
         issue: Issue,
         attempt: Option<u32>,
         worker_host: Option<String>,
+        plan: RunPlan,
     ) {
         let Some(issue_id) = issue.id.clone() else {
             return;
@@ -136,6 +307,8 @@ impl Orchestrator<'_> {
             reporter: crate::worker::WorkerReporter::new(run_id, self.worker_tx.clone()),
             cancel: cancel.clone(),
             cancel_grace: self.ctx.worker_cancel_grace,
+            backend: plan.backend.clone(),
+            task: plan.task.as_ref().map(|(spec, _)| spec.clone()),
         };
         let future = self.ctx.factory.start(ctx);
         let span = tracing::info_span!(
@@ -175,6 +348,12 @@ impl Orchestrator<'_> {
                 workspace_path: None,
                 started_at: Some(started_at),
             },
+            Arc::new(Redactor::from_settings(&self.settings(), &ProcessEnv)),
+        );
+        let settings = self.settings();
+        let pricing = Pricing::for_backend(
+            settings.backend(plan.backend.as_deref()).as_ref(),
+            &settings.budget,
         );
         let now = Instant::now();
         self.state.running.insert(
@@ -202,10 +381,44 @@ impl Orchestrator<'_> {
                 started_at,
                 started: now,
                 recorder,
+                pricing,
+                cost_micro_usd: 0,
+                task: plan.task.map(|(spec, max_tokens)| TaskRun {
+                    id: spec.id,
+                    max_tokens,
+                    result: None,
+                }),
             },
         );
         self.state.claimed.insert(issue_id.clone());
         self.remove_retry_entry(&issue_id);
+    }
+}
+
+/// What a run executes besides its issue: another backend, or a task.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RunPlan {
+    pub backend: Option<String>,
+    /// The task and its token limit.
+    pub task: Option<(TaskSpec, Option<u64>)>,
+}
+
+/// The issue a task's runs are recorded under (`task:<id>` / `task-<id>`).
+pub(crate) fn task_issue(task: &TaskRecord) -> Issue {
+    let title = task.title.clone().unwrap_or_else(|| {
+        let first = task.prompt.lines().next().unwrap_or_default();
+        first.chars().take(80).collect()
+    });
+    Issue {
+        id: Some(task_issue_id(task.id)),
+        identifier: Some(task.identifier.clone()),
+        title: Some(title),
+        description: Some(task.prompt.clone()),
+        state: Some("task".into()),
+        dispatchable: true,
+        created_at: Some(task.created_at),
+        updated_at: Some(task.updated_at),
+        ..Issue::default()
     }
 }
 

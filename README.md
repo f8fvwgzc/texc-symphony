@@ -1,8 +1,10 @@
 # texc-symphony
 
-texc-symphony is a Rust orchestrator for coding agents. It turns tracker issues (Linear, GitHub,
-GitLab, Jira, Asana) into isolated, autonomous implementation runs driven by Codex or Claude Code,
-so teams manage work instead of supervising agents.
+texc-symphony is a Rust orchestrator for AI agents: any task, assigned to an agent and handled to
+completion, on any model provider. It turns tracker issues (Linear, GitHub, GitLab, Jira, Asana)
+and tasks posted to its task API into isolated, autonomous runs driven by Codex, the Claude Code
+CLI, or its own agent loop over any Anthropic or OpenAI-compatible model API, so teams manage work
+instead of supervising agents.
 
 [![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](https://player.vimeo.com/video/1186371009?h=5626e4b899)
 
@@ -24,6 +26,20 @@ environment. To keep token use down, situational parts of the prompt can be
 [reference sections](docs/configuration.md#reference-sections) that the agent loads only when they
 apply, and `symphony workflow audit` shows what a prompt costs per model request.
 
+**Agent backends.** `backends:` in `WORKFLOW.md` defines what runs the work
+([`docs/agents.md`](docs/agents.md)): `codex` (the Codex app-server, the default), `claude_code`
+(the Claude Code CLI, with the tracker tools bridged over MCP), and `api`, Symphony's own agent
+loop over Anthropic Messages or OpenAI-compatible Chat Completions with workspace tools (files, a
+sandboxed shell) and the scoped tracker tools. A new OpenAI-compatible provider (OpenAI, Ollama,
+vLLM, LM Studio, OpenRouter, Groq, Together, Gemini's OpenAI endpoint) is a few lines of config.
+On the platform, the shared `LLM_*` connection contract (including gateway mode) configures all
+three ([configuration](docs/configuration.md#llm-connection-contract)); a Helm chart is in
+[`deploy/helm/symphony`](deploy/helm/symphony).
+
+**Task API.** Products assign work without a tracker: `POST /api/v1/tasks` with a prompt and,
+optionally, a repository, backend and limits; then cancel, unblock or watch it over SSE
+([`docs/tasks.md`](docs/tasks.md)). The `symphony-tasks-client` crate wraps it for Rust products.
+
 Symphony works best in codebases that have adopted
 [harness engineering](https://openai.com/index/harness-engineering/).
 
@@ -42,10 +58,11 @@ see [Model providers](docs/configuration.md#model-providers).
 
 **A. Release binary** (Linux x86_64/arm64, macOS x86_64/arm64). Each release has raw executables
 named `symphony-<vX.Y.Z|nightly>-<linux_x86_64|linux_arm64|macos_x86_64|macos_arm64>` with a
-matching `.sha256` checksum file:
+matching `.sha256` checksum file. No version is tagged yet: until the first release, build from source (B).
 
 ```sh
-version=v0.1.0 target=linux_x86_64
+version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/f8fvwgzc/texc-symphony/releases/latest | sed 's|.*/||')
+target=linux_x86_64   # or linux_arm64, macos_arm64, macos_x86_64
 base=https://github.com/f8fvwgzc/texc-symphony/releases/download/$version
 curl -fL -O "$base/symphony-$version-$target" -O "$base/symphony-$version-$target.sha256"
 shasum -a 256 -c "symphony-$version-$target.sha256"
@@ -63,11 +80,17 @@ cargo install --locked --path crates/symphony
 The dashboard is embedded from `web/dist` at compile time; build it first (`make web`), otherwise
 the server shows a placeholder page. `make build` (below) does both.
 
-**C. Docker** (amd64 and arm64):
+**C. Docker** (amd64 and arm64; the image is published with each release, so `latest` exists from the first one):
 
 ```sh
-docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" -e LINEAR_API_KEY ghcr.io/f8fvwgzc/texc-symphony:latest
+export SYMPHONY_API_TOKEN="$(openssl rand -hex 32)"   # the container binds 0.0.0.0: a token is required
+docker run --rm -p 127.0.0.1:4000:4000 -v "$PWD/WORKFLOW.md:/config/WORKFLOW.md:ro" \
+  -e LINEAR_API_KEY -e SYMPHONY_API_TOKEN ghcr.io/f8fvwgzc/texc-symphony:latest \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md
 ```
+
+Pass the acknowledgement flag only after reviewing the sandbox settings in your `WORKFLOW.md`; the
+image does not pass it for you.
 
 The image includes git and the Codex CLI. For Compose, persistent volumes, Codex login inside the
 container and reverse proxies, see [`docker/README.md`](docker/README.md).
@@ -141,8 +164,10 @@ How the crates fit together: [`docs/architecture.md`](docs/architecture.md).
 
 The API is documented in [`docs/api/README.md`](docs/api/README.md), with the OpenAPI 3.1 contract
 in [`docs/api/openapi.yaml`](docs/api/openapi.yaml); a running server also serves it at
-`GET /api/openapi.json`. The HTTP API has no authentication: keep it on loopback or behind an
-authenticating proxy.
+`GET /api/openapi.json`. With `server.api_token` (or `SYMPHONY_API_TOKEN`) set, every API call
+needs `Authorization: Bearer <token>`; without one Symphony serves the API on loopback only. It
+also refuses foreign `Host` headers and cross-origin writes, redacts credentials in recorded
+events, and enforces the `budget:` limits and the `POST /api/v1/pause` kill switch.
 
 ## Development
 
