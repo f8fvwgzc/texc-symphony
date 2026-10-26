@@ -445,22 +445,19 @@ impl Toolbox {
             self.create_dirs_beneath(raw, &workspace, parent)?;
         }
         let mut flags = OFlags::CLOEXEC | OFlags::NONBLOCK;
-        flags |= if write {
-            OFlags::RDWR | OFlags::CREATE
+        // `openat2` rejects a nonzero `mode` unless `O_CREAT` is set, so a read passes mode 0.
+        let mode = if write {
+            flags |= OFlags::RDWR | OFlags::CREATE;
+            Mode::from_bits_truncate(0o600)
         } else {
-            OFlags::RDONLY
+            flags |= OFlags::RDONLY;
+            Mode::empty()
         };
         // `IN_ROOT` resolves the whole path with the workspace as `/`, so symlinks and `..` stay
         // inside it (an escape, or a component swapped to a symlink to `/etc`, lands in the
         // workspace) while in-workspace symlinks keep working, matching the non-Linux contract.
-        let fd = openat2(
-            &workspace,
-            rel,
-            flags,
-            Mode::from_bits_truncate(0o600),
-            ResolveFlags::IN_ROOT,
-        )
-        .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
+        let fd = openat2(&workspace, rel, flags, mode, ResolveFlags::IN_ROOT)
+            .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
         let file = File::from(fd);
         let meta = file
             .metadata()

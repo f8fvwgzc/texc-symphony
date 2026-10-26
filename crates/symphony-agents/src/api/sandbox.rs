@@ -531,11 +531,15 @@ mod tests {
             return;
         }
         let joined = args(&command.unwrap()).join(" ");
+        // The api sandbox profile (no --share-net) with the shim running the command.
+        assert!(joined.contains("--ro-bind-try /usr /usr"), "{joined}");
         assert!(
-            joined.contains(
-                "--unshare-net --die-with-parent --chdir /w/MT-1 -- \
-                 /usr/local/bin/symphony egress-shim"
-            ),
+            joined.contains("--proc /proc --tmpfs /tmp --unshare-all --new-session"),
+            "{joined}"
+        );
+        assert!(!joined.contains("--share-net"), "{joined}");
+        assert!(
+            joined.contains("--chdir /w/MT-1 -- /usr/local/bin/symphony egress-shim"),
             "{joined}"
         );
         assert!(
