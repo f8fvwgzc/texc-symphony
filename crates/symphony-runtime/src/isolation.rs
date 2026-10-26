@@ -545,6 +545,26 @@ mod tests {
         assert!(uids_in_use(4_000_000_000, 1).is_empty());
     }
 
+    // Regression: a process that marks itself non-dumpable makes its `/proc/<pid>` root-owned,
+    // but `proc_uid` reads `/proc/<pid>/status`, so the scan still sees its real uid (a leftover
+    // daemon cannot hide from the free-uid check or the kill pass this way).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_dumpable_process_is_still_seen_by_the_uid_scan() {
+        use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+        use std::os::unix::fs::MetadataExt;
+        let me = proc_uid("self").expect("own uid from status");
+        // Our `/proc/self` is owner-readable now.
+        assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), me);
+        set_dumpable_behavior(DumpableBehavior::NotDumpable).unwrap();
+        // Now `/proc/self` is owned by root, so the old dir-owner scan would read 0, not `me`.
+        assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), 0);
+        let seen = uids_in_use(me, 1);
+        // Restore before asserting, so a failure does not leave the binary non-dumpable.
+        set_dumpable_behavior(DumpableBehavior::Dumpable).unwrap();
+        assert!(seen.contains(&me), "the non-dumpable process was missed");
+    }
+
     #[test]
     fn killing_an_unused_uid_signals_nothing() {
         // A uid with no processes: the /proc scan runs and signals nothing (safe without root).
