@@ -32,6 +32,8 @@ server:
 ---
 Image test.
 EOF
+# mktemp makes it 0600 and `docker cp` keeps the mode; the image's user must read it.
+chmod 0644 "$workflow"
 
 container="$(docker create -e SYMPHONY_API_TOKEN="$token" "$image" \
   --i-understand-that-this-will-be-running-without-the-usual-guardrails /config/WORKFLOW.md)"
