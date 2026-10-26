@@ -173,12 +173,6 @@ impl AgentBackend for ApiBackend {
             None if api.network => NetworkAccess::Allowed,
             None => NetworkAccess::Denied,
         };
-        let github_app_key = options
-            .settings
-            .isolation
-            .as_ref()
-            .and_then(|isolation| isolation.github_app.as_ref())
-            .map(|app| app.private_key_file.clone());
         let toolbox = Toolbox::new(
             workspace.clone(),
             api.tools.clone(),
@@ -190,16 +184,7 @@ impl AgentBackend for ApiBackend {
                 secret_names: options.secret_names(),
                 extra_env: options.env.clone(),
                 task_env: options.task_env.clone(),
-                masked_files: options
-                    .settings
-                    .llm
-                    .as_ref()
-                    .map(|llm| llm.secret_files())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .chain(api.api_key_file.clone())
-                    .chain(github_app_key)
-                    .collect(),
+                masked_files: options.settings.host_secret_files(),
                 run_as: options.run_as,
             },
         );

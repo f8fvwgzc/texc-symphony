@@ -22,6 +22,11 @@ fn memory() -> Store {
 
 /// A store in a fresh schema of the test database.
 fn postgres_store(url: &str) -> Store {
+    postgres_store_named(url).0
+}
+
+/// [`postgres_store`] and its schema, which is also its connections' `application_name`.
+fn postgres_store_named(url: &str) -> (Store, String) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let schema = format!(
@@ -42,8 +47,40 @@ fn postgres_store(url: &str) -> Store {
     .join()
     .unwrap();
     let separator = if url.contains('?') { '&' } else { '?' };
-    Store::open_postgres(&format!("{url}{separator}options=-csearch_path%3D{schema}"))
-        .expect("postgres store")
+    let store = Store::open_postgres(&format!(
+        "{url}{separator}options=-csearch_path%3D{schema}&application_name={schema}"
+    ))
+    .expect("postgres store");
+    (store, schema)
+}
+
+#[tokio::test]
+async fn a_lost_postgres_connection_is_reopened() {
+    let Some(url) = std::env::var("SYMPHONY_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    else {
+        return;
+    };
+    let (store, schema) = postgres_store_named(&url);
+    store.start_run(new_run("MT-1")).await.unwrap();
+    // The database drops the connection (a restart, a failover, an idle timeout on the path).
+    std::thread::spawn(move || {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let ended = admin
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+                &[&schema],
+            )
+            .unwrap();
+        assert_eq!(ended.len(), 1, "the store's one connection");
+    })
+    .join()
+    .unwrap();
+    // The operation that meets the dead connection may fail; the store then reconnects.
+    let _ = store.list_runs(RunQuery::default()).await;
+    let page = store.list_runs(RunQuery::default()).await.unwrap();
+    assert_eq!(page.runs.len(), 1, "the same schema after reconnecting");
 }
 
 fn new_run(issue: &str) -> NewRun {

@@ -137,6 +137,42 @@ fn bad_values_are_reported_by_path() {
 }
 
 #[test]
+fn a_github_app_task_may_also_reach_the_api_of_its_git_host() {
+    let settings = parse(
+        json!({"isolation": {"github_app": {
+            "app_id": 7, "private_key_file": "/run/secrets/app.pem",
+            "api_url": "https://ghe.example.com/api/v3", "git_host": "ghe.example.com",
+        }}}),
+        &MapEnv::new(),
+    )
+    .unwrap();
+    let isolation = settings.isolation.as_ref().unwrap();
+    assert_eq!(
+        isolation.egress_allow_list(Some("https://ghe.example.com/acme/widgets"), None),
+        vec![HostPort::new("ghe.example.com", 443)],
+        "on GHE the API shares the git host"
+    );
+    let settings = parse(
+        json!({"isolation": {"github_app": {"app_id": 7, "private_key_file": "/run/secrets/app.pem"}}}),
+        &MapEnv::new(),
+    )
+    .unwrap();
+    let isolation = settings.isolation.as_ref().unwrap();
+    assert_eq!(
+        isolation.egress_allow_list(Some("https://github.com/acme/widgets"), None),
+        vec![
+            HostPort::new("github.com", 443),
+            HostPort::new("api.github.com", 443)
+        ]
+    );
+    // Another git host gets no token, so no API either.
+    assert_eq!(
+        isolation.egress_allow_list(Some("https://gitlab.com/acme/widgets"), None),
+        vec![HostPort::new("gitlab.com", 443)]
+    );
+}
+
+#[test]
 fn the_allow_list_is_the_git_host_the_gateway_and_the_extras() {
     let env = MapEnv::new()
         .with("LLM_GATEWAY_URL", "http://Gateway.internal:8080/")

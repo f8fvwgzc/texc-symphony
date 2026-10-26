@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::Value;
-use symphony_codex::{CodexEvent, CodexEventData, StreamMessage};
+use symphony_codex::{CodexError, CodexEvent, CodexEventData, StreamMessage};
 use symphony_core::config::SecretSource;
 use symphony_core::config::llm::{LLM_API_KEY_FILE, LLM_GATEWAY_TOKEN_FILE};
 use symphony_core::{EnvSource, Settings};
@@ -210,11 +210,41 @@ impl Redactor {
                     *raw = redacted;
                 }
             }
-            CodexEventData::SessionStarted { .. }
-            | CodexEventData::StartupFailed { .. }
-            | CodexEventData::TurnEndedWithError { .. } => {}
+            CodexEventData::StartupFailed { reason }
+            | CodexEventData::TurnEndedWithError { reason, .. } => self.redact_error(reason),
+            CodexEventData::SessionStarted { .. } => {}
         }
         event
+    }
+
+    /// Redacts the text and JSON an agent error carries (turn details, a backend's stderr tail
+    /// and result message, ...); tags and fixed messages are kept.
+    pub fn redact_error(&self, error: &mut CodexError) {
+        match error {
+            CodexError::ResponseError(value)
+            | CodexError::InvalidThreadPayload(value)
+            | CodexError::InvalidTurnPayload(value)
+            | CodexError::TurnFailed(value)
+            | CodexError::TurnCancelled(value)
+            | CodexError::TurnInputRequired(value)
+            | CodexError::ApprovalRequired(value) => self.redact_value(value),
+            CodexError::Backend(text)
+            | CodexError::LimitExceeded(text)
+            | CodexError::Unsupported(text)
+            | CodexError::SpawnFailed(text)
+            | CodexError::RemoteLauncherMissing(text) => {
+                if let Cow::Owned(redacted) = self.redact_str(text) {
+                    *text = redacted;
+                }
+            }
+            CodexError::InvalidWorkspaceCwd(_)
+            | CodexError::BashNotFound
+            | CodexError::SshNotFound
+            | CodexError::SandboxPolicy(_)
+            | CodexError::ResponseTimeout
+            | CodexError::PortExit(_)
+            | CodexError::TurnTimeout => {}
+        }
     }
 }
 
@@ -314,6 +344,34 @@ mod tests {
                 "usage": {"total_tokens": 10, "access_token": null},
             })
         );
+    }
+
+    #[test]
+    fn failure_events_and_errors_are_redacted_too() {
+        let redactor = Redactor::new(["task-token-0123456789".to_owned()]);
+        let event = CodexEvent::new(
+            CodexEventData::TurnEndedWithError {
+                session_id: "thread-turn".into(),
+                reason: CodexError::TurnFailed(json!({"error": "push: task-token-0123456789"})),
+            },
+            None,
+            None,
+        );
+        let json = redactor.redact_event(event).to_json().to_string();
+        assert!(!json.contains("task-token-0123456789"), "{json}");
+        assert!(json.contains("[REDACTED]"), "{json}");
+        let event = CodexEvent::new(
+            CodexEventData::StartupFailed {
+                reason: CodexError::Backend("stderr: GH_TOKEN=task-token-0123456789".into()),
+            },
+            None,
+            None,
+        );
+        let json = redactor.redact_event(event).to_json().to_string();
+        assert!(!json.contains("task-token-0123456789"), "{json}");
+        let mut error = CodexError::LimitExceeded("echo task-token-0123456789".into());
+        redactor.redact_error(&mut error);
+        assert_eq!(error.to_string(), "agent_limit_exceeded: echo [REDACTED]");
     }
 
     #[test]

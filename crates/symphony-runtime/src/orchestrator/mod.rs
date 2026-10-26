@@ -112,6 +112,9 @@ pub const LEASE_RENEW_EVERY: Duration = Duration::from_secs(15);
 /// late) is stopped while the lease is still ours, so another replica never runs it at the same
 /// time: renewals may fail once, not twice in a row.
 pub const LEASE_STOP_WINDOW: Duration = Duration::from_secs(2 * LEASE_RENEW_EVERY.as_secs());
+/// Bound on waiting for one renewal: a renewal stuck on an unresponsive database counts as
+/// failed, so the expiry check still stops the runs whose lease may lapse.
+pub const LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(LEASE_RENEW_EVERY.as_secs() / 2);
 
 /// Extra wait, beyond the cancel grace, before a cancelled worker is aborted.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
@@ -542,13 +545,15 @@ impl<'w> Orchestrator<'w> {
         let keys: Vec<String> = self.state.leases.keys().cloned().collect();
         if !keys.is_empty() {
             let asked = Instant::now();
-            match self
-                .ctx
-                .store
-                .renew_leases(self.ctx.replica_id.clone(), keys.clone(), LEASE_TTL)
-                .await
-            {
-                Ok(held) => {
+            let renewal = tokio::time::timeout(
+                LEASE_RENEW_TIMEOUT,
+                self.ctx
+                    .store
+                    .renew_leases(self.ctx.replica_id.clone(), keys.clone(), LEASE_TTL),
+            )
+            .await;
+            match renewal {
+                Ok(Ok(held)) => {
                     for key in &held {
                         if let Some(deadline) = self.state.leases.get_mut(key) {
                             *deadline = asked + LEASE_TTL;
@@ -562,7 +567,11 @@ impl<'w> Orchestrator<'w> {
                         self.abandon_running_issue(key, "dispatch lease lost").await;
                     }
                 }
-                Err(err) => tracing::warn!("Failed to renew dispatch leases: {err}"),
+                Ok(Err(err)) => tracing::warn!("Failed to renew dispatch leases: {err}"),
+                Err(_) => tracing::warn!(
+                    "Renewing dispatch leases timed out after {}ms",
+                    LEASE_RENEW_TIMEOUT.as_millis()
+                ),
             }
             if self.ctx.store.is_shared() {
                 for key in expiring_leases(&self.state.leases, Instant::now()) {

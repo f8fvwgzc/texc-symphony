@@ -2705,6 +2705,7 @@ dependencies = [
  "futures",
  "regex",
  "reqwest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

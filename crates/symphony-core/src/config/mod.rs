@@ -191,6 +191,27 @@ impl Settings {
         )
     }
 
+    /// Files holding Symphony's own secrets, which no agent may read: the LLM contract's key
+    /// files, `api` backends' key files and the GitHub App key of `isolation` (masked in the
+    /// `api` shell's sandbox and in a task's network jail).
+    pub fn host_secret_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .llm
+            .iter()
+            .flat_map(|llm| llm.secret_files())
+            .chain(backend::backend_secret_files(&self.backends))
+            .chain(
+                self.isolation
+                    .iter()
+                    .filter_map(|isolation| isolation.github_app.as_ref())
+                    .map(|app| app.private_key_file.clone()),
+            )
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
     /// The backend named `name`, else `agent.backend` (`None` for an unknown name). `codex` is
     /// always known, also in settings that were not parsed (`Settings::default()`).
     pub fn backend(&self, name: Option<&str>) -> Option<BackendSettings> {

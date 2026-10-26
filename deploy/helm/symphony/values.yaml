@@ -42,7 +42,8 @@ extraEnv: []
 # Extra `envFrom` sources.
 extraEnvFrom: []
 # Extra volumes and their mounts in the Symphony container (for example the GitHub App key of
-# `isolation.github_app`, from a Secret mounted read-only at /var/run/secrets/github-app).
+# `isolation.github_app`, from a Secret mounted read-only at /var/run/secrets/github-app; give
+# it `defaultMode: 0400`, which `isolation.task_uids` with `network.mode: allow` requires).
 extraVolumes: []
 extraVolumeMounts: []
 
@@ -118,8 +119,9 @@ containerSecurityContext:
     drop: [ALL]
 
 # Pod egress control. When enabled, the pod may only reach DNS (kube-dns, UDP/TCP 53) and the
-# `egress` rules listed here: add the LLM gateway (or provider), the tracker API and the git host.
-# This is the enforcement point for Codex and Claude Code under `isolation.network.mode: deny`.
+# `egress` rules listed here: add the LLM gateway (or provider), the tracker API, the git host
+# and, with `database`, the PostgreSQL server (TCP 5432).
+# A pod-level layer under the per-task network jail of `isolation.network.mode: deny`.
 networkPolicy:
   enabled: false
   # Extra NetworkPolicy egress rules, for example:

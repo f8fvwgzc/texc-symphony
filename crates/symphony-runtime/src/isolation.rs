@@ -3,7 +3,7 @@
 //! | Guarantee | Enforcement |
 //! |---|---|
 //! | Own uid per task (`task_uids`) | the workspace (`0700`) and `<workspace>/.home` belong to the task uid; the clone, Codex, Claude Code and the api shell run as it; the api file tools hand what they write to it. Needs root: without it the run fails with `isolation_unavailable`. |
-//! | Short-lived repository credentials (`github_app`) | a GitHub App installation token scoped to the task's repository ([`crate::credentials`]), given to the clone and the agent through the environment only (never argv), redacted from the run's events; the operator's own tokens stay stripped. |
+//! | Short-lived repository credentials (`github_app`) | a GitHub App installation token scoped to the task's repository ([`crate::credentials`]), given to the clone and the agent through the environment only (never argv), redacted from the run's events and errors; the operator's own tokens stay stripped. The App key itself never reaches an agent: it is masked wherever agents run under a default-deny network, and otherwise `task_uids` with a key no task uid can read is required. |
 //! | Default-deny network (`network.mode: deny`) | an [`EgressProxy`] allowing only the repository's git host on 443, the LLM gateway and `network.allow`. No task process can bypass it: the api shell (bubblewrap: empty network namespace + shim; seatbelt: everything but the proxy port denied) and Codex, Claude Code and an unconfined shell in the network jail (`symphony_agents::egress::network_jail`); where the jail cannot run they do not start. |
 //!
 //! Every task process gets `HOME=<workspace>/.home`, so the operator's `~/.gitconfig`, `gh` login
@@ -29,12 +29,16 @@ fn unavailable(message: impl Into<String>) -> RunError {
 }
 
 /// Checks, before any work, that `isolation` can apply to a run on `worker_host`: no SSH worker,
-/// and root for `task_uids` (switching and chowning to other users needs it).
+/// a GitHub App key no agent can read, and root for `task_uids` (switching and chowning to other
+/// users needs it).
 pub fn preflight(isolation: &IsolationSettings, worker_host: Option<&str>) -> Result<(), RunError> {
     if let Some(host) = worker_host {
         return Err(unavailable(format!(
             "task isolation is not supported on SSH workers (worker_host={host})"
         )));
+    }
+    if let Some(app) = &isolation.github_app {
+        app_key_out_of_reach(isolation, app)?;
     }
     if isolation.task_uids.is_some() {
         #[cfg(unix)]
@@ -50,6 +54,43 @@ pub fn preflight(isolation: &IsolationSettings, worker_host: Option<&str>) -> Re
         }
         #[cfg(not(unix))]
         return Err(unavailable("isolation.task_uids needs a Unix host"));
+    }
+    Ok(())
+}
+
+/// The GitHub App key mints tokens for every repository the App is installed on, so no agent may
+/// read it. Under a default-deny network every agent process runs where it reads as empty (the
+/// `api` shell's sandbox, the network jail); otherwise only a task uid that cannot read the file
+/// keeps it out of reach.
+fn app_key_out_of_reach(
+    isolation: &IsolationSettings,
+    app: &symphony_core::config::GitHubAppSettings,
+) -> Result<(), RunError> {
+    if isolation.network.denies() {
+        return Ok(());
+    }
+    if isolation.task_uids.is_none() {
+        return Err(unavailable(
+            "isolation.github_app needs network.mode: deny (agents run where the App key reads \
+             as empty) or isolation.task_uids: an agent running as Symphony's user could read \
+             the key and mint tokens for every repository of the App",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let key = &app.private_key_file;
+        let mode = std::fs::metadata(key)
+            .map_err(|err| unavailable(format!("cannot inspect {}: {err}", key.display())))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(unavailable(format!(
+                "{} must not be readable by group or others (mode 0400 or 0600): the task users \
+                 could read it",
+                key.display()
+            )));
+        }
     }
     Ok(())
 }

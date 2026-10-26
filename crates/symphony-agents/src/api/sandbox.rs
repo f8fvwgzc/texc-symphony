@@ -215,7 +215,7 @@ pub fn command(
             // network jail (the shim inside sets the proxy variables).
             let mut command = match network {
                 NetworkAccess::Proxy { route, shim } => {
-                    let jail = network_jail(route, shim.as_deref(), workspace)?;
+                    let jail = network_jail(route, shim.as_deref(), workspace, masked)?;
                     let (program, args) = jail
                         .split_first()
                         .ok_or_else(|| "the network jail is empty".to_owned())?;

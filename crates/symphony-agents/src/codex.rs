@@ -102,6 +102,7 @@ impl AgentBackend for CodexBackend {
                 &route,
                 self.egress_shim.as_deref(),
                 Path::new(&options.workspace),
+                &options.settings.host_secret_files(),
             )
             .map_err(CodexError::Unsupported)?;
             options = options.with_launcher(jail);

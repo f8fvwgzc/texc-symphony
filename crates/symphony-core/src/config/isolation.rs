@@ -44,7 +44,9 @@ pub struct IsolationSettings {
 
 impl IsolationSettings {
     /// The `host:port` entries a task for `repo` may reach in deny mode: the repository's git
-    /// host on 443, the LLM gateway (when the LLM contract uses one) and `network.allow`.
+    /// host on 443, the GitHub API of `github_app` when the repository is on its git host (`gh`
+    /// uses the task's token there), the LLM gateway (when the LLM contract uses one) and
+    /// `network.allow`.
     pub fn egress_allow_list(
         &self,
         repo: Option<&str>,
@@ -53,12 +55,18 @@ impl IsolationSettings {
         let repo = repo
             .and_then(repo_host)
             .map(|host| HostPort::new(&host, GIT_HTTPS_PORT));
+        let api = self.github_app.as_ref().and_then(|app| {
+            repo.as_ref()
+                .filter(|git| git.host == app.git_host)
+                .and_then(|_| url_host_port(&app.api_url))
+        });
         let gateway = llm
             .and_then(|llm| llm.gateway.as_ref())
             .and_then(|gateway| url_host_port(&gateway.url));
         let mut out: Vec<HostPort> = Vec::new();
         for entry in repo
             .into_iter()
+            .chain(api)
             .chain(gateway)
             .chain(self.network.allow.iter().cloned())
         {

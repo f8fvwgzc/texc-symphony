@@ -243,21 +243,69 @@ pub(crate) fn postgres_sql(sql: &str) -> String {
 pub(crate) struct PostgresDb {
     pub(crate) client: postgres::Client,
     statements: HashMap<String, postgres::Statement>,
+    /// Opens a new connection when the current one is lost (a database restart or failover, an
+    /// idle connection dropped by the network).
+    reconnect: Box<dyn FnMut() -> Result<postgres::Client> + Send>,
+    /// Between `BEGIN` and `COMMIT`/`ROLLBACK`: a connection lost there takes the transaction
+    /// with it, so the rest of it must fail rather than run on a new connection.
+    in_transaction: bool,
+    /// The last operation failed on the connection itself (not with an SQL error).
+    lost: bool,
 }
 
 impl PostgresDb {
-    pub(crate) fn new(client: postgres::Client) -> Self {
+    pub(crate) fn new(
+        client: postgres::Client,
+        reconnect: Box<dyn FnMut() -> Result<postgres::Client> + Send>,
+    ) -> Self {
         Self {
             client,
             statements: HashMap::new(),
+            reconnect,
+            in_transaction: false,
+            lost: false,
         }
     }
 
+    /// Replaces a lost connection (prepared statements belong to the old one).
+    fn ensure_connected(&mut self) -> Result<()> {
+        if !self.lost && !self.client.is_closed() {
+            return Ok(());
+        }
+        if self.in_transaction {
+            return Err(StoreError::Internal(
+                "the PostgreSQL connection was lost during a transaction".into(),
+            ));
+        }
+        self.client = (self.reconnect)()?;
+        self.statements.clear();
+        self.lost = false;
+        tracing::warn!("Reconnected to PostgreSQL after the connection was lost");
+        Ok(())
+    }
+
+    /// `result`, noting a failure of the connection itself (closed, an I/O error, or the
+    /// server ending the session: SQLSTATE classes 08 and 57P) so the next operation reconnects.
+    fn checked<T>(&mut self, result: std::result::Result<T, postgres::Error>) -> Result<T> {
+        if let Err(err) = &result {
+            let state = err.code().map(postgres::error::SqlState::code);
+            self.lost |= err.is_closed()
+                || self.client.is_closed()
+                || match state {
+                    Some(code) => code.starts_with("08") || code.starts_with("57P"),
+                    None => err.as_db_error().is_none(),
+                };
+        }
+        Ok(result?)
+    }
+
     fn statement(&mut self, sql: &str) -> Result<postgres::Statement> {
+        self.ensure_connected()?;
         if let Some(statement) = self.statements.get(sql) {
             return Ok(statement.clone());
         }
-        let statement = self.client.prepare(&postgres_sql(sql))?;
+        let prepared = self.client.prepare(&postgres_sql(sql));
+        let statement = self.checked(prepared)?;
         self.statements.insert(sql.to_owned(), statement.clone());
         Ok(statement)
     }
@@ -336,7 +384,8 @@ impl Db for PostgresDb {
         let bound = Self::bind(&statement, params)?;
         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
             bound.iter().map(|b| b.as_ref()).collect();
-        Ok(self.client.execute(&statement, &refs)?)
+        let executed = self.client.execute(&statement, &refs);
+        self.checked(executed)
     }
 
     fn query(&mut self, sql: &str, params: &[Val]) -> Result<Vec<Row>> {
@@ -344,8 +393,8 @@ impl Db for PostgresDb {
         let bound = Self::bind(&statement, params)?;
         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
             bound.iter().map(|b| b.as_ref()).collect();
-        self.client
-            .query(&statement, &refs)?
+        let rows = self.client.query(&statement, &refs);
+        self.checked(rows)?
             .iter()
             .map(|row| {
                 (0..row.len())
@@ -357,7 +406,22 @@ impl Db for PostgresDb {
     }
 
     fn batch(&mut self, sql: &str) -> Result<()> {
-        Ok(self.client.batch_execute(sql)?)
+        if matches!(sql, "COMMIT" | "ROLLBACK") {
+            self.in_transaction = false;
+            if self.lost || self.client.is_closed() {
+                return Err(StoreError::Internal(
+                    "the PostgreSQL connection was lost during a transaction".into(),
+                ));
+            }
+        } else {
+            self.ensure_connected()?;
+        }
+        let done = self.client.batch_execute(sql);
+        self.checked(done)?;
+        if sql == "BEGIN" {
+            self.in_transaction = true;
+        }
+        Ok(())
     }
 
     fn backend(&self) -> Backend {

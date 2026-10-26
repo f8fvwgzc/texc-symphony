@@ -12,8 +12,10 @@ spec:
   # SQLite: one replica on persistent volumes. PostgreSQL: replicas coordinated by dispatch leases
   # (see docs/deployment.md#postgresql-and-replicas).
   replicas: {{ .Values.replicaCount }}
+  # Rolling only without persistent volumes: a second pod on the same claims would share the
+  # workspaces (or hang on a ReadWriteOnce attach).
   strategy:
-    type: {{ if .Values.database.existingSecret }}RollingUpdate{{ else }}Recreate{{ end }}
+    type: {{ if $shared }}RollingUpdate{{ else }}Recreate{{ end }}
   selector:
     matchLabels:
       {{- include "symphony.selector" . | nindent 6 }}

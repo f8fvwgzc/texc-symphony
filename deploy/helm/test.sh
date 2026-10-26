@@ -81,6 +81,9 @@ has "$out" "replicas: 3" "replicas"
 has "$out" "name: SYMPHONY_DATABASE_URL" "postgres"
 has "$out" "type: RollingUpdate" "postgres"
 lacks "$out" "kind: PersistentVolumeClaim" "replicas use emptyDir"
+out=$(helm template t "$chart" --set database.existingSecret=symphony-db)
+has "$out" "type: Recreate" "one replica on PostgreSQL keeps its volumes: no overlapping pods"
+has "$out" "kind: PersistentVolumeClaim" "one replica on PostgreSQL keeps its volumes"
 if helm template t "$chart" --set replicaCount=2 >/dev/null 2>&1; then
   fail "replicas without PostgreSQL must be refused"
 fi

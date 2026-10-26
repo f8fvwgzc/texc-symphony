@@ -161,10 +161,17 @@ async fn a_jailed_agent_process_reaches_only_the_proxy() {
     let proxy = proxy_allowing(allowed).await;
     let workspace = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+    // One of Symphony's own keys (the GitHub App key, ...), reached through a symlink.
+    let secrets = tempfile::tempdir().unwrap();
+    let key = secrets.path().join("private-key.pem");
+    std::fs::write(&key, "app-private-key").unwrap();
+    let link = secrets.path().join("key-link.pem");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
     let jail = symphony_agents::egress::network_jail(
         &proxy.route(),
         Some(Path::new(SYMPHONY)),
         &workspace,
+        std::slice::from_ref(&link),
     )
     .unwrap();
     let run = |script: String| {
@@ -191,4 +198,8 @@ async fn a_jailed_agent_process_reaches_only_the_proxy() {
         workspace.display().to_string()
     );
     assert!(workspace.join("made-in-the-jail").exists());
+    // The masked key reads as empty under every name.
+    let out = run(format!("cat {} {}", key.display(), link.display())).await;
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
 }

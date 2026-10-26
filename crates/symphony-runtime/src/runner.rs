@@ -414,7 +414,16 @@ impl AgentRunner {
                 Some(isolation) => isolation.redacted_events(&ctx.events),
                 None => ctx.events.clone(),
             };
-            let outcome = session.run_turn(&prompt, &ctx.issue, &events).await?;
+            let outcome = match session.run_turn(&prompt, &ctx.issue, &events).await {
+                Ok(outcome) => outcome,
+                // The run's error becomes the task's `error`: redacted like its events.
+                Err(mut err) => {
+                    if let Some(redactor) = isolation.and_then(TaskIsolation::redactor) {
+                        redactor.redact_error(&mut err);
+                    }
+                    return Err(err.into());
+                }
+            };
             tracing::info!(
                 "Completed task run for {} session_id={} workspace={workspace}",
                 issue_log(&ctx.issue),

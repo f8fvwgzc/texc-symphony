@@ -260,10 +260,13 @@ impl AgentBackend for ClaudeCodeBackend {
         // A default-deny network runs every turn in the network jail: Claude Code and the
         // commands its tools run reach only the task's egress proxy (the shim sets the variables).
         let launcher = match &options.egress {
-            Some(route) => {
-                crate::egress::network_jail(route, self.bridge_program.as_deref(), &workspace)
-                    .map_err(CodexError::Unsupported)?
-            }
+            Some(route) => crate::egress::network_jail(
+                route,
+                self.bridge_program.as_deref(),
+                &workspace,
+                &options.settings.host_secret_files(),
+            )
+            .map_err(CodexError::Unsupported)?,
             None => Vec::new(),
         };
         let relay = self.relay(&options).await;

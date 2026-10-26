@@ -1962,7 +1962,9 @@ async fn replicas_never_run_the_same_issue_or_task_at_once() {
     orch_b.terminate_running_issue(&key, false, "test").await;
 }
 
-#[tokio::test(start_paused = true)]
+// Real time: under a paused clock the renewal's timeout would fire while the store thread is
+// still answering (the clock jumps whenever the runtime idles).
+#[tokio::test]
 async fn a_replica_that_lost_its_leases_stops_the_runs_and_leaves_the_task_to_the_new_owner() {
     use symphony_store::TaskStatus;
     let store = Store::open_in_memory().unwrap();
@@ -2016,6 +2018,49 @@ async fn a_replica_that_lost_its_leases_stops_the_runs_and_leaves_the_task_to_th
         store.get_task(task.id).await.unwrap().unwrap().status,
         TaskStatus::Running
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_renewal_stuck_on_the_database_is_not_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    let started: Started = Arc::default();
+    let mut h = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    // Another connection holds the write lock: the renewal waits on it (an unresponsive
+    // database), and the orchestrator must move on after LEASE_RENEW_TIMEOUT.
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let deadline = orch.state.leases["i-1"];
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let real = std::time::Instant::now();
+    orch.renew_leases().await;
+    assert_eq!(
+        orch.state.leases["i-1"], deadline,
+        "the renewal did not succeed (the lock held)"
+    );
+    assert!(
+        real.elapsed() < symphony_store::BUSY_TIMEOUT / 2,
+        "renew_leases waited for the stuck store ({:?})",
+        real.elapsed()
+    );
+    assert!(
+        orch.state.running.contains_key("i-1"),
+        "one failed renewal is tolerated"
+    );
+    drop(lock);
+    orch.terminate_running_issue("i-1", false, "test").await;
 }
 
 #[tokio::test]

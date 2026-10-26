@@ -114,29 +114,22 @@ impl Store {
     /// Symphony replicas may share one database: migrations are serialized and dispatch is
     /// coordinated by leases. TLS uses the system roots (`sslmode=disable` turns it off).
     pub fn open_postgres(url: &str) -> Result<Store> {
-        let config: postgres::Config =
-            url.parse()
-                .map_err(|err: postgres::Error| StoreError::Open {
-                    path: redact_url(url),
-                    reason: err.to_string(),
-                })?;
         let label = redact_url(url);
+        let config = postgres_config(url).map_err(|reason| StoreError::Open {
+            path: label.clone(),
+            reason,
+        })?;
         let open_label = label.clone();
         Store::spawn(label, None, true, move || {
-            let open_err = |reason: String| StoreError::Open {
-                path: open_label.clone(),
-                reason,
+            let connect = move || {
+                connect_postgres(&config).map_err(|reason| StoreError::Open {
+                    path: open_label.clone(),
+                    reason,
+                })
             };
-            let mut client = match config.get_ssl_mode() {
-                postgres::config::SslMode::Disable => config
-                    .connect(postgres::NoTls)
-                    .map_err(|err| open_err(err.to_string()))?,
-                _ => config
-                    .connect(postgres_tls()?)
-                    .map_err(|err| open_err(err.to_string()))?,
-            };
+            let mut client = connect()?;
             schema::migrate_postgres(&mut client)?;
-            Ok(Box::new(PostgresDb::new(client)))
+            Ok(Box::new(PostgresDb::new(client, Box::new(connect))))
         })
     }
 
@@ -706,14 +699,74 @@ impl<T> Future for Pending<T> {
     }
 }
 
-/// `url` without its password (for logs and errors).
+/// Bound on opening a PostgreSQL connection (unless the URL sets `connect_timeout`).
+pub const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long unacknowledged data may stay on a PostgreSQL connection before the kernel drops it
+/// (unless the URL sets `tcp_user_timeout`; Linux), with keepalives after this much idleness: a
+/// silently partitioned database surfaces as an error, not a hang.
+pub const POSTGRES_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client configuration for `url`. TLS unless `sslmode=disable`: `prefer` (also the
+/// default) becomes `require`, because it would fall back to plaintext when anyone on the path
+/// answers the TLS request with a refusal. Connecting and a silent network are bounded.
+pub(crate) fn postgres_config(url: &str) -> std::result::Result<postgres::Config, String> {
+    use postgres::config::SslMode;
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|err: postgres::Error| err.to_string())?;
+    if config.get_ssl_mode() == SslMode::Prefer {
+        config.ssl_mode(SslMode::Require);
+    }
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(POSTGRES_CONNECT_TIMEOUT);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(POSTGRES_NETWORK_TIMEOUT);
+    }
+    // The driver's default is two hours of idleness before the first keepalive.
+    if config.get_keepalives_idle() > POSTGRES_NETWORK_TIMEOUT {
+        config
+            .keepalives(true)
+            .keepalives_idle(POSTGRES_NETWORK_TIMEOUT);
+    }
+    Ok(config)
+}
+
+/// A new connection for `config` (TLS with the system roots unless `sslmode=disable`).
+fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::Client, String> {
+    match config.get_ssl_mode() {
+        postgres::config::SslMode::Disable => config.connect(postgres::NoTls),
+        _ => config.connect(postgres_tls().map_err(|err| err.to_string())?),
+    }
+    .map_err(|err| err.to_string())
+}
+
+/// `url` without its password, in the userinfo or a `password` parameter (for logs and errors).
 pub(crate) fn redact_url(url: &str) -> String {
     match url::Url::parse(url) {
-        Ok(mut parsed) if parsed.password().is_some() => {
-            let _ = parsed.set_password(Some("***"));
+        Ok(mut parsed) => {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("***"));
+            }
+            if parsed
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("password"))
+            {
+                let pairs: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .map(|(key, value)| {
+                        let value = if key.eq_ignore_ascii_case("password") {
+                            "***".to_owned()
+                        } else {
+                            value.into_owned()
+                        };
+                        (key.into_owned(), value)
+                    })
+                    .collect();
+                parsed.query_pairs_mut().clear().extend_pairs(pairs);
+            }
             parsed.to_string()
         }
-        Ok(parsed) => parsed.to_string(),
         // Key/value connection strings: drop the password field.
         Err(_) => url
             .split_whitespace()
@@ -750,6 +803,56 @@ fn postgres_tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_never_falls_back_to_plaintext_and_does_not_hang_on_a_silent_network() {
+        use postgres::config::SslMode;
+        let config = postgres_config("postgres://u@db.internal/symphony").unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            SslMode::Require,
+            "the default `prefer`"
+        );
+        let config = postgres_config("postgres://u@db.internal/symphony?sslmode=prefer").unwrap();
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
+        let config = postgres_config("postgres://u@db.internal/symphony?sslmode=disable").unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            SslMode::Disable,
+            "an explicit opt-out"
+        );
+        assert_eq!(
+            config.get_connect_timeout(),
+            Some(&POSTGRES_CONNECT_TIMEOUT)
+        );
+        assert_eq!(
+            config.get_tcp_user_timeout(),
+            Some(&POSTGRES_NETWORK_TIMEOUT)
+        );
+        assert_eq!(config.get_keepalives_idle(), POSTGRES_NETWORK_TIMEOUT);
+        let config = postgres_config(
+            "postgres://u@db.internal/symphony?connect_timeout=3&tcp_user_timeout=5",
+        )
+        .unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
+        assert!(postgres_config("postgres://u@db/x?sslmode=sometimes").is_err());
+    }
+
+    #[test]
+    fn urls_are_logged_without_any_password() {
+        assert_eq!(
+            redact_url("postgres://symphony:hunter2@db:5432/s?sslmode=require"),
+            "postgres://symphony:***@db:5432/s?sslmode=require"
+        );
+        let redacted = redact_url("postgres://symphony@db/s?password=hunter2&sslmode=require");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(redacted.contains("sslmode=require"), "{redacted}");
+        assert_eq!(
+            redact_url("host=db user=symphony password=hunter2"),
+            "host=db user=symphony password=***"
+        );
+    }
 
     #[test]
     fn handle_is_clone_send_sync() {

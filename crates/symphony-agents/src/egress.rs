@@ -45,12 +45,14 @@ use tokio::task::{JoinHandle, JoinSet};
 /// The launch prefix that confines a whole agent process (Codex, Claude Code) of a task to its
 /// egress proxy: `bwrap --dev-bind / / --unshare-net ... -- <shim> egress-shim --socket S
 /// --port 3128 --`. The agent keeps the host's file system and tools; only its network is
-/// replaced by the shim's relay to the proxy. `Err` when this cannot be enforced (not Linux, no
+/// replaced by the shim's relay to the proxy, and the `masked` secret files (Symphony's own keys,
+/// such as the GitHub App key) read as empty. `Err` when this cannot be enforced (not Linux, no
 /// `bwrap`, a proxy without a socket, no shim): the agent must not start then.
 pub fn network_jail(
     route: &EgressRoute,
     shim: Option<&Path>,
     cwd: &Path,
+    masked: &[PathBuf],
 ) -> Result<Vec<std::ffi::OsString>, String> {
     const NEEDS: &str = "isolation.network.mode: deny confines Codex and Claude Code with \
                          bubblewrap (Linux, with unprivileged user namespaces)";
@@ -66,17 +68,16 @@ pub fn network_jail(
     let shim =
         shim.ok_or_else(|| "the `symphony` executable (the egress shim) is unknown".to_owned())?;
     let mut argv: Vec<std::ffi::OsString> = vec![bwrap.into()];
-    argv.extend(
-        [
-            "--dev-bind",
-            "/",
-            "/",
-            "--unshare-net",
-            "--die-with-parent",
-            "--chdir",
-        ]
-        .map(Into::into),
-    );
+    argv.extend(["--dev-bind", "/", "/", "--unshare-net", "--die-with-parent"].map(Into::into));
+    // Over the file's real path, so every name of it (a Kubernetes Secret's symlinks) is masked.
+    for file in masked {
+        if let Ok(real) = std::fs::canonicalize(file)
+            && real.is_file()
+        {
+            argv.extend(["--ro-bind".into(), "/dev/null".into(), real.into()]);
+        }
+    }
+    argv.push("--chdir".into());
     argv.push(cwd.into());
     argv.push("--".into());
     argv.push(shim.into());
@@ -565,7 +566,17 @@ mod tests {
             tcp: "127.0.0.1:41000".parse().unwrap(),
         };
         let shim = Path::new("/usr/local/bin/symphony");
-        let jail = network_jail(&route, Some(shim), Path::new("/w/.tasks/7"));
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let real_key = std::fs::canonicalize(key.path()).unwrap();
+        let jail = network_jail(
+            &route,
+            Some(shim),
+            Path::new("/w/.tasks/7"),
+            &[
+                key.path().to_path_buf(),
+                PathBuf::from("/nonexistent/key.pem"),
+            ],
+        );
         if !cfg!(target_os = "linux") || find_executable("bwrap").is_none() {
             let err = jail.unwrap_err();
             assert!(err.contains("bubblewrap"), "{err}");
@@ -578,17 +589,21 @@ mod tests {
             .collect();
         assert_eq!(
             argv[1..].join(" "),
-            "--dev-bind / / --unshare-net --die-with-parent --chdir /w/.tasks/7 -- \
-             /usr/local/bin/symphony egress-shim --socket /tmp/symphony-egress-1/proxy.sock \
-             --port 3128 --"
+            format!(
+                "--dev-bind / / --unshare-net --die-with-parent --ro-bind /dev/null {} \
+                 --chdir /w/.tasks/7 -- /usr/local/bin/symphony egress-shim --socket \
+                 /tmp/symphony-egress-1/proxy.sock --port 3128 --",
+                real_key.display()
+            ),
+            "the existing secret file is masked at its real path, a missing one skipped"
         );
         // Without a socket or a shim there is nothing to relay through: refused, not unconfined.
         let no_socket = EgressRoute {
             socket: None,
             ..route.clone()
         };
-        assert!(network_jail(&no_socket, Some(shim), Path::new("/w")).is_err());
-        assert!(network_jail(&route, None, Path::new("/w")).is_err());
+        assert!(network_jail(&no_socket, Some(shim), Path::new("/w"), &[]).is_err());
+        assert!(network_jail(&route, None, Path::new("/w"), &[]).is_err());
     }
 
     #[test]

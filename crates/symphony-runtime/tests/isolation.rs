@@ -202,75 +202,119 @@ fn generate_key(dir: &Path) -> Option<PathBuf> {
     ok.then_some(key)
 }
 
-#[tokio::test]
-async fn an_isolated_task_gets_its_own_home_and_token() {
-    let keys = tempfile::tempdir().unwrap();
-    let Some(key) = generate_key(keys.path()) else {
-        eprintln!("skipped: openssl is not available");
-        return;
-    };
+/// Wiremock for the App's installation lookup and token, called `calls` times.
+async fn app_api(calls: u64) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/widgets/installation"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 31})))
-        .expect(1)
+        .expect(calls)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/app/installations/31/access_tokens"))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"token": TOKEN})))
-        .expect(1)
+        .expect(calls)
         .mount(&server)
         .await;
+    server
+}
+
+#[tokio::test]
+async fn an_app_key_an_agent_could_read_is_refused_before_a_token_is_minted() {
+    let keys = tempfile::tempdir().unwrap();
+    let key = keys.path().join("app.pem");
+    fs::write(&key, "not used").unwrap();
+    let server = app_api(0).await;
+    // Network allowed and no task uid: the agent runs as Symphony's user, outside any jail, and
+    // could read the key (and mint tokens for every repository of the App).
     let s = setup(json!({
-        "github_app": {
-            "app_id": 99,
-            "private_key_file": key.to_string_lossy(),
-            "api_url": server.uri(),
-        },
-        // Default-deny networking is covered by `a_task_whose_network_cannot_be_confined_...`
-        // here and, through the real jail, by the `symphony` crate's egress tests.
+        "github_app": {"app_id": 99, "private_key_file": key.to_string_lossy(), "api_url": server.uri()},
         "network": {"mode": "allow"},
     }));
-    // A workspace left by an earlier run of the task: no clone (and so no network) is needed.
-    let ws = workspace(&s);
-    fs::create_dir_all(&ws).unwrap();
-    fs::write(ws.join("README.md"), "earlier run").unwrap();
+    let (ctx, _rx) = task_context(Some("https://github.com/acme/widgets"));
+    let err = s.runner.run(ctx).await.unwrap_err();
+    assert!(
+        matches!(&err, RunError::IsolationUnavailable(m) if m.contains("network.mode: deny")),
+        "{err:?}"
+    );
+    assert!(read(&s.trace).is_empty(), "the agent never started");
 
-    let (ctx, mut rx) = task_context(Some("https://github.com/acme/widgets"));
-    s.runner.run(ctx).await.unwrap();
+    // With task uids the key must not be readable by them: a 0644 key (a Kubernetes Secret's
+    // default) is refused, also before the root check.
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    let s = setup(json!({
+        "github_app": {"app_id": 99, "private_key_file": key.to_string_lossy(), "api_url": server.uri()},
+        "task_uids": {"first": 200000, "count": 10},
+        "network": {"mode": "allow"},
+    }));
+    let (ctx, _rx) = task_context(Some("https://github.com/acme/widgets"));
+    let err = s.runner.run(ctx).await.unwrap_err();
+    assert!(
+        matches!(&err, RunError::IsolationUnavailable(m) if m.contains("must not be readable by group or others")),
+        "{err:?}"
+    );
+}
 
-    let trace = read(&s.trace);
-    let home = trace_value(&trace, "HOME");
-    assert!(home.ends_with("/.home"), "{trace}");
-    assert!(Path::new(&home).is_dir(), "the task home exists");
+#[tokio::test]
+async fn an_isolated_task_gets_its_own_home_and_a_redacted_token() {
+    use symphony_runtime::isolation::TaskIsolation;
+    let keys = tempfile::tempdir().unwrap();
+    let Some(key) = generate_key(keys.path()) else {
+        eprintln!("skipped: openssl is not available");
+        return;
+    };
+    let server = app_api(1).await;
+    let isolation = symphony_core::config::IsolationSettings {
+        task_uids: None,
+        github_app: Some(symphony_core::config::GitHubAppSettings {
+            app_id: "99".into(),
+            private_key_file: key,
+            api_url: server.uri(),
+            git_host: "github.com".into(),
+        }),
+        network: allow_all(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("7");
+    fs::create_dir(&ws).unwrap();
+    let mut spec = task(7);
+    spec.repo = Some("https://github.com/acme/widgets".into());
+    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &spec, &ws)
+        .await
+        .unwrap();
+    let env: std::collections::HashMap<String, String> = prepared.task_env().into_iter().collect();
+    assert_eq!(env["HOME"], ws.join(".home").display().to_string());
     assert_eq!(
-        trace_value(&trace, "GH_TOKEN"),
-        TOKEN,
+        env["GH_TOKEN"], TOKEN,
         "the task's token, not the operator's"
     );
-    assert_eq!(trace_value(&trace, "SYMPHONY_GIT_TOKEN"), TOKEN);
+    assert_eq!(env["SYMPHONY_GIT_TOKEN"], TOKEN);
     assert_eq!(
-        trace_value(&trace, "HELPER_KEY"),
+        env["GIT_CONFIG_KEY_1"],
         "credential.https://github.com.helper"
     );
-    assert_eq!(trace_value(&trace, "HTTPS_PROXY"), "", "{trace}");
-    assert!(
-        !trace.contains("operator-gh-token-must-not-leak"),
-        "{trace}"
-    );
 
-    // The token never leaves the run in an event.
-    let mut events = Vec::new();
-    while let Ok(event) = rx.try_recv() {
-        events.push(event.to_json().to_string());
-    }
-    assert!(!events.is_empty());
-    assert!(events.iter().all(|e| !e.contains(TOKEN)), "{events:?}");
-    assert!(
-        events.iter().any(|e| e.contains("token [REDACTED]")),
-        "{events:?}"
+    // The token never leaves the run in an event or its error.
+    let redactor = prepared.redactor().unwrap();
+    assert_eq!(
+        redactor.redact_str(&format!("token {TOKEN}")),
+        "token [REDACTED]"
     );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = prepared.redacted_events(&EventSink::new(tx));
+    events.emit(CodexEvent::new(
+        symphony_codex::CodexEventData::TurnEndedWithError {
+            session_id: "s".into(),
+            reason: symphony_codex::CodexError::Backend(format!("push failed: {TOKEN}")),
+        },
+        None,
+        None,
+    ));
+    let json = rx.try_recv().unwrap().to_json().to_string();
+    assert!(!json.contains(TOKEN), "{json}");
+    assert!(json.contains("[REDACTED]"), "{json}");
 }
 
 #[tokio::test]
