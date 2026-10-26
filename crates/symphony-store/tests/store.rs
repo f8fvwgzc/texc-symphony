@@ -77,9 +77,12 @@ async fn a_lost_postgres_connection_is_reopened() {
     })
     .join()
     .unwrap();
-    // The operation that meets the dead connection may fail; the store then reconnects.
-    let _ = store.list_runs(RunQuery::default()).await;
-    assert!(store.is_degraded(), "the lost connection shows as degraded");
+    // The first operation may meet the dead connection and fail, or the driver may notice the
+    // close first and the store reconnect before it runs. Only the former marks it degraded.
+    if store.list_runs(RunQuery::default()).await.is_err() {
+        assert!(store.is_degraded(), "a failed op marks the store degraded");
+    }
+    // Either way the store recovers and serves the same schema, no longer degraded.
     let page = store.list_runs(RunQuery::default()).await.unwrap();
     assert_eq!(page.runs.len(), 1, "the same schema after reconnecting");
     assert!(!store.is_degraded(), "healthy again after reconnecting");

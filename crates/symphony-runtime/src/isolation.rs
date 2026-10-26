@@ -29,6 +29,10 @@ fn unavailable(message: impl Into<String>) -> RunError {
     RunError::IsolationUnavailable(message.into())
 }
 
+/// The set of task uids leased by live runs, shared across every [`TaskUidPool`] so overlapping
+/// ranges (a reloaded `count`) never lease the same uid.
+pub type LeasedUids = Arc<Mutex<HashSet<u32>>>;
+
 /// Assigns each isolated task its own uid from `isolation.task_uids`. A task leases a free uid
 /// for the length of its run instead of the old `first + (id mod count)` mapping, so no two live
 /// runs share a uid and no uid with a live process is reused. "In use" is found by scanning
@@ -37,7 +41,7 @@ fn unavailable(message: impl Into<String>) -> RunError {
 pub struct TaskUidPool {
     first: u32,
     count: u32,
-    leased: Mutex<HashSet<u32>>,
+    leased: LeasedUids,
 }
 
 /// A uid held for one run; dropping it frees the uid for the next task.
@@ -48,12 +52,13 @@ pub struct TaskUidLease {
 }
 
 impl TaskUidPool {
-    /// A pool over `uids`'s range.
-    pub fn new(uids: symphony_core::config::TaskUids) -> Arc<Self> {
+    /// A pool over `uids`'s range sharing `leased` with every other pool, so a uid leased from
+    /// one range is not handed out by an overlapping range.
+    pub fn new(uids: symphony_core::config::TaskUids, leased: LeasedUids) -> Arc<Self> {
         Arc::new(Self {
             first: uids.first,
             count: uids.count,
-            leased: Mutex::new(HashSet::new()),
+            leased,
         })
     }
 
@@ -97,30 +102,39 @@ impl Drop for TaskUidLease {
     }
 }
 
+/// The real uid of process `pid`, read from `/proc/<pid>/status` (the `Uid:` line). Unlike the
+/// owner of `/proc/<pid>`, which the kernel changes to `root` for a non-dumpable process
+/// (`prctl(PR_SET_DUMPABLE, 0)`), the `Uid:` line is readable and still names the process's uid,
+/// so a task daemon cannot hide from the free-uid scan or the kill pass by marking itself
+/// non-dumpable.
+#[cfg(target_os = "linux")]
+fn proc_uid(pid: &str) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    // `Uid:\treal\teffective\tsaved\tfs`; the real uid is enough (all four are the task's).
+    line.split_whitespace().next()?.parse().ok()
+}
+
 /// The uids in `first..first+count` that a live process runs as (Linux; empty elsewhere).
 #[cfg(target_os = "linux")]
 fn uids_in_use(first: u32, count: u32) -> HashSet<u32> {
-    use std::os::unix::fs::MetadataExt;
     let end = first.saturating_add(count);
     let mut set = HashSet::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return set;
     };
     for entry in entries.flatten() {
-        // Numeric entries are processes; `/proc/<pid>` is owned by the process's uid.
-        if entry
-            .file_name()
+        let name = entry.file_name();
+        let Some(pid) = name
             .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-            .is_none()
-        {
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            let uid = meta.uid();
-            if (first..end).contains(&uid) {
-                set.insert(uid);
-            }
+        };
+        if let Some(uid) = proc_uid(pid)
+            && (first..end).contains(&uid)
+        {
+            set.insert(uid);
         }
     }
     set
@@ -136,23 +150,19 @@ fn uids_in_use(_first: u32, _count: u32) -> HashSet<u32> {
 /// leases the uid. Needs root; returns how many it signalled. A no-op off Linux.
 #[cfg(target_os = "linux")]
 pub fn kill_uid_processes(uid: u32) -> usize {
-    use std::os::unix::fs::MetadataExt;
     let mut killed = 0;
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
     };
     for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
             continue;
         };
         if pid <= 1 {
             continue;
         }
-        if entry.metadata().is_ok_and(|meta| meta.uid() == uid)
+        if proc_uid(&pid.to_string()) == Some(uid)
             && let Some(pid) = rustix::process::Pid::from_raw(pid)
         {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
@@ -176,6 +186,11 @@ pub fn preflight(
     worker_host: Option<&str>,
     repo: Option<&str>,
 ) -> Result<(), RunError> {
+    // Keep the files Symphony creates from here on (the run-history database, logs, workspaces)
+    // off-limits to the task uids. Set per isolated run as well as at startup, so isolation
+    // turned on by a reload still takes effect.
+    #[cfg(unix)]
+    rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
     if let Some(host) = worker_host {
         return Err(unavailable(format!(
             "task isolation is not supported on SSH workers (worker_host={host})"
@@ -462,6 +477,10 @@ mod tests {
     use super::*;
     use symphony_core::config::TaskUids;
 
+    fn leased() -> LeasedUids {
+        Arc::new(Mutex::new(HashSet::new()))
+    }
+
     /// A range starting well above any real uid, so `uids_in_use` finds nothing in it.
     fn free_range(count: u32) -> TaskUids {
         TaskUids {
@@ -472,7 +491,7 @@ mod tests {
 
     #[test]
     fn the_pool_leases_distinct_uids_refuses_when_exhausted_and_frees_on_drop() {
-        let pool = TaskUidPool::new(free_range(2));
+        let pool = TaskUidPool::new(free_range(2), leased());
         let a = pool.lease().unwrap();
         let b = pool.lease().unwrap();
         assert_ne!(a.uid(), b.uid());
@@ -490,6 +509,22 @@ mod tests {
         drop((b, c));
     }
 
+    #[test]
+    fn overlapping_ranges_share_one_leased_set() {
+        // A reloaded `count` makes a wider range; it must not re-lease a uid a narrower range
+        // already holds.
+        let leased = leased();
+        let narrow = TaskUidPool::new(free_range(1), Arc::clone(&leased));
+        let wide = TaskUidPool::new(free_range(5), Arc::clone(&leased));
+        let a = narrow.lease().unwrap();
+        // The wide pool skips the uid the narrow pool leased.
+        let b = wide.lease().unwrap();
+        assert_ne!(a.uid(), b.uid());
+        // The single uid of the narrow range is taken, so it is exhausted.
+        assert!(narrow.lease().is_err());
+        drop((a, b));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn uids_in_use_sees_a_live_process_and_skips_it() {
@@ -498,10 +533,13 @@ mod tests {
         // A range around our own uid: this process is live, so our uid is "in use".
         assert!(uids_in_use(me, 1).contains(&me));
         // A pool over just our uid has nothing free (the only uid is busy).
-        let pool = TaskUidPool::new(TaskUids {
-            first: me,
-            count: 1,
-        });
+        let pool = TaskUidPool::new(
+            TaskUids {
+                first: me,
+                count: 1,
+            },
+            leased(),
+        );
         assert!(pool.lease().is_err());
         // A high range nobody uses is free.
         assert!(uids_in_use(4_000_000_000, 1).is_empty());

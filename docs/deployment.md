@@ -248,8 +248,9 @@ export SYMPHONY_DATABASE_URL='postgres://symphony:secret@db.internal:5432/sympho
   `statement_timeout`/`lock_timeout` to 30 s, so no single query can pin the store thread. A lost
   connection (a database restart or failover) is reopened by the next operation, retried with a
   short backoff; the operation that met it fails, and `GET /api/v1/health` reports
-  `status: degraded` (and `store: postgres`) until it reconnects, so a readiness probe can drain
-  or restart the replica. The password never appears in logs (userinfo or `password=`).
+  `status: degraded` (and `store: postgres`) in the body until it reconnects (the status code
+  stays 200), so operators can alert on it. The password never appears in logs (userinfo or
+  `password=`).
 - **Several replicas** may share one database. Each dispatch takes a lease on the issue (or
   `task:<id>`) in the `leases` table: a replica skips issues and tasks another live replica
   holds, renews its leases every 15 s (a renewal waits at most 7 s) and releases them with the

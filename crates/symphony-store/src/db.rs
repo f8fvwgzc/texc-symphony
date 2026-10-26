@@ -251,9 +251,15 @@ pub(crate) struct PostgresDb {
     in_transaction: bool,
     /// The last operation failed on the connection itself (not with an SQL error).
     lost: bool,
+    /// When the last reconnect attempt failed; the next one waits out [`RECONNECT_COOLDOWN`] so a
+    /// backlog of jobs during an outage does not each block on a fresh connect timeout.
+    last_failed_reconnect: Option<std::time::Instant>,
     /// `false` while the connection is lost; a health probe reports the store as degraded.
     healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How long after a failed reconnect the store waits before trying again.
+const RECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl PostgresDb {
     pub(crate) fn new(
@@ -267,6 +273,7 @@ impl PostgresDb {
             reconnect,
             in_transaction: false,
             lost: false,
+            last_failed_reconnect: None,
             healthy,
         }
     }
@@ -286,12 +293,30 @@ impl PostgresDb {
                 "the PostgreSQL connection was lost during a transaction".into(),
             ));
         }
-        self.client = (self.reconnect)()?;
-        self.statements.clear();
-        self.lost = false;
-        self.set_healthy(true);
-        tracing::warn!("Reconnected to PostgreSQL after the connection was lost");
-        Ok(())
+        // Throttle: within the cooldown of a failed attempt, fail fast instead of blocking this
+        // job (and every one queued behind it) on another connect.
+        if let Some(at) = self.last_failed_reconnect
+            && at.elapsed() < RECONNECT_COOLDOWN
+        {
+            return Err(StoreError::Internal(
+                "the PostgreSQL connection is down; reconnect is cooling down".into(),
+            ));
+        }
+        match (self.reconnect)() {
+            Ok(client) => {
+                self.client = client;
+                self.statements.clear();
+                self.lost = false;
+                self.last_failed_reconnect = None;
+                self.set_healthy(true);
+                tracing::warn!("Reconnected to PostgreSQL after the connection was lost");
+                Ok(())
+            }
+            Err(err) => {
+                self.last_failed_reconnect = Some(std::time::Instant::now());
+                Err(err)
+            }
+        }
     }
 
     /// `result`, noting a failure of the connection itself (closed, an I/O error, or the

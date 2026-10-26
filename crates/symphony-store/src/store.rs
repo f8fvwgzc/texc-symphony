@@ -129,18 +129,26 @@ impl Store {
         let open_label = label.clone();
         let healthy = Arc::new(AtomicBool::new(true));
         let db_healthy = Arc::clone(&healthy);
+        let reconnect_label = label.clone();
         Store::spawn(label, None, true, healthy, move || {
-            let connect = move || {
-                connect_postgres(&config).map_err(|reason| StoreError::Open {
-                    path: open_label.clone(),
+            // One throttled attempt per reconnect, so a backlog of jobs during an outage does not
+            // each sleep through a backoff; the backoff below is only for the first connect.
+            let reconnect_config = config.clone();
+            let reconnect = move || {
+                connect_postgres(&reconnect_config).map_err(|reason| StoreError::Open {
+                    path: reconnect_label.clone(),
                     reason,
                 })
             };
-            let mut client = connect()?;
+            let mut client =
+                connect_postgres_with_backoff(&config).map_err(|reason| StoreError::Open {
+                    path: open_label.clone(),
+                    reason,
+                })?;
             schema::migrate_postgres(&mut client)?;
             Ok(Box::new(PostgresDb::new(
                 client,
-                Box::new(connect),
+                Box::new(reconnect),
                 db_healthy,
             )))
         })
@@ -773,33 +781,36 @@ const POSTGRES_CONNECT_ATTEMPTS: u32 = 3;
 /// `sslmode=disable`, and a server-side `statement_timeout`/`lock_timeout` so a query the
 /// server itself wedges on returns instead of pinning the store thread.
 fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::Client, String> {
-    let tls = (config.get_ssl_mode() != postgres::config::SslMode::Disable)
-        .then(postgres_tls)
-        .transpose()
+    let mut client = match config.get_ssl_mode() {
+        postgres::config::SslMode::Disable => config.connect(postgres::NoTls),
+        _ => config.connect(postgres_tls().map_err(|err| err.to_string())?),
+    }
+    .map_err(|err| err.to_string())?;
+    // A statement that runs or waits for a lock past the network timeout is aborted, so no single
+    // query pins the store thread indefinitely.
+    let ms = POSTGRES_NETWORK_TIMEOUT.as_millis();
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout = {ms}; SET lock_timeout = {ms}"
+        ))
         .map_err(|err| err.to_string())?;
+    Ok(client)
+}
+
+/// Opens the first connection, retrying with a short backoff so a database that is briefly down
+/// at startup does not fail the whole process. Used only for the initial connect; a mid-run
+/// reconnect is a single throttled attempt (see [`db::PostgresDb`]).
+fn connect_postgres_with_backoff(
+    config: &postgres::Config,
+) -> std::result::Result<postgres::Client, String> {
     let mut last = String::new();
     for attempt in 0..POSTGRES_CONNECT_ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
         }
-        let connected = match &tls {
-            Some(tls) => config.connect(tls.clone()),
-            None => config.connect(postgres::NoTls),
-        };
-        match connected {
-            Ok(mut client) => {
-                let ms = POSTGRES_NETWORK_TIMEOUT.as_millis();
-                // A statement that runs or waits for a lock past the network timeout is aborted,
-                // so no single query pins the store thread indefinitely.
-                if let Err(err) = client.batch_execute(&format!(
-                    "SET statement_timeout = {ms}; SET lock_timeout = {ms}"
-                )) {
-                    last = err.to_string();
-                    continue;
-                }
-                return Ok(client);
-            }
-            Err(err) => last = err.to_string(),
+        match connect_postgres(config) {
+            Ok(client) => return Ok(client),
+            Err(err) => last = err,
         }
     }
     Err(last)

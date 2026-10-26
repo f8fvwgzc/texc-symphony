@@ -163,14 +163,17 @@ async fn a_jailed_agent_is_confined_to_the_proxy_and_its_workspace() {
     let proxy = proxy_allowing(allowed).await;
     let workspace = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(workspace.path()).unwrap();
-    // A host secret outside the workspace and system dirs, and one of Symphony's own keys masked.
+    // A host secret outside the workspace and system dirs.
     let outside = tempfile::tempdir().unwrap();
     let host_secret = std::fs::canonicalize(outside.path())
         .unwrap()
         .join("host-secret");
     std::fs::write(&host_secret, "other tenant's data").unwrap();
-    let key = outside.path().join("private-key.pem");
+    // The masked key sits INSIDE the workspace (which the jail binds read-write), so the mask —
+    // not a tmpfs hiding it — is what makes it unreadable. An unmasked sibling stays readable.
+    let key = workspace.join("private-key.pem");
     std::fs::write(&key, "app-private-key").unwrap();
+    std::fs::write(workspace.join("plain.txt"), "readable").unwrap();
     // A process on the host, to prove its /proc entry is not visible in the jail.
     let mut sentinel = Command::new("sleep").arg("30").spawn().unwrap();
     let sentinel_pid = sentinel.id();
@@ -216,12 +219,16 @@ async fn a_jailed_agent_is_confined_to_the_proxy_and_its_workspace() {
         "{out:?}"
     );
 
-    // The masked key reads as empty (its /dev/null bind) or is refused, never its contents.
-    let out = run(format!("cat {} 2>/dev/null", key.display())).await;
+    // The masked key is in the workspace yet reads empty (its /dev/null bind), while its
+    // unmasked sibling in the same workspace is readable — so the mask, not absence, empties it.
+    let out = run(format!("cat {}", key.display())).await;
+    assert!(out.status.success(), "{out:?}");
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("app-private-key"),
-        "{out:?}"
+        out.stdout.is_empty(),
+        "the masked key is not empty: {out:?}"
     );
+    let out = run(format!("cat {}", workspace.join("plain.txt").display())).await;
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "readable", "{out:?}");
 
     // Host /proc is not visible: the sentinel's entry is absent in the jail's own PID namespace.
     let out = run(format!(

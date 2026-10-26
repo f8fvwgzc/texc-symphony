@@ -470,10 +470,11 @@ What each part does:
   and redacted from the run's events, result and error. The operator's tokens (`GITHUB_TOKEN`,
   ...) are never given to task agents. A failure is `task_credentials_failed: ...`. The App key
   itself mints tokens for every repository the App is installed on, so no agent may read it:
-  with `network.mode: deny` it reads as empty wherever agents run (the `api` shell's sandbox, the
-  network jail); with `network.mode: allow` the task needs `task_uids` and the key file must not
+  `github_app` requires `task_uids` (refused at config load otherwise), and the key file must not
   be readable by group or others (mode `0400` or `0600`; a Kubernetes Secret volume needs
-  `defaultMode: 0400`), else the run fails with `isolation_unavailable`.
+  `defaultMode: 0400`), else the run fails with `isolation_unavailable`. Under `network.mode:
+  deny` the key is additionally masked (reads as empty) wherever agents run — the `api` shell's
+  sandbox and the network jail.
 - **Default-deny network** (`network.mode: deny`). Symphony starts an egress proxy for the run
   that reaches only the repository's git host on port 443 (https; never 22), the LLM gateway
   (`LLM_GATEWAY_URL`) when one is configured, and `network.allow`; everything else gets `403`.

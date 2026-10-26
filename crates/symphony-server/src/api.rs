@@ -111,8 +111,9 @@ pub(crate) async fn health(State(app): State<AppState>) -> Json<Health> {
         StoreMode::Sqlite
     };
     Json(Health {
-        // A lost database connection (PostgreSQL) shows as degraded, so a readiness probe can
-        // restart or drain the replica instead of it looking healthy while it cannot dispatch.
+        // A lost database connection (PostgreSQL) shows as `degraded` in the body (the status
+        // code stays 200, so this one endpoint serves both the liveness and readiness probes);
+        // operators can alert on it rather than it always reading `ok` while it cannot dispatch.
         status: if app.store.is_degraded() {
             "degraded"
         } else {

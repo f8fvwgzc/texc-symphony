@@ -11,10 +11,11 @@
 //!
 //! Paths are relative to the workspace. Absolute paths must lie inside it, `..` is refused, and
 //! the nearest existing ancestor is canonicalized so symlinks cannot lead outside. On Linux the
-//! open and any parent creation are then resolved entirely beneath the workspace directory
-//! (`openat2`, refusing every symlink), so a component swapped for a symlink by a racing task
-//! process cannot redirect them to a host path such as `/etc` (which, running as root under task
-//! isolation, would otherwise be an escalation).
+//! open and any parent creation are then resolved beneath the workspace directory
+//! (`openat2(RESOLVE_IN_ROOT)`), which treats the workspace as `/`, so `..` and symlinks stay
+//! inside it: a component swapped for a symlink to `/etc` by a racing task process lands in the
+//! workspace (which, running as root under task isolation, would otherwise be an escalation),
+//! while in-workspace symlinks keep resolving as on other platforms.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -426,11 +427,12 @@ impl Toolbox {
         Ok(file)
     }
 
-    /// Opens `path` (under the workspace) resolved entirely beneath the workspace directory,
-    /// refusing every symlink and every escape, and (for a write) creating any missing parent
-    /// directories the same way; new files and directories are handed to the task user. Kernel
-    /// enforcement (`openat2`), so a component swapped to a symlink mid-operation cannot redirect
-    /// it to a host path such as `/etc`.
+    /// Opens `path` resolved beneath the workspace with `openat2(RESOLVE_IN_ROOT)` (the workspace
+    /// is the resolution root, so `..` and symlinks stay inside it) and, for a write, creates any
+    /// missing parent directories one component at a time without following a symlink; new files
+    /// and directories are handed to the task user. A component swapped to a symlink
+    /// mid-operation cannot redirect it to a host path such as `/etc`, while in-workspace symlinks
+    /// keep working.
     #[cfg(target_os = "linux")]
     fn open_beneath(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
         use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
@@ -442,18 +444,21 @@ impl Toolbox {
         if write && let Some(parent) = rel.parent() {
             self.create_dirs_beneath(raw, &workspace, parent)?;
         }
-        let mut flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        let mut flags = OFlags::CLOEXEC | OFlags::NONBLOCK;
         flags |= if write {
             OFlags::RDWR | OFlags::CREATE
         } else {
             OFlags::RDONLY
         };
+        // `IN_ROOT` resolves the whole path with the workspace as `/`, so symlinks and `..` stay
+        // inside it (an escape, or a component swapped to a symlink to `/etc`, lands in the
+        // workspace) while in-workspace symlinks keep working, matching the non-Linux contract.
         let fd = openat2(
             &workspace,
             rel,
             flags,
             Mode::from_bits_truncate(0o600),
-            ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS,
+            ResolveFlags::IN_ROOT,
         )
         .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
         let file = File::from(fd);

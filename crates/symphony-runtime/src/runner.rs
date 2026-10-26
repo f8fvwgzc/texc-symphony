@@ -21,9 +21,9 @@
 // Modified 2026-10-25: runs every backend through symphony_agents::AgentBackend; task runs (Part B).
 // Modified 2026-10-26: task isolation (uid, repository token, egress proxy).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -39,7 +39,7 @@ use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
 use crate::agents;
-use crate::isolation::{self, TaskIsolation, TaskUidLease, TaskUidPool};
+use crate::isolation::{self, LeasedUids, TaskIsolation, TaskUidLease, TaskUidPool};
 use crate::process::{EnvPolicy, run_captured};
 use crate::ssh::{SshConfig, SshLauncher};
 use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
@@ -161,11 +161,10 @@ pub struct AgentRunner {
     options: RunnerOptions,
     /// One uid pool per `isolation.task_uids` range, shared across runs so leases do not
     /// collide. Keyed by `(first, count)`, so a reloaded range gets its own pool.
-    uid_pools: UidPools,
+    /// Task uids leased by live runs, shared across every range so overlapping ranges (a
+    /// reloaded `count`) never hand out the same uid.
+    leased_uids: LeasedUids,
 }
-
-/// The shared [`TaskUidPool`] registry, keyed by `(first, count)`.
-type UidPools = Arc<Mutex<HashMap<(u32, u32), Arc<TaskUidPool>>>>;
 
 impl std::fmt::Debug for AgentRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,19 +198,13 @@ impl AgentRunner {
             ssh,
             fetcher,
             options: RunnerOptions::default(),
-            uid_pools: Arc::new(Mutex::new(HashMap::new())),
+            leased_uids: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// The shared uid pool for `uids`'s range (created once per range).
+    /// A uid pool for `uids`'s range sharing the runner's one leased-uid set.
     fn uid_pool(&self, uids: symphony_core::config::TaskUids) -> Arc<TaskUidPool> {
-        Arc::clone(
-            self.uid_pools
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry((uids.first, uids.count))
-                .or_insert_with(|| TaskUidPool::new(uids)),
-        )
+        TaskUidPool::new(uids, Arc::clone(&self.leased_uids))
     }
 
     /// Replaces the between-turns issue fetcher (`:issue_state_fetcher`).
