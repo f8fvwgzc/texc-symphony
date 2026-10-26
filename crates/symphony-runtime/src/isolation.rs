@@ -557,12 +557,21 @@ mod tests {
         // Our `/proc/self` is owner-readable now.
         assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), me);
         set_dumpable_behavior(DumpableBehavior::NotDumpable).unwrap();
-        // Now `/proc/self` is owned by root, so the old dir-owner scan would read 0, not `me`.
-        assert_eq!(std::fs::metadata("/proc/self").unwrap().uid(), 0);
-        let seen = uids_in_use(me, 1);
+        // Now `/proc/self` is owned by root, so the old dir-owner read would give 0, not `me`.
+        let dir_owner = std::fs::metadata("/proc/self").unwrap().uid();
+        // `proc_uid` reads `/proc/<pid>/status`, so it still returns the real uid.
+        let from_status = proc_uid("self");
         // Restore before asserting, so a failure does not leave the binary non-dumpable.
         set_dumpable_behavior(DumpableBehavior::Dumpable).unwrap();
-        assert!(seen.contains(&me), "the non-dumpable process was missed");
+        assert_eq!(
+            dir_owner, 0,
+            "non-dumpable should make /proc/self root-owned"
+        );
+        assert_eq!(
+            from_status,
+            Some(me),
+            "proc_uid must read the real uid from status, not the root-owned dir"
+        );
     }
 
     #[test]

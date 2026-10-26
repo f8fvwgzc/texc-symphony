@@ -444,8 +444,10 @@ What each part does:
 
 - **Own uid per task** (`task_uids`). Each run leases a free uid from the range: no two live
   runs share one, and a uid with a live process (including one left by an earlier task, or one
-  another replica on the same host is using) is skipped; a task is refused when the range is
-  exhausted rather than sharing a uid. Before the clone the workspace is made `0700` and handed
+  another replica on the same host already has a process for) is skipped; a task is refused when
+  the range is exhausted rather than sharing a uid. Across replicas on one host the `/proc` scan
+  sees a uid only once the other replica has spawned a process, so give each replica its own uid
+  range (or one host per replica) to rule out the brief overlap window. Before the clone the workspace is made `0700` and handed
   to the task uid; the clone, Codex, Claude Code and the `api` backend's shell run as it, and
   the `api` file tools (which run inside Symphony) hand the files and directories they write to
   it. When the run ends, every process still running as the uid is killed before the uid is
