@@ -152,7 +152,7 @@ pub fn kill_uid_processes(uid: u32) -> usize {
         if pid <= 1 {
             continue;
         }
-        if entry.metadata().map(|meta| meta.uid()) == Ok(uid)
+        if entry.metadata().is_ok_and(|meta| meta.uid() == uid)
             && let Some(pid) = rustix::process::Pid::from_raw(pid)
         {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);

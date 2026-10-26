@@ -494,9 +494,11 @@ impl Toolbox {
     ) -> Result<(), String> {
         use rustix::fs::{Mode, OFlags, openat};
         use rustix::io::Errno;
+        use std::os::fd::AsFd;
 
         let mut dir = workspace
-            .try_clone()
+            .as_fd()
+            .try_clone_to_owned()
             .map_err(|err| format!("cannot open the workspace for `{raw}`: {err}"))?;
         for component in rel.components() {
             let Component::Normal(name) = component else {
