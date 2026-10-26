@@ -18,9 +18,11 @@
 //!   bubblewrap sandbox, whose network namespace is empty: it listens on `127.0.0.1:P` there,
 //!   relays every connection to the proxy's socket, and runs `CMD` with the proxy variables.
 //!
-//! * [`network_jail`] is the launch prefix for Codex and Claude Code: bubblewrap with the host's
-//!   file system but an empty network namespace, and the shim inside, so the agent and every
-//!   command it runs have no route out but the proxy. It needs Linux and unprivileged user
+//! * [`network_jail`] is the launch prefix for Codex and Claude Code: bubblewrap with the api
+//!   sandbox's filesystem shape (system directories read-only, the workspace writable, a private
+//!   `/tmp`, its own `/proc`, no host sockets) and an empty network namespace with the shim
+//!   inside, so the agent and every command it runs have no route out but the proxy and cannot
+//!   read other tenants' files, processes or sockets. It needs Linux and unprivileged user
 //!   namespaces; without them a task with a default-deny network does not start.
 //!
 //! Enforcement: the sandboxed api shell and the jailed Codex and Claude Code have no other route
@@ -42,18 +44,27 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirec
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-/// The launch prefix that confines a whole agent process (Codex, Claude Code) of a task to its
-/// egress proxy: `bwrap --dev-bind / / --unshare-net ... -- <shim> egress-shim --socket S
-/// --port 3128 --`. The agent keeps the host's file system and tools; only its network is
-/// replaced by the shim's relay to the proxy, and the `masked` secret files (Symphony's own keys,
-/// such as the GitHub App key) read as empty. `Err` when this cannot be enforced (not Linux, no
-/// `bwrap`, a proxy without a socket, no shim): the agent must not start then.
+/// The launch prefix that confines a whole agent process (Codex, Claude Code) of a task: an
+/// empty network namespace whose only route out is the task's egress proxy (through the
+/// `symphony egress-shim` the prefix runs), and the api sandbox's filesystem shape — only the
+/// system directories ([`SYSTEM_DIRS`], [`ETC_ENTRIES`]) are bound read-only, the workspace
+/// (which holds the task's `.home`) is writable, `/tmp` is a private tmpfs, `/proc` is the new
+/// PID namespace's own, and `/run`, `/var`, other workspaces, the run-history database and
+/// host sockets are not there. The `masked` secret files (the GitHub App key) read as empty.
+/// The agent's environment is inherited (not cleared): `HOME`, the task token. `Err` when this
+/// cannot be enforced (not Linux, no `bwrap`, a proxy without a socket, no shim): the agent
+/// must not start then.
+///
+/// [`SYSTEM_DIRS`]: crate::api::sandbox::SYSTEM_DIRS
+/// [`ETC_ENTRIES`]: crate::api::sandbox::ETC_ENTRIES
 pub fn network_jail(
     route: &EgressRoute,
     shim: Option<&Path>,
     cwd: &Path,
     masked: &[PathBuf],
 ) -> Result<Vec<std::ffi::OsString>, String> {
+    use crate::api::sandbox::{ETC_ENTRIES, SYSTEM_DIRS};
+
     const NEEDS: &str = "isolation.network.mode: deny confines Codex and Claude Code with \
                          bubblewrap (Linux, with unprivileged user namespaces)";
     if !cfg!(target_os = "linux") {
@@ -68,8 +79,24 @@ pub fn network_jail(
     let shim =
         shim.ok_or_else(|| "the `symphony` executable (the egress shim) is unknown".to_owned())?;
     let mut argv: Vec<std::ffi::OsString> = vec![bwrap.into()];
-    argv.extend(["--dev-bind", "/", "/", "--unshare-net", "--die-with-parent"].map(Into::into));
-    // Over the file's real path, so every name of it (a Kubernetes Secret's symlinks) is masked.
+    for dir in SYSTEM_DIRS.iter().chain(ETC_ENTRIES.iter()) {
+        argv.extend(["--ro-bind-try", dir, dir].map(Into::into));
+    }
+    argv.extend(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"].map(Into::into));
+    // Every namespace new (user, PID with its own /proc, IPC, UTS, cgroup, network: no route
+    // out but the shim) and a new session; everything dies with the command. The environment
+    // is inherited, unlike the api shell, so HOME and the task token reach the agent.
+    argv.extend(["--unshare-all", "--new-session", "--die-with-parent"].map(Into::into));
+    // The workspace (and its `.home`) is the only writable host path.
+    argv.extend(["--bind".into(), cwd.into(), cwd.into()]);
+    // The proxy's socket directory, bound after `--tmpfs /tmp` (it hides a directory under /tmp),
+    // and the shim binary itself (it may live outside the system directories).
+    if let Some(dir) = socket.parent() {
+        argv.extend(["--bind".into(), dir.into(), dir.into()]);
+    }
+    argv.extend(["--ro-bind".into(), shim.into(), shim.into()]);
+    // Symphony's own secret files (the App key) read as empty, over their real path so every
+    // name of one (a Kubernetes Secret's symlinks) is masked.
     for file in masked {
         if let Ok(real) = std::fs::canonicalize(file)
             && real.is_file()
@@ -635,15 +662,46 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            argv[1..].join(" "),
-            format!(
-                "--dev-bind / / --unshare-net --die-with-parent --ro-bind /dev/null {} \
-                 --chdir /w/.tasks/7 -- /usr/local/bin/symphony egress-shim --socket \
-                 /tmp/symphony-egress-1/proxy.sock --port 3128 --",
-                real_key.display()
+        let joined = argv[1..].join(" ");
+        // Only system directories are bound, not the whole host root.
+        assert!(!joined.contains("--dev-bind / /"), "{joined}");
+        assert!(joined.contains("--ro-bind-try /usr /usr"), "{joined}");
+        assert!(
+            joined.contains("--ro-bind-try /etc/ssl /etc/ssl"),
+            "{joined}"
+        );
+        // Own /proc and PID namespace, a private /tmp, no shared network.
+        assert!(
+            joined.contains("--proc /proc --tmpfs /tmp --unshare-all --new-session"),
+            "{joined}"
+        );
+        assert!(!joined.contains("--share-net"), "{joined}");
+        // The workspace is writable and the proxy socket directory is bound in.
+        assert!(
+            joined.contains("--bind /w/.tasks/7 /w/.tasks/7"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("--bind /tmp/symphony-egress-1 /tmp/symphony-egress-1"),
+            "{joined}"
+        );
+        // The shim binary is reachable, the existing key masked at its real path, a missing one
+        // skipped, and the agent runs under the shim with no network of its own.
+        assert!(
+            joined.contains("--ro-bind /usr/local/bin/symphony /usr/local/bin/symphony"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(&format!("--ro-bind /dev/null {}", real_key.display())),
+            "{joined}"
+        );
+        assert!(!joined.contains("/nonexistent/key.pem"), "{joined}");
+        assert!(
+            joined.ends_with(
+                "--chdir /w/.tasks/7 -- /usr/local/bin/symphony egress-shim --socket \
+                 /tmp/symphony-egress-1/proxy.sock --port 3128 --"
             ),
-            "the existing secret file is masked at its real path, a missing one skipped"
+            "{joined}"
         );
         // Without a socket or a shim there is nothing to relay through: refused, not unconfined.
         let no_socket = EgressRoute {

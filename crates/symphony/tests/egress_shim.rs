@@ -144,10 +144,12 @@ async fn a_bubblewrap_shell_reaches_only_the_proxy() {
     assert!(!out.status.success(), "no route around the proxy: {out:?}");
 }
 
-/// What Codex and Claude Code run under when a task's network is default-deny: no file sandbox,
-/// but no route out except the proxy (not with `--noproxy`, not straight to the address).
+/// The confinement Codex and Claude Code run under when a task's network is default-deny: no
+/// route out except the proxy (not `--noproxy`, not the address directly), and the api sandbox's
+/// filesystem shape — the workspace is writable, but host files outside it, host `/proc` and
+/// masked secrets are not reachable.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_jailed_agent_process_reaches_only_the_proxy() {
+async fn a_jailed_agent_is_confined_to_the_proxy_and_its_workspace() {
     let (Some(bwrap), Some(_)) = (find_executable("bwrap"), find_executable("curl")) else {
         eprintln!("skipped: bwrap or curl is not installed");
         return;
@@ -161,17 +163,23 @@ async fn a_jailed_agent_process_reaches_only_the_proxy() {
     let proxy = proxy_allowing(allowed).await;
     let workspace = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(workspace.path()).unwrap();
-    // One of Symphony's own keys (the GitHub App key, ...), reached through a symlink.
-    let secrets = tempfile::tempdir().unwrap();
-    let key = secrets.path().join("private-key.pem");
+    // A host secret outside the workspace and system dirs, and one of Symphony's own keys masked.
+    let outside = tempfile::tempdir().unwrap();
+    let host_secret = std::fs::canonicalize(outside.path())
+        .unwrap()
+        .join("host-secret");
+    std::fs::write(&host_secret, "other tenant's data").unwrap();
+    let key = outside.path().join("private-key.pem");
     std::fs::write(&key, "app-private-key").unwrap();
-    let link = secrets.path().join("key-link.pem");
-    std::os::unix::fs::symlink(&key, &link).unwrap();
+    // A process on the host, to prove its /proc entry is not visible in the jail.
+    let mut sentinel = Command::new("sleep").arg("30").spawn().unwrap();
+    let sentinel_pid = sentinel.id();
+
     let jail = symphony_agents::egress::network_jail(
         &proxy.route(),
         Some(Path::new(SYMPHONY)),
         &workspace,
-        std::slice::from_ref(&link),
+        std::slice::from_ref(&key),
     )
     .unwrap();
     let run = |script: String| {
@@ -190,16 +198,42 @@ async fn a_jailed_agent_process_reaches_only_the_proxy() {
         !out.status.success(),
         "no route around the proxy, even to an allowed host: {out:?}"
     );
-    // Only the network is confined: the agent works in its directory on the host's files.
-    let out = run(format!("pwd; test -x {SYMPHONY} && touch made-in-the-jail")).await;
+
+    // The workspace is writable, and the chdir is the workspace.
+    let out = run("pwd; touch made-in-the-jail".to_owned()).await;
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
         workspace.display().to_string()
     );
     assert!(workspace.join("made-in-the-jail").exists());
-    // The masked key reads as empty under every name.
-    let out = run(format!("cat {} {}", key.display(), link.display())).await;
-    assert!(out.status.success(), "{out:?}");
-    assert!(out.stdout.is_empty(), "{out:?}");
+
+    // A host file outside the workspace is not even present.
+    let out = run(format!("cat {}", host_secret.display())).await;
+    assert!(!out.status.success(), "host file reachable: {out:?}");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("other tenant"),
+        "{out:?}"
+    );
+
+    // The masked key reads as empty (its /dev/null bind) or is refused, never its contents.
+    let out = run(format!("cat {} 2>/dev/null", key.display())).await;
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("app-private-key"),
+        "{out:?}"
+    );
+
+    // Host /proc is not visible: the sentinel's entry is absent in the jail's own PID namespace.
+    let out = run(format!(
+        "cat /proc/{sentinel_pid}/comm 2>/dev/null; echo done"
+    ))
+    .await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "done",
+        "{out:?}"
+    );
+
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
 }

@@ -156,6 +156,10 @@ pub fn run(invocation: Invocation) -> ExitCode {
         Ok(format) => format,
         Err(message) => return fail(&message),
     };
+    // With task isolation, foreign uids run: keep Symphony's own files off-limits to them.
+    if workflow.settings().isolation.is_some() {
+        crate::hardening::restrict_new_files();
+    }
     let stdout_is_tty = std::io::stdout().is_terminal();
     let dashboard_enabled = workflow.settings().observability.dashboard_enabled && stdout_is_tty;
     let console = (!dashboard_enabled).then_some(console_format);
