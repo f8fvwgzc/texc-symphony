@@ -188,8 +188,11 @@ WORKDIR /srv/symphony
 VOLUME ["/data", "/workspaces"]
 EXPOSE 4000
 
+# Docker runs the probe with the container's whole environment (every secret) as uid 10001, and
+# its processes are dumpable: `exec env -i` hands wget an empty environment, so only the brief
+# sh/env start-up holds it, not the request.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -q -T 4 -O /dev/null "http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health" || exit 1
+  CMD ["sh", "-c", "exec env -i wget -q -T 4 -O /dev/null \"http://127.0.0.1:${SYMPHONY_PORT}/api/v1/health\""]
 
 # `symphony init` is PID 1: it forwards signals to symphony and reaps orphaned hook and agent
 # processes like tini did, and it keeps its environment unreadable to them (tini's was readable

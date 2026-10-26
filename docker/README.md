@@ -250,7 +250,8 @@ docker buildx build -f docker/Dockerfile \
 `docker/test.sh symphony:dev` tests a built image as it ships (CI runs it before every push). It
 starts the image with a marker API token and, as the image's user outside any sandbox, checks
 that PID 1 is `symphony init`, that neither its environment nor Symphony's is readable while an
-ordinary process's is, that orphans are reaped, and that `docker stop` stops Symphony with exit 0.
+ordinary process's is, that no other process (the health probe included) has the token in a
+readable environment, that orphans are reaped, and that `docker stop` stops Symphony with exit 0.
 
 Build arguments:
 
@@ -275,7 +276,8 @@ How the build is laid out:
 3. `codex-npm`: `npm install --os=linux --cpu=<target>` of `@openai/codex`, on the build
    platform; only the target-platform `node` binary is copied from the target image.
 4. `runtime`: `debian:bookworm-slim` with the packages above, non-root user, health check
-   (`wget` against `/api/v1/health`).
+   (`wget` against `/api/v1/health`, started with an empty environment: Docker gives probes the
+   container's secrets). A healthcheck of your own should also clear it (`env -i`).
 
 Rebuilds after a source change only recompile the changed crates (the cache mounts keep
 `target/`). `docker buildx prune --filter type=exec.cachemount` clears those caches.

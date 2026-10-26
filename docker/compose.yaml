@@ -53,7 +53,8 @@ services:
       # COMPOSE_FILE=compose.yaml:compose.codex-auth.yaml (see compose.codex-auth.yaml).
       # - ${CODEX_AUTH_JSON:-~/.codex/auth.json}:/home/symphony/.codex/auth.json:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:4000/api/v1/health"]
+      # `env -i`: the probe would otherwise carry every secret in a readable /proc/<pid>/environ.
+      test: ["CMD", "env", "-i", "wget", "-q", "-T", "4", "-O", "/dev/null", "http://127.0.0.1:4000/api/v1/health"]
       interval: 30s
       timeout: 5s
       start_period: 20s
