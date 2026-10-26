@@ -25,7 +25,7 @@ url = { workspace = true }
 # `O_NOFOLLOW` / `O_NONBLOCK` for the file tools.
 libc = { workspace = true }
 # Safe `killpg` wrapper (the workspace forbids `unsafe`); same version as symphony-codex.
-rustix = { version = "1.1.5", features = ["process"] }
+rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,7 +10,11 @@
 //! | `tracker` | the tracker tools' own arguments | as configured (scoped) |
 //!
 //! Paths are relative to the workspace. Absolute paths must lie inside it, `..` is refused, and
-//! the nearest existing ancestor is canonicalized so symlinks cannot lead outside.
+//! the nearest existing ancestor is canonicalized so symlinks cannot lead outside. On Linux the
+//! open and any parent creation are then resolved entirely beneath the workspace directory
+//! (`openat2`, refusing every symlink), so a component swapped for a symlink by a racing task
+//! process cannot redirect them to a host path such as `/etc` (which, running as root under task
+//! isolation, would otherwise be an escalation).
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -348,11 +352,27 @@ impl Toolbox {
         }
     }
 
-    /// Opens an existing or new regular file inside the workspace without following a symlink at
-    /// the last component and without blocking (FIFOs, devices and directories are refused),
-    /// then checks that the opened file is the one the canonical path names inside the
-    /// workspace, so a path swapped between the checks cannot redirect the access.
+    /// Opens an existing or new regular file inside the workspace (FIFOs, devices and directories
+    /// are refused). On Linux the whole path is resolved beneath the workspace with
+    /// `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)` so no symlink in any component — swapped
+    /// in by a racing task process or not — can redirect the open or its parent creation outside
+    /// the workspace (F5). Elsewhere it opens the canonical target with `O_NOFOLLOW` and rechecks
+    /// the opened file's identity.
     fn open_regular(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        #[cfg(target_os = "linux")]
+        return self.open_beneath(raw, path, write);
+        #[cfg(not(target_os = "linux"))]
+        self.open_regular_rechecked(raw, path, write)
+    }
+
+    /// The non-Linux open: canonicalize, `O_NOFOLLOW`, dev/ino recheck, and create parents for a
+    /// write (task isolation is Linux-only, so no ownership handoff here).
+    #[cfg(not(target_os = "linux"))]
+    fn open_regular_rechecked(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        if write && let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
+        }
         // The canonical target (symlinks inside the workspace are fine), or for a new file the
         // canonical parent plus its name.
         let target = match std::fs::canonicalize(path) {
@@ -406,6 +426,115 @@ impl Toolbox {
         Ok(file)
     }
 
+    /// Opens `path` (under the workspace) resolved entirely beneath the workspace directory,
+    /// refusing every symlink and every escape, and (for a write) creating any missing parent
+    /// directories the same way; new files and directories are handed to the task user. Kernel
+    /// enforcement (`openat2`), so a component swapped to a symlink mid-operation cannot redirect
+    /// it to a host path such as `/etc`.
+    #[cfg(target_os = "linux")]
+    fn open_beneath(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+
+        let rel = path
+            .strip_prefix(&self.workspace)
+            .map_err(|_| format!("`{raw}` resolves outside the workspace"))?;
+        let workspace = self.open_workspace_dir(raw)?;
+        if write && let Some(parent) = rel.parent() {
+            self.create_dirs_beneath(raw, &workspace, parent)?;
+        }
+        let mut flags = OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        flags |= if write {
+            OFlags::RDWR | OFlags::CREATE
+        } else {
+            OFlags::RDONLY
+        };
+        let fd = openat2(
+            &workspace,
+            rel,
+            flags,
+            Mode::from_bits_truncate(0o600),
+            ResolveFlags::IN_ROOT | ResolveFlags::NO_SYMLINKS,
+        )
+        .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
+        let file = File::from(fd);
+        let meta = file
+            .metadata()
+            .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
+        if !meta.is_file() {
+            return Err(format!("`{raw}` is not a regular file"));
+        }
+        if write && let Some((uid, gid)) = self.shell.run_as {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+                .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
+        }
+        Ok(file)
+    }
+
+    /// The workspace opened as a directory, the root for [`Self::open_beneath`]'s resolution.
+    #[cfg(target_os = "linux")]
+    fn open_workspace_dir(&self, raw: &str) -> Result<std::os::fd::OwnedFd, String> {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            &self.workspace,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| format!("cannot open the workspace for `{raw}`: {err}"))
+    }
+
+    /// Creates each missing directory of `rel` beneath `workspace`, one component at a time from
+    /// a verified directory fd, refusing a symlink at any step; new directories go to the task
+    /// user. `rel` is already known to be workspace-relative and free of `..`.
+    #[cfg(target_os = "linux")]
+    fn create_dirs_beneath(
+        &self,
+        raw: &str,
+        workspace: &std::os::fd::OwnedFd,
+        rel: &Path,
+    ) -> Result<(), String> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use rustix::io::Errno;
+
+        let mut dir = workspace
+            .try_clone()
+            .map_err(|err| format!("cannot open the workspace for `{raw}`: {err}"))?;
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let open_dir = |at: &std::os::fd::OwnedFd| {
+                openat(
+                    at,
+                    name,
+                    OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::RDONLY,
+                    Mode::empty(),
+                )
+            };
+            let next = match open_dir(&dir) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => {
+                    match rustix::fs::mkdirat(&dir, name, Mode::from_bits_truncate(0o700)) {
+                        Ok(()) | Err(Errno::EXIST) => {}
+                        Err(err) => {
+                            return Err(format!("cannot create the parent of `{raw}`: {err}"));
+                        }
+                    }
+                    let fd = open_dir(&dir)
+                        .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
+                    if let Some((uid, gid)) = self.shell.run_as {
+                        std::os::unix::fs::fchown(&fd, Some(uid), Some(gid)).map_err(|err| {
+                            format!("cannot hand the parent of `{raw}` to the task user: {err}")
+                        })?;
+                    }
+                    fd
+                }
+                Err(err) => return Err(format!("cannot create the parent of `{raw}`: {err}")),
+            };
+            dir = next;
+        }
+        Ok(())
+    }
+
     /// Reads at most [`MAX_FILE_BYTES`] of a regular file; `true` when it was longer.
     fn read_capped(&self, raw: &str, path: &Path) -> Result<(Vec<u8>, bool), String> {
         let file = self.open_regular(raw, path, false)?;
@@ -425,11 +554,8 @@ impl Toolbox {
         file.set_len(0)
             .and_then(|()| file.write_all(content.as_bytes()))
             .map_err(|err| format!("cannot write `{raw}`: {err}"))?;
-        #[cfg(unix)]
-        if let Some((uid, gid)) = self.shell.run_as {
-            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
-                .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
-        }
+        // On Linux `open_beneath` already handed the file to the task user; elsewhere task
+        // isolation does not apply, so nothing to do.
         Ok(())
     }
 
@@ -479,21 +605,8 @@ impl Toolbox {
             return Err(format!("`{raw}` is a directory"));
         }
         let existed = path.exists();
-        if let Some(parent) = path.parent() {
-            let mut missing: Vec<&Path> = parent
-                .ancestors()
-                .take_while(|dir| dir.symlink_metadata().is_err())
-                .collect();
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
-            missing.reverse();
-            for dir in missing {
-                self.own(dir)
-                    .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
-            }
-        }
-        // The parent now exists; check again so a symlinked parent cannot redirect the write.
-        let path = self.resolve(raw)?;
+        // `write_contents` opens the file (creating any missing parents) resolved beneath the
+        // workspace, so a symlinked component cannot redirect the write or the ownership handoff.
         self.write_contents(raw, &path, content)?;
         let kind = if existed { "update" } else { "add" };
         Ok((
@@ -787,6 +900,35 @@ mod tests {
                 run_as: None,
             },
         )
+    }
+
+    /// A symlinked path component, swapped in by a racing task process, cannot redirect a write
+    /// (or its parent creation) outside the workspace: `open_beneath` resolves the whole path
+    /// beneath the workspace and refuses every symlink, so nothing lands on a host path (F5).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_component_cannot_redirect_a_write_out_of_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(dir.path()).unwrap();
+        let tools = toolbox(&ws, &["write_file"]);
+        // `escape` points at a directory outside the workspace, as a swapped component would.
+        std::os::unix::fs::symlink(outside.path(), ws.join("escape")).unwrap();
+        // open_beneath is given a path whose first component is that symlink.
+        let target = ws.join("escape/pwned");
+        let err = tools
+            .open_beneath("escape/pwned", &target, true)
+            .unwrap_err();
+        assert!(err.contains("escape/pwned"), "{err}");
+        assert!(
+            !outside.path().join("pwned").exists(),
+            "a file was created outside the workspace"
+        );
+        // A genuine new path beneath the workspace is created and stays inside.
+        tools
+            .open_beneath("a/b/c.txt", &ws.join("a/b/c.txt"), true)
+            .unwrap();
+        assert!(ws.join("a/b/c.txt").is_file());
     }
 
     #[test]
