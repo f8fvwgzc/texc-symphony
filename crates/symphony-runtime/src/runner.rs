@@ -21,8 +21,9 @@
 // Modified 2026-10-25: runs every backend through symphony_agents::AgentBackend; task runs (Part B).
 // Modified 2026-10-26: task isolation (uid, repository token, egress proxy).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
 use crate::agents;
-use crate::isolation::{self, TaskIsolation};
+use crate::isolation::{self, TaskIsolation, TaskUidLease, TaskUidPool};
 use crate::process::{EnvPolicy, run_captured};
 use crate::ssh::{SshConfig, SshLauncher};
 use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
@@ -158,7 +159,13 @@ pub struct AgentRunner {
     ssh: SshConfig,
     fetcher: Arc<dyn IssueFetcher>,
     options: RunnerOptions,
+    /// One uid pool per `isolation.task_uids` range, shared across runs so leases do not
+    /// collide. Keyed by `(first, count)`, so a reloaded range gets its own pool.
+    uid_pools: UidPools,
 }
+
+/// The shared [`TaskUidPool`] registry, keyed by `(first, count)`.
+type UidPools = Arc<Mutex<HashMap<(u32, u32), Arc<TaskUidPool>>>>;
 
 impl std::fmt::Debug for AgentRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,7 +199,19 @@ impl AgentRunner {
             ssh,
             fetcher,
             options: RunnerOptions::default(),
+            uid_pools: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The shared uid pool for `uids`'s range (created once per range).
+    fn uid_pool(&self, uids: symphony_core::config::TaskUids) -> Arc<TaskUidPool> {
+        Arc::clone(
+            self.uid_pools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry((uids.first, uids.count))
+                .or_insert_with(|| TaskUidPool::new(uids)),
+        )
     }
 
     /// Replaces the between-turns issue fetcher (`:issue_state_fetcher`).
@@ -260,6 +279,13 @@ impl AgentRunner {
             let repo = ctx.task.as_ref().and_then(|task| task.repo.as_deref());
             isolation::preflight(isolation_settings, worker_host, repo)?;
         }
+        // Lease the task its own uid (no two live runs share one, no uid with a leftover process
+        // is reused); held until the run ends and the uid's processes are killed.
+        let uid_lease: Option<TaskUidLease> = match isolation_settings.and_then(|i| i.task_uids) {
+            Some(uids) => Some(self.uid_pool(uids).lease()?),
+            None => None,
+        };
+        let run_as = uid_lease.as_ref().map(|lease| (lease.uid(), lease.uid()));
 
         let workspaces = self.workspace_manager(&settings);
         let issue_context = IssueContext::from(&ctx.issue);
@@ -278,6 +304,7 @@ impl AgentRunner {
                         isolation_settings,
                         task,
                         std::path::Path::new(&workspace),
+                        run_as,
                     )
                     .await?,
                 ),
@@ -329,6 +356,19 @@ impl AgentRunner {
                 .run_after_run_hook(&workspace, &issue_context, worker_host)
                 .await;
         }
+        // Kill any process the task left as its uid (a `setsid` daemon, anything under
+        // `sandbox: none`) before the lease frees the uid for the next task. The jail's own PID
+        // namespace already reaps the deny-mode agent; this covers allow mode.
+        if let Some(lease) = &uid_lease {
+            let killed = isolation::kill_uid_processes(lease.uid());
+            if killed > 0 {
+                tracing::info!(
+                    "Killed {killed} leftover process(es) of task uid {}",
+                    lease.uid()
+                );
+            }
+        }
+        drop(uid_lease);
         result
     }
 

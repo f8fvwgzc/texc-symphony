@@ -2,15 +2,16 @@
 //!
 //! | Guarantee | Enforcement |
 //! |---|---|
-//! | Own uid per task (`task_uids`) | the workspace (`0700`) and `<workspace>/.home` belong to the task uid; the clone, Codex, Claude Code and the api shell run as it; the api file tools hand what they write to it. Needs root: without it the run fails with `isolation_unavailable`. |
+//! | Own uid per task (`task_uids`) | each run leases a free uid from the range ([`TaskUidPool`]), so no two live runs share one and no uid with a leftover process is reused; the workspace (`0700`) and `<workspace>/.home` belong to it; the clone, Codex, Claude Code and the api shell run as it; the api file tools hand what they write to it. At the run's end the uid's leftover processes are killed ([`kill_uid_processes`]). Needs root: without it the run fails with `isolation_unavailable`. |
 //! | Short-lived repository credentials (`github_app`) | a GitHub App installation token scoped to the task's repository ([`crate::credentials`]), given to the clone and the agent through the environment only (never argv), redacted from the run's events and errors; the operator's own tokens stay stripped. The App key itself never reaches an agent: it is masked wherever agents run under a default-deny network, and otherwise `task_uids` with a key no task uid can read is required. |
 //! | Default-deny network (`network.mode: deny`) | an [`EgressProxy`] allowing only the repository's git host on 443, the LLM gateway and `network.allow`. No task process can bypass it: the api shell (bubblewrap: empty network namespace + shim; seatbelt: everything but the proxy port denied) and Codex, Claude Code and an unconfined shell in the network jail (`symphony_agents::egress::network_jail`); where the jail cannot run they do not start. |
 //!
 //! Every task process gets `HOME=<workspace>/.home`, so the operator's `~/.gitconfig`, `gh` login
 //! or agent logins are never visible to a task. SSH workers are not supported.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use symphony_agents::egress::{AllowList, EgressProxy};
 use symphony_codex::{EventSink, StartOptions};
@@ -26,6 +27,145 @@ pub const HOME_DIR: &str = ".home";
 
 fn unavailable(message: impl Into<String>) -> RunError {
     RunError::IsolationUnavailable(message.into())
+}
+
+/// Assigns each isolated task its own uid from `isolation.task_uids`. A task leases a free uid
+/// for the length of its run instead of the old `first + (id mod count)` mapping, so no two live
+/// runs share a uid and no uid with a live process is reused. "In use" is found by scanning
+/// `/proc`, so a uid held by another replica on the same host counts too.
+#[derive(Debug)]
+pub struct TaskUidPool {
+    first: u32,
+    count: u32,
+    leased: Mutex<HashSet<u32>>,
+}
+
+/// A uid held for one run; dropping it frees the uid for the next task.
+#[derive(Debug)]
+pub struct TaskUidLease {
+    uid: u32,
+    pool: Arc<TaskUidPool>,
+}
+
+impl TaskUidPool {
+    /// A pool over `uids`'s range.
+    pub fn new(uids: symphony_core::config::TaskUids) -> Arc<Self> {
+        Arc::new(Self {
+            first: uids.first,
+            count: uids.count,
+            leased: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Leases a uid no live run holds and no process currently runs as. `Err` when every uid in
+    /// the range is busy: the task is refused rather than sharing a uid with another tenant.
+    pub fn lease(self: &Arc<Self>) -> Result<TaskUidLease, RunError> {
+        let mut leased = self.leased.lock().unwrap_or_else(PoisonError::into_inner);
+        let busy = uids_in_use(self.first, self.count);
+        let end = self.first.saturating_add(self.count);
+        for uid in self.first..end {
+            if !leased.contains(&uid) && !busy.contains(&uid) {
+                leased.insert(uid);
+                return Ok(TaskUidLease {
+                    uid,
+                    pool: Arc::clone(self),
+                });
+            }
+        }
+        Err(unavailable(format!(
+            "no free task uid in {}..{end}: every uid in isolation.task_uids is busy (a live run \
+             or a leftover process)",
+            self.first
+        )))
+    }
+}
+
+impl TaskUidLease {
+    /// The leased uid (used as both uid and gid).
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+}
+
+impl Drop for TaskUidLease {
+    fn drop(&mut self) {
+        self.pool
+            .leased
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.uid);
+    }
+}
+
+/// The uids in `first..first+count` that a live process runs as (Linux; empty elsewhere).
+#[cfg(target_os = "linux")]
+fn uids_in_use(first: u32, count: u32) -> HashSet<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let end = first.saturating_add(count);
+    let mut set = HashSet::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return set;
+    };
+    for entry in entries.flatten() {
+        // Numeric entries are processes; `/proc/<pid>` is owned by the process's uid.
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            let uid = meta.uid();
+            if (first..end).contains(&uid) {
+                set.insert(uid);
+            }
+        }
+    }
+    set
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uids_in_use(_first: u32, _count: u32) -> HashSet<u32> {
+    HashSet::new()
+}
+
+/// SIGKILLs every process running as `uid` (not PID 1), so a task's leftovers (a `setsid`
+/// daemon outside the jail, anything under `sandbox: none`) cannot reach the next task that
+/// leases the uid. Needs root; returns how many it signalled. A no-op off Linux.
+#[cfg(target_os = "linux")]
+pub fn kill_uid_processes(uid: u32) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let mut killed = 0;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 {
+            continue;
+        }
+        if entry.metadata().map(|meta| meta.uid()) == Ok(uid)
+            && let Some(pid) = rustix::process::Pid::from_raw(pid)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// Non-Linux stub for [`kill_uid_processes`].
+#[cfg(not(target_os = "linux"))]
+pub fn kill_uid_processes(_uid: u32) -> usize {
+    0
 }
 
 /// Checks, before any work, that `isolation` can apply to a run on `worker_host`: no SSH worker,
@@ -165,11 +305,9 @@ impl TaskIsolation {
         isolation: &IsolationSettings,
         task: &TaskSpec,
         workspace: &Path,
+        run_as: Option<(u32, u32)>,
     ) -> Result<Self, RunError> {
-        let run_as = isolation.task_uids.map(|uids| {
-            let id = uids.for_task(task.id);
-            (id, id)
-        });
+        debug_assert_eq!(run_as.is_some(), isolation.task_uids.is_some());
         if let Some(owner) = run_as {
             let meta = std::fs::symlink_metadata(workspace).map_err(|err| {
                 unavailable(format!("cannot inspect {}: {err}", workspace.display()))
@@ -317,4 +455,61 @@ fn exclude_home(workspace: &Path) {
 fn libc_nofollow() -> i32 {
     // The flag is a small positive constant; the cast cannot wrap.
     rustix::fs::OFlags::NOFOLLOW.bits() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphony_core::config::TaskUids;
+
+    /// A range starting well above any real uid, so `uids_in_use` finds nothing in it.
+    fn free_range(count: u32) -> TaskUids {
+        TaskUids {
+            first: 4_000_000_000,
+            count,
+        }
+    }
+
+    #[test]
+    fn the_pool_leases_distinct_uids_refuses_when_exhausted_and_frees_on_drop() {
+        let pool = TaskUidPool::new(free_range(2));
+        let a = pool.lease().unwrap();
+        let b = pool.lease().unwrap();
+        assert_ne!(a.uid(), b.uid());
+        assert!((4_000_000_000..4_000_000_002).contains(&a.uid()));
+        // Both uids are leased: the next task is refused rather than sharing one.
+        let err = pool.lease().unwrap_err();
+        assert!(
+            matches!(&err, RunError::IsolationUnavailable(m) if m.contains("no free task uid"))
+        );
+        // Dropping a lease frees its uid for the next task.
+        let freed = a.uid();
+        drop(a);
+        let c = pool.lease().unwrap();
+        assert_eq!(c.uid(), freed);
+        drop((b, c));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uids_in_use_sees_a_live_process_and_skips_it() {
+        use std::os::unix::fs::MetadataExt;
+        let me = std::fs::metadata("/proc/self").unwrap().uid();
+        // A range around our own uid: this process is live, so our uid is "in use".
+        assert!(uids_in_use(me, 1).contains(&me));
+        // A pool over just our uid has nothing free (the only uid is busy).
+        let pool = TaskUidPool::new(TaskUids {
+            first: me,
+            count: 1,
+        });
+        assert!(pool.lease().is_err());
+        // A high range nobody uses is free.
+        assert!(uids_in_use(4_000_000_000, 1).is_empty());
+    }
+
+    #[test]
+    fn killing_an_unused_uid_signals_nothing() {
+        // A uid with no processes: the /proc scan runs and signals nothing (safe without root).
+        assert_eq!(kill_uid_processes(4_000_000_001), 0);
+    }
 }

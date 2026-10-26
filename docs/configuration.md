@@ -431,7 +431,7 @@ isolation:
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
 | `isolation.task_uids.first` | integer | none | `> 0`. First uid (and gid) of the task range. | new runs |
-| `isolation.task_uids.count` | integer | none | `> 0`; `first + count - 1` must stay below `2^32 - 1`. Task `N` runs as uid = gid = `first + (N mod count)`. | new runs |
+| `isolation.task_uids.count` | integer | none | `> 0`; `first + count - 1` must stay below `2^32 - 1`. Each run leases a free uid from the range; the range must hold at least as many uids as the peak number of concurrent tasks. | new runs |
 | `isolation.github_app.app_id` | integer or string | none | The App id (or client id), the JWT `iss`. | new runs |
 | `isolation.github_app.private_key_file` | string | none | Absolute path of the App's PEM key (PKCS#1 or PKCS#8), read for every task. | new runs |
 | `isolation.github_app.api_url` | string | `https://api.github.com` | REST root (GitHub Enterprise: `https://<host>/api/v3`); `https`, or `http` to a loopback host. | new runs |
@@ -442,9 +442,15 @@ isolation:
 
 What each part does:
 
-- **Own uid per task** (`task_uids`). Before the clone the workspace is made `0700` and handed to
-  the task uid; the clone, Codex, Claude Code and the `api` backend's shell run as it, and the
-  `api` file tools (which run inside Symphony) hand the files and directories they write to it.
+- **Own uid per task** (`task_uids`). Each run leases a free uid from the range: no two live
+  runs share one, and a uid with a live process (including one left by an earlier task, or one
+  another replica on the same host is using) is skipped; a task is refused when the range is
+  exhausted rather than sharing a uid. Before the clone the workspace is made `0700` and handed
+  to the task uid; the clone, Codex, Claude Code and the `api` backend's shell run as it, and
+  the `api` file tools (which run inside Symphony) hand the files and directories they write to
+  it. When the run ends, every process still running as the uid is killed before the uid is
+  freed, so a `setsid` daemon (or anything left under `sandbox: none`) cannot reach the next
+  task; the deny-mode agents are already reaped by the jail's own PID namespace.
   Switching users needs root (or `CAP_SETUID`, `CAP_SETGID` and `CAP_CHOWN`, plus `CAP_KILL`,
   `CAP_DAC_OVERRIDE` and `CAP_FOWNER` to stop and clean up after the task users); Symphony checks
   its effective uid and refuses the run when it is not root. bubblewrap then runs as the task

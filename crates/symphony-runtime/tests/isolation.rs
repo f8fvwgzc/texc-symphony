@@ -297,7 +297,7 @@ async fn an_isolated_task_gets_its_own_home_and_a_redacted_token() {
     fs::create_dir(&ws).unwrap();
     let mut spec = task(7);
     spec.repo = Some("https://github.com/acme/widgets".into());
-    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &spec, &ws)
+    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &spec, &ws, None)
         .await
         .unwrap();
     let env: std::collections::HashMap<String, String> = prepared.task_env().into_iter().collect();
@@ -389,9 +389,15 @@ async fn the_workspace_and_home_are_handed_to_the_task_user() {
         github_app: None,
         network: allow_all(),
     };
-    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &task(3), &ws)
-        .await
-        .unwrap();
+    let prepared = TaskIsolation::prepare(
+        &Default::default(),
+        &isolation,
+        &task(3),
+        &ws,
+        Some((first, first)),
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.run_as(), Some((first, first)));
     prepared.finish_workspace(&ws, false).unwrap();
     for path in [ws.clone(), ws.join(".home")] {
@@ -428,7 +434,7 @@ async fn a_planted_home_symlink_is_refused() {
         github_app: None,
         network: allow_all(),
     };
-    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &task(4), &ws)
+    let prepared = TaskIsolation::prepare(&Default::default(), &isolation, &task(4), &ws, None)
         .await
         .unwrap();
     let err = prepared.finish_workspace(&ws, true).unwrap_err();

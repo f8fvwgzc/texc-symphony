@@ -123,16 +123,6 @@ pub struct TaskUids {
     pub count: u32,
 }
 
-impl TaskUids {
-    /// The uid (= gid) of task `task_id`: `first + (task_id mod count)`.
-    pub fn for_task(&self, task_id: i64) -> u32 {
-        let offset = task_id.rem_euclid(i64::from(self.count.max(1)));
-        // `0 <= offset < count`, and casting checked that `first + count - 1` fits.
-        self.first
-            .saturating_add(u32::try_from(offset).unwrap_or(0))
-    }
-}
-
 /// `isolation.github_app`: the GitHub App whose installation tokens tasks get.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitHubAppSettings {
@@ -594,16 +584,5 @@ mod tests {
             Some(HostPort::new("gw.example", 443))
         );
         assert_eq!(url_host_port("ftp://x"), None);
-    }
-
-    #[test]
-    fn task_uids_wrap_around_the_range() {
-        let uids = TaskUids {
-            first: 200_000,
-            count: 10,
-        };
-        assert_eq!(uids.for_task(0), 200_000);
-        assert_eq!(uids.for_task(13), 200_003);
-        assert_eq!(uids.for_task(-1), 200_009);
     }
 }
