@@ -82,7 +82,16 @@ impl Drop for UidWorkspaceSeal {
             // The uid is returned to the pool only now that its workspace is root-owned `0700`.
             Ok(()) => drop(lease),
             // Already gone (e.g. a final run's workspace was removed): nothing to seal, release.
-            Err(_) if !self.workspace.exists() => drop(lease),
+            // `symlink_metadata` so a dangling symlink still counts as present (don't follow it),
+            // and only a genuine `NotFound` releases — any other error quarantines.
+            Err(_)
+                if matches!(
+                    std::fs::symlink_metadata(&self.workspace),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                ) =>
+            {
+                drop(lease)
+            }
             Err(err) => {
                 tracing::error!(
                     "Quarantining task uid {uid}: could not seal {} before releasing it: {err}",
@@ -707,6 +716,33 @@ mod tests {
         assert_eq!(
             hook_env_policy(&settings, true).removed(),
             symphony_core::config::llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)
+        );
+    }
+
+    /// Dropping a real `UidWorkspaceSeal` as a non-root process (its `chown` to root fails)
+    /// quarantines the uid rather than releasing it, so the single-uid pool can lease nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_seal_guard_quarantines_the_uid_when_it_cannot_seal() {
+        use std::os::unix::fs::MetadataExt;
+        let leased: LeasedUids = Arc::new(Mutex::new(HashSet::new()));
+        let uids = symphony_core::config::TaskUids {
+            first: 4_000_000_000,
+            count: 1,
+        };
+        let pool = TaskUidPool::new(uids, Arc::clone(&leased));
+        let lease = pool.lease().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        if std::fs::metadata(&ws).unwrap().uid() == 0 {
+            // Running as root (not expected in CI): the seal would succeed, nothing to quarantine.
+            return;
+        }
+        drop(UidWorkspaceSeal::new(lease, ws));
+        assert!(
+            pool.lease().is_err(),
+            "the uid is quarantined after a failed seal, not re-leased"
         );
     }
 }

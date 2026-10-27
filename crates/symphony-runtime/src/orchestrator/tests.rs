@@ -2316,6 +2316,35 @@ async fn a_watchdog_fenced_run_is_abandoned_not_retried_as_a_failure() {
     assert!(orch.state.blocked.is_empty());
 }
 
+/// A run that finished on its own (here `Ok`) while the actor was parked trips the fence flag too
+/// (its lease neared the deadline), but it was never cancelled and carries a real outcome. Since we
+/// fence before expiry, the lease is still ours: the outcome must be recorded, not abandoned and
+/// requeued (which would re-run the agent — duplicate PRs/spend).
+#[tokio::test(start_paused = true)]
+async fn a_fenced_flag_does_not_abandon_a_run_that_finished_on_its_own() {
+    let store = Store::open_in_memory_shared().unwrap();
+    let mut h = Harness::with_store(json!({}), result_factory(|| Ok(())), store.clone());
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.leases.contains_key("i-1"));
+    // The watchdog flags it (lease near its deadline) even though the worker finished Ok and was
+    // never cancelled.
+    orch.lease_watch
+        .lock()
+        .unwrap()
+        .get_mut("i-1")
+        .expect("the run is watched")
+        .fenced = true;
+    run_until(&mut orch, |o| o.state.completed.contains("i-1")).await;
+    assert!(
+        orch.state.completed.contains("i-1"),
+        "the Ok outcome is recorded (not abandoned as a fence)"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_replica_drops_a_restored_retry_that_another_replica_holds() {
     let store = Store::open_in_memory().unwrap();

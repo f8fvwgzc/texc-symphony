@@ -141,10 +141,12 @@ impl Orchestrator<'_> {
         };
         self.record_session_completion_totals(&entry);
         let session_id = entry.session_id.clone().unwrap_or_else(|| "n/a".into());
-        // The watchdog cancelled this run because its lease was about to expire while the actor
-        // loop was parked. That `Cancelled` exit is an abandon, not a failure: don't mark the task
-        // Failed or remove its workspace — requeue it and hand the lease back.
-        if self.lease_fenced(&issue_id) {
+        // Abandon only a run the watchdog actually cancelled: the exit must be `Cancelled` *and*
+        // the lease fenced. A run that finished on its own (Ok/Blocked/Failed) while the actor was
+        // parked also trips the fence flag at deadline−backstop, but its token was never cancelled
+        // and it carries a real outcome — the lease is still ours (we fire before expiry), so
+        // record that outcome instead of dropping it and requeuing the task (which would re-run it).
+        if matches!(result, Err(RunError::Cancelled)) && self.lease_fenced(&issue_id) {
             self.abandon_fenced_run(&issue_id, entry);
             tracing::warn!(
                 "Agent task abandoned for issue_id={issue_id} session_id={session_id}: dispatch \

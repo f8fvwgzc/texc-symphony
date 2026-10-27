@@ -147,7 +147,17 @@ pub(crate) type LeaseWatchMap = Arc<Mutex<HashMap<String, LeaseWatch>>>;
 /// one timed-out renewal or a brief tracker/reconcile stall must not trip it, only a genuinely
 /// parked actor that has stopped renewing for far longer.
 fn lease_watchdog_backstop(worker_cancel_grace: Duration) -> Duration {
-    worker_cancel_grace + CANCEL_MARGIN + ABORT_WAIT + 2 * LEASE_WATCHDOG_INTERVAL
+    // The watchdog only cancels the worker; the actor's `stop_worker` does the abort, and it can't
+    // run while the actor is parked, so `ABORT_WAIT` doesn't apply here — the run exits
+    // cooperatively within `worker_cancel_grace`. Fire that long plus a small margin before expiry.
+    // Clamp strictly below `LEASE_STOP_WINDOW` so a large configured grace can't push the backstop
+    // up to (or past) the actor's own fence — which would undercut its one-missed-renewal tolerance
+    // or, past `LEASE_TTL`, fence every run on the first tick.
+    let raw = worker_cancel_grace + CANCEL_MARGIN + 2 * LEASE_WATCHDOG_INTERVAL;
+    raw.clamp(
+        2 * LEASE_WATCHDOG_INTERVAL,
+        LEASE_STOP_WINDOW - LEASE_WATCHDOG_INTERVAL,
+    )
 }
 
 /// Cancels, independently of the actor loop, the worker of any run whose dispatch lease is within
@@ -761,9 +771,10 @@ impl<'w> Orchestrator<'w> {
             }
         }
         // Re-arm the next renewal before the reconciliation calls below, so a store call that
-        // stalls on an unresponsive database cannot delay the schedule — the next renewal (and
-        // its `expiring_leases` check, the lease fence) fires on time. Each reconciliation call
-        // is also bounded, so one stuck job cannot park the actor loop past a lease deadline.
+        // stalls on an unresponsive database cannot delay the schedule — the next renewal (and its
+        // `expiring_leases` check) fires on time. Should a reconciliation call park the loop past a
+        // lease deadline anyway, the lease watchdog ([`run_lease_watchdog`]) still stops runs near
+        // expiry on its own schedule.
         self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
         if self.ctx.store.is_shared() {
             // `sync_kill_switch` and `recover_orphans` only read the shared control row and close
