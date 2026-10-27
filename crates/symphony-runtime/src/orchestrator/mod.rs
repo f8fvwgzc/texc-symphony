@@ -20,8 +20,8 @@ mod state;
 mod tests;
 mod workers;
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -120,6 +120,54 @@ pub const LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(LEASE_RENEW_EVERY.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
 /// Bound on waiting for an aborted worker to be dropped.
 const ABORT_WAIT: Duration = Duration::from_secs(5);
+/// How often the lease watchdog checks deadlines — short relative to `LEASE_STOP_WINDOW` so a run
+/// is cancelled well within the window even while the actor loop is parked.
+const LEASE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A running issue's dispatch-lease deadline and the token that cancels its worker. Shared between
+/// the actor (which registers, renews and removes entries) and [`run_lease_watchdog`].
+pub(crate) struct LeaseWatch {
+    pub deadline: Instant,
+    pub cancel: CancellationToken,
+}
+
+/// Issue id → [`LeaseWatch`]. A plain `std::sync::Mutex`: the critical sections are tiny and hold
+/// no `.await`.
+pub(crate) type LeaseWatchMap = Arc<Mutex<HashMap<String, LeaseWatch>>>;
+
+/// Cancels, independently of the actor loop, the worker of any run whose dispatch lease is within
+/// `LEASE_STOP_WINDOW` of expiry. The actor renews held leases every `LEASE_RENEW_EVERY`, pushing
+/// each deadline out, so this fires only once the actor loop is parked (for example on a slow
+/// store call on the dispatch path) and renewals have stopped — exactly when the actor's own
+/// `expiring_leases` fence cannot run. The cancelled worker exits through the normal path; the
+/// lease then lapses by TTL, and another replica takes the issue only after this run has already
+/// stopped, so two replicas never run one issue at once.
+async fn run_lease_watchdog(map: LeaseWatchMap, shutdown: CancellationToken) {
+    let mut ticker = tokio::time::interval(LEASE_WATCHDOG_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = ticker.tick() => fire_expiring_lease_cancels(&map),
+        }
+    }
+}
+
+/// Cancels the worker of every watched run within `LEASE_STOP_WINDOW` of its deadline. Idempotent:
+/// an already-cancelled run is skipped, and entries are removed by `drop_lease` on the normal exit.
+fn fire_expiring_lease_cancels(map: &LeaseWatchMap) {
+    let now = Instant::now();
+    let watches = map.lock().unwrap_or_else(|poison| poison.into_inner());
+    for (issue_id, watch) in watches.iter() {
+        if watch.deadline <= now + LEASE_STOP_WINDOW && !watch.cancel.is_cancelled() {
+            tracing::warn!(
+                "Stopping issue_id={issue_id}: its dispatch lease is within the stop window and \
+                 renewals have stalled; cancelling its run independently of the actor loop"
+            );
+            watch.cancel.cancel();
+        }
+    }
+}
 
 /// Timer events (each tick/retry carries its token).
 #[derive(Debug)]
@@ -167,6 +215,9 @@ pub(crate) struct Orchestrator<'w> {
     pause_writes: mpsc::UnboundedSender<Option<String>>,
     /// Kill-switch changes sent but not written yet.
     pause_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Shared with [`run_lease_watchdog`]: each running issue's lease deadline and worker-cancel
+    /// token, so a run is stopped near expiry even when the actor loop is parked.
+    lease_watch: LeaseWatchMap,
 }
 
 /// A task status change for the store.
@@ -261,6 +312,7 @@ impl<'w> Orchestrator<'w> {
             task_writes: spawn_task_writer(ctx_store),
             pause_writes,
             pause_in_flight,
+            lease_watch: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -303,46 +355,6 @@ impl<'w> Orchestrator<'w> {
             .join(crate::workspace::TASK_WORKSPACES)
     }
 
-    /// Hands a blocked task's retained workspace back to root (`0700`), so a uid re-leased to the
-    /// next task cannot read or tamper with this task's clone (for example planting `.git/hooks`).
-    /// Only under `task_uids`; `TaskIsolation::prepare` chowns it back when the task is unblocked.
-    pub(crate) fn seal_task_workspace(&self, id: i64) {
-        if self
-            .settings()
-            .isolation
-            .as_ref()
-            .and_then(|iso| iso.task_uids)
-            .is_none()
-        {
-            return;
-        }
-        let path = self.task_workspace(id);
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await
-                {
-                    tracing::warn!(
-                        "Failed to restrict blocked task workspace {}: {err}",
-                        path.display()
-                    );
-                    return;
-                }
-                // The top directory to root: a reused uid then cannot enter it.
-                if let Err(err) = std::os::unix::fs::lchown(&path, Some(0), Some(0)) {
-                    tracing::warn!(
-                        "Failed to hand blocked task workspace {} to root: {err}",
-                        path.display()
-                    );
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = &path;
-        });
-    }
-
     /// Removes task `id`'s workspace in the background (its agent is already stopped). Task
     /// workspaces run no workflow hooks.
     pub(crate) fn remove_task_workspace(&self, id: i64) {
@@ -376,10 +388,12 @@ impl<'w> Orchestrator<'w> {
             else {
                 continue;
             };
+            // Seal first, before asking the store what to do: a leftover uid-owned workspace must
+            // be handed to root even if `get_task` errors (which would otherwise leave it
+            // reachable by a re-leased uid). Removal of final/unknown tasks follows.
+            self.seal_kept_task_workspace(id).await;
             match self.ctx.store.get_task(id).await {
-                Ok(Some(task)) if !task.status.is_final() => {
-                    self.seal_kept_task_workspace(id).await;
-                }
+                Ok(Some(task)) if !task.status.is_final() => {}
                 Ok(_) => self.remove_task_workspace(id),
                 Err(err) => tracing::warn!("Failed to read task {id}: {err}"),
             }
@@ -429,9 +443,17 @@ impl<'w> Orchestrator<'w> {
 
     /// Runs until shutdown: startup cleanup, first tick, then the event loop; finally stops workers.
     pub(crate) async fn run(mut self) {
+        // Fires worker-cancel tokens near lease expiry on its own schedule, so a run cannot
+        // outlive its lease even if the actor loop below is parked on a slow dispatch-path store
+        // call (which would otherwise stop the `LeaseRenew` timer from being processed).
+        let watchdog = tokio::spawn(run_lease_watchdog(
+            Arc::clone(&self.lease_watch),
+            self.shutdown.clone(),
+        ));
         self.startup().await;
         while self.step().await {}
         self.stop_all_workers().await;
+        watchdog.abort();
     }
 
     /// `init/1`: startup terminal cleanup, then an immediate tick.
@@ -588,8 +610,45 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
+    /// Registers `issue_id`'s run with the lease watchdog (shared stores only, once the lease
+    /// exists): the watchdog cancels its worker near expiry even if the actor loop is parked.
+    fn watch_lease(&self, issue_id: &str, cancel: &CancellationToken) {
+        if !self.ctx.store.is_shared() {
+            return;
+        }
+        let Some(&deadline) = self.state.leases.get(issue_id) else {
+            return;
+        };
+        self.lease_watch
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                issue_id.to_owned(),
+                LeaseWatch {
+                    deadline,
+                    cancel: cancel.clone(),
+                },
+            );
+    }
+
+    /// Pushes a renewed lease's deadline out in the watchdog map, matching `state.leases`.
+    fn renew_lease_watch(&self, issue_id: &str, deadline: Instant) {
+        if let Some(watch) = self
+            .lease_watch
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get_mut(issue_id)
+        {
+            watch.deadline = deadline;
+        }
+    }
+
     /// Gives up the lease of `issue_id` if this replica holds it.
     pub(crate) fn drop_lease(&mut self, issue_id: &str) {
+        self.lease_watch
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(issue_id);
         if self.state.leases.remove(issue_id).is_none() {
             return;
         }
@@ -622,10 +681,14 @@ impl<'w> Orchestrator<'w> {
             .await;
             match renewal {
                 Ok(Ok(held)) => {
+                    let renewed = asked + LEASE_TTL;
                     for key in &held {
                         if let Some(deadline) = self.state.leases.get_mut(key) {
-                            *deadline = asked + LEASE_TTL;
+                            *deadline = renewed;
+                        } else {
+                            continue;
                         }
+                        self.renew_lease_watch(key, renewed);
                     }
                     for key in keys.iter().filter(|key| !held.contains(key)) {
                         tracing::warn!(
@@ -642,12 +705,27 @@ impl<'w> Orchestrator<'w> {
                 ),
             }
             if self.ctx.store.is_shared() {
-                for key in expiring_leases(&self.state.leases, Instant::now()) {
+                let expiring = expiring_leases(&self.state.leases, Instant::now());
+                // Cancel every expiring run's worker up front (the watchdog may already have), so
+                // they shut down concurrently rather than one waiting on the next's cancel grace.
+                for key in &expiring {
                     tracing::warn!(
                         "Stopping issue_id={key}: its dispatch lease could not be renewed and \
                          may expire before the next renewal"
                     );
-                    self.abandon_running_issue(&key, "dispatch lease could not be renewed")
+                    if let Some(cancel) = self
+                        .state
+                        .running
+                        .get(key)
+                        .and_then(|entry| entry.worker.as_ref())
+                        .map(|worker| &worker.cancel)
+                    {
+                        cancel.cancel();
+                    }
+                }
+                // Then abandon each (drops the lease and claim, awaits the already-cancelled stop).
+                for key in &expiring {
+                    self.abandon_running_issue(key, "dispatch lease could not be renewed")
                         .await;
                 }
             }
@@ -664,8 +742,9 @@ impl<'w> Orchestrator<'w> {
             // stopping a run removes the `running` entry and then releases the task, the dispatch
             // lease, and the claim. A timeout firing between those steps would drop the rest,
             // stranding the task `running` with its lease renewed forever. Run-stopping must run
-            // to completion with no cancellation point; the lease fence above already protects
-            // against a slow `enforce_spend` delaying renewals.
+            // to completion with no cancellation point; and should a slow `enforce_spend` delay
+            // the next renewal anyway, the lease watchdog ([`run_lease_watchdog`]) still cancels
+            // runs near expiry on its own schedule.
             let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.sync_kill_switch()).await;
             self.enforce_spend().await;
             let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.recover_orphans()).await;

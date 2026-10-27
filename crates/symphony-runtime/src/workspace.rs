@@ -424,13 +424,15 @@ impl WorkspaceManager {
                     .map_err(|err| io_error("mkdir_p", &tasks, &err))?;
                 // Only under `task_uids` does a task run as a different uid that must traverse
                 // `<root>` and `.tasks` to reach its own `0700` workspace. There Symphony runs as
-                // root (umask 077 would otherwise leave these `0700`) and owns them, so ensure the
-                // "others" execute bit (traverse, not list). Add it only when it is missing, and
-                // never when it is already set: an operator-provisioned root we do not own (for
-                // example a root-owned `/workspaces` on the Helm chart) is already traversable, so
-                // skipping it avoids an EPERM that would fail every isolated task. Without
-                // `task_uids` the task runs as Symphony's own uid, needs no extra traversal, and
-                // Symphony may not own these directories, so leave them untouched.
+                // root (umask 077 would otherwise leave these `0700`) and owns them, so add the
+                // group- and other-execute bits (`0o011`: traverse, not list) when the "others"
+                // bit is missing, and never when it is already set: an operator-provisioned root
+                // we do not own (for example a root-owned `/workspaces` on the Helm chart) is
+                // already traversable, so skipping it avoids an EPERM that would fail every
+                // isolated task. `| 0o011` preserves any other bits already set (for example a
+                // setgid bit the operator put on the directory). Without `task_uids` the task runs
+                // as Symphony's own uid, needs no extra traversal, and Symphony may not own these
+                // directories, so leave them untouched.
                 #[cfg(unix)]
                 if self
                     .settings
@@ -1067,6 +1069,31 @@ mod tests {
             vec![0o705, 0o705],
             "already-traversable parents must be left untouched"
         );
+    }
+
+    /// Adding the traverse bit preserves other mode bits the operator set — notably setgid, used so
+    /// clones inherit the parent's group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_parents_keep_their_setgid_bit_when_made_traversable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let mgr = task_manager(&root, isolation_settings(true));
+        let parents = vec![root.clone(), root.join(TASK_WORKSPACES)];
+        std::fs::create_dir_all(root.join(TASK_WORKSPACES)).unwrap();
+        // setgid + rwx owner, no traverse for others.
+        set_mode(&parents, 0o2700);
+        mgr.create_for_issue(&task_issue("9"), None).await.unwrap();
+        for dir in &parents {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                mode,
+                0o2711,
+                "{} is {mode:o}: setgid kept, traverse added",
+                dir.display()
+            );
+        }
     }
 
     /// Without `task_uids` the task runs as Symphony's own uid and needs no extra traversal, so the

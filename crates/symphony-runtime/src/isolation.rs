@@ -90,6 +90,14 @@ impl TaskUidLease {
     pub fn uid(&self) -> u32 {
         self.uid
     }
+
+    /// Retires the lease without returning its uid to the pool: the uid is never handed out again.
+    /// Used when a workspace could not be sealed before release — a reused uid must not be able to
+    /// reach an unsealed, uid-owned clone, so the uid is sacrificed instead. Leaks only the small
+    /// pool `Arc` refcount, on a path that should never occur under `task_uids` (Symphony is root).
+    pub fn quarantine(self) {
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for TaskUidLease {

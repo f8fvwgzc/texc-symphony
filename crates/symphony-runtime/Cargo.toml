@@ -36,6 +36,8 @@ reqwest = { workspace = true, features = ["json"] }
 rustix = { version = "1.1.5", features = ["process", "fs"] }
 
 [dev-dependencies]
+# The shared in-memory store seam (`open_in_memory_shared`) is test-only; kept off the prod build.
+symphony-store = { workspace = true, features = ["test-util"] }
 # Holds a store's SQLite lock in a test (same version as symphony-store).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = { workspace = true }

@@ -49,11 +49,12 @@ impl Harness {
     ) -> Self {
         let wf = TestWorkflow::new(config);
         let memory = MemoryIssues::new();
-        let options = RuntimeOptions::new(Arc::clone(&wf.store), TrackerDeps::new().unwrap())
+        let mut options = RuntimeOptions::new(Arc::clone(&wf.store), TrackerDeps::new().unwrap())
             .with_tracker(Arc::new(MemoryTracker::new(memory.clone())))
             .with_worker_factory(factory);
-        let mut options = customize(options);
+        // Default cancel grace, set before `customize` so a test can override it.
         options.worker_cancel_grace = Duration::from_millis(500);
+        let options = customize(options);
         let (gen_tx, generation) = watch::channel(0);
         let ctx = Arc::new(RuntimeContext::from_options(&options, gen_tx));
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -96,6 +97,19 @@ fn blocking_factory(started: Started) -> Arc<dyn WorkerFactory> {
             ctx.cancel.cancelled().await;
             Err(RunError::Cancelled)
         }
+    }))
+}
+
+/// Worker that records its start, then ignores cancellation entirely — only an abort after the
+/// cancel grace stops it. Lets a test make `stop_worker` take the full grace.
+fn uncancellable_factory(started: Started) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        started.lock().unwrap().push((
+            ctx.issue.id.clone().unwrap_or_default(),
+            ctx.attempt,
+            ctx.worker_host.clone(),
+        ));
+        async move { std::future::pending::<WorkerResult>().await }
     }))
 }
 
@@ -1487,6 +1501,10 @@ async fn an_issue_over_its_budget_is_stopped_and_blocked_with_cost_recorded() {
 /// run it stops is released all the way — claim and dispatch lease dropped, not just removed from
 /// `running`. A timeout firing after `state.running.remove` but before `drop_lease`/`claimed.remove`
 /// would strand the task `running` with its lease renewed forever; this drives the exact path.
+///
+/// Guard: the worker ignores cancellation and the cancel grace (9s) exceeds `LEASE_RENEW_TIMEOUT`
+/// (7.5s), so `stop_running_issue` sits in `stop_worker` past that bound. If a timeout were
+/// restored around `enforce_spend`, it would fire mid-stop and the final assertions would fail.
 #[tokio::test(start_paused = true)]
 async fn shared_store_renew_cycle_releases_a_spend_stopped_run_completely() {
     let store = Store::open_in_memory_shared().unwrap();
@@ -1495,10 +1513,17 @@ async fn shared_store_renew_cycle_releases_a_spend_stopped_run_completely() {
         "the renew/reconcile block only runs on a shared store"
     );
     let started: Started = Arc::default();
-    let mut h = Harness::with_store(
+    let store_for_opts = store.clone();
+    let mut h = Harness::build(
         json!({}),
-        blocking_factory(Arc::clone(&started)),
-        store.clone(),
+        uncancellable_factory(Arc::clone(&started)),
+        |options| {
+            let mut options = options.with_store(store_for_opts);
+            // Longer than LEASE_RENEW_TIMEOUT (7.5s): a restored `enforce_spend` timeout would fire
+            // before this worker's forced abort, stranding the run.
+            options.worker_cancel_grace = LEASE_RENEW_TIMEOUT + Duration::from_secs(2);
+            options
+        },
     );
     h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
     let mut workers = WorkerSet::default();
@@ -2136,6 +2161,84 @@ async fn a_lease_is_stopped_before_a_second_missed_renewal_could_let_it_expire()
     );
     // Stopped while the lease is still ours, with at least a renewal period to spare.
     assert!(2 * LEASE_RENEW_EVERY + LEASE_RENEW_EVERY <= LEASE_TTL);
+}
+
+/// Fix 1: the watchdog cancels a run whose lease is within the stop window and leaves a
+/// freshly-renewed one alone — the same window the actor's `expiring_leases` fence uses.
+#[tokio::test(start_paused = true)]
+async fn fire_expiring_lease_cancels_only_runs_within_the_stop_window() {
+    let now = tokio::time::Instant::now();
+    let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let fresh = CancellationToken::new();
+    let expiring = CancellationToken::new();
+    {
+        let mut guard = map.lock().unwrap();
+        // Just renewed: deadline a full TTL out.
+        guard.insert(
+            "fresh".to_owned(),
+            LeaseWatch {
+                deadline: now + LEASE_TTL,
+                cancel: fresh.clone(),
+            },
+        );
+        // Renewals have stalled: the deadline sits inside the stop window.
+        guard.insert(
+            "expiring".to_owned(),
+            LeaseWatch {
+                deadline: now + LEASE_STOP_WINDOW - Duration::from_secs(1),
+                cancel: expiring.clone(),
+            },
+        );
+    }
+    fire_expiring_lease_cancels(&map);
+    assert!(
+        !fresh.is_cancelled(),
+        "a freshly-renewed lease keeps running"
+    );
+    assert!(
+        expiring.is_cancelled(),
+        "a lease within the stop window is cancelled"
+    );
+}
+
+/// Fix 1: the watchdog task cancels an expiring run on its own schedule, with no actor loop
+/// running at all — proving the fence survives a parked actor that can no longer renew or process
+/// the `LeaseRenew` timer.
+#[tokio::test(start_paused = true)]
+async fn the_lease_watchdog_cancels_an_unrenewed_run_without_the_actor_loop() {
+    let now = tokio::time::Instant::now();
+    let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let shutdown = CancellationToken::new();
+    let token = CancellationToken::new();
+    map.lock().unwrap().insert(
+        "i-1".to_owned(),
+        LeaseWatch {
+            deadline: now + LEASE_TTL,
+            cancel: token.clone(),
+        },
+    );
+    let watchdog = tokio::spawn(run_lease_watchdog(Arc::clone(&map), shutdown.clone()));
+
+    // Before the stop window the run is left alone.
+    tokio::time::advance(LEASE_TTL - LEASE_STOP_WINDOW - LEASE_RENEW_EVERY).await;
+    tokio::task::yield_now().await;
+    assert!(!token.is_cancelled(), "not yet within the stop window");
+
+    // Nothing renews the lease (the actor loop is parked); once the clock enters the stop window
+    // the watchdog cancels on its own.
+    for _ in 0..(2 * LEASE_STOP_WINDOW.as_secs() + 2) {
+        if token.is_cancelled() {
+            break;
+        }
+        tokio::time::advance(LEASE_WATCHDOG_INTERVAL).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        token.is_cancelled(),
+        "the watchdog cancelled the run before its lease expired"
+    );
+    shutdown.cancel();
+    let _ = watchdog.await;
 }
 
 #[tokio::test(start_paused = true)]

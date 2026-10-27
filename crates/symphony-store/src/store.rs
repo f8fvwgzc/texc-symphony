@@ -120,6 +120,10 @@ impl Store {
     /// exercise the multi-replica dispatch path (lease renewal, kill-switch sync, orphan
     /// recovery, spend enforcement) without a live PostgreSQL. SQLite cannot actually be shared
     /// between processes; this only forces the in-process coordination that a shared store drives.
+    ///
+    /// Behind the `test-util` feature: the production binary never enables it, so a real build can
+    /// never construct a SQLite store that reports [`Store::is_postgres`].
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn open_in_memory_shared() -> Result<Store> {
         let mut conn = Connection::open_in_memory()?;

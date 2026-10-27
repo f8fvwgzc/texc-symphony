@@ -313,6 +313,7 @@ impl Orchestrator<'_> {
         let (codex_tx, codex_rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = oneshot::channel::<()>();
         let cancel = self.shutdown.child_token();
+        let cancel_for_watch = cancel.clone();
         let ctx = WorkerContext {
             issue: issue.clone(),
             attempt,
@@ -406,6 +407,9 @@ impl Orchestrator<'_> {
             },
         );
         self.state.claimed.insert(issue_id.clone());
+        // Watch this run's lease so the watchdog can cancel it near expiry even if the actor loop
+        // parks; the lease (shared stores only) was taken just before this spawn.
+        self.watch_lease(&issue_id, &cancel_for_watch);
         self.remove_retry_entry(&issue_id);
     }
 }

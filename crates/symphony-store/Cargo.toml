@@ -24,6 +24,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# Exposes `Store::open_in_memory_shared` (a shared in-memory store) for other crates' tests only;
+# never enabled by the production binary, so `is_postgres()` can never report true for SQLite.
+test-util = []
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio = { workspace = true }

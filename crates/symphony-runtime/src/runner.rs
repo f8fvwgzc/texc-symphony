@@ -46,6 +46,52 @@ use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
 use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerFactory, WorkerResult};
 use crate::workspace::{IssueContext, WorkspaceManager};
 
+/// Owns a task's uid lease for the lifetime of its run and, on `Drop`, kills the uid's leftover
+/// processes and seals its workspace to root *before* the uid is freed — on every exit path,
+/// including a panic or an abort-after-grace that would otherwise drop the lease unsealed. If the
+/// seal fails, the uid is quarantined (never reused) rather than released, so a reused uid can
+/// never reach an unsealed, uid-owned clone.
+struct UidWorkspaceSeal {
+    lease: Option<TaskUidLease>,
+    workspace: PathBuf,
+}
+
+impl UidWorkspaceSeal {
+    fn new(lease: TaskUidLease, workspace: PathBuf) -> Self {
+        Self {
+            lease: Some(lease),
+            workspace,
+        }
+    }
+}
+
+impl Drop for UidWorkspaceSeal {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let uid = lease.uid();
+        // Kill anything the task left as its uid (a `setsid` daemon, anything under `sandbox:
+        // none`) before the uid could be reused. Deny mode's jail PID namespace already reaped its
+        // agent; this covers allow mode.
+        let killed = isolation::kill_uid_processes(uid);
+        if killed > 0 {
+            tracing::info!("Killed {killed} leftover process(es) of task uid {uid}");
+        }
+        match isolation::seal_workspace(&self.workspace) {
+            // The uid is returned to the pool only now that its workspace is root-owned `0700`.
+            Ok(()) => drop(lease),
+            Err(err) => {
+                tracing::error!(
+                    "Quarantining task uid {uid}: could not seal {} before releasing it: {err}",
+                    self.workspace.display()
+                );
+                lease.quarantine();
+            }
+        }
+    }
+}
+
 /// Dynamic tools backed by a tracker [`ToolBinding`] (snapshot taken at session start).
 #[derive(Debug, Clone)]
 pub struct TrackerToolHandler {
@@ -288,6 +334,12 @@ impl AgentRunner {
             created = workspaces.create_for_issue(&issue_context, worker_host) => created?,
         };
         ctx.reporter.runtime_info(worker_host, &workspace);
+        // Own the uid lease in a guard now that the workspace exists: its `Drop` kills the uid's
+        // leftover processes and seals the workspace to root before the uid is ever freed, on every
+        // exit — success, failure, cancellation, timeout, and even a panic or an abort-after-grace
+        // that would otherwise drop the lease unsealed. Nothing below releases the uid itself.
+        let _seal_guard =
+            uid_lease.map(|lease| UidWorkspaceSeal::new(lease, PathBuf::from(&workspace)));
 
         let body = async {
             let isolation = match (&ctx.task, isolation_settings) {
@@ -349,30 +401,9 @@ impl AgentRunner {
                 .run_after_run_hook(&workspace, &issue_context, worker_host)
                 .await;
         }
-        // Kill any process the task left as its uid (a `setsid` daemon, anything under
-        // `sandbox: none`) before the lease frees the uid for the next task. The jail's own PID
-        // namespace already reaps the deny-mode agent; this covers allow mode.
-        if let Some(lease) = &uid_lease {
-            let killed = isolation::kill_uid_processes(lease.uid());
-            if killed > 0 {
-                tracing::info!(
-                    "Killed {killed} leftover process(es) of task uid {}",
-                    lease.uid()
-                );
-            }
-            // Seal the workspace to root before the uid is freed. This is the single exit point
-            // for a uid-leased run, so it covers every outcome — success, failure, cancellation,
-            // timeout, and the blocked/requeued cases that keep the workspace — without each
-            // caller remembering to seal. The next task leased this uid must not be able to read
-            // or tamper with this clone; an unblock re-chowns it. A seal failure is a cross-task
-            // escape, so it fails the run (overriding the outcome) rather than freeing the uid
-            // beside a uid-owned tree.
-            if let Err(err) = isolation::seal_workspace(std::path::Path::new(&workspace)) {
-                drop(uid_lease);
-                return Err(err);
-            }
-        }
-        drop(uid_lease);
+        // `_seal_guard` drops here (and on any early return, panic or abort above): it kills the
+        // uid's leftover processes and seals the workspace before the uid is freed. See
+        // `UidWorkspaceSeal`.
         result
     }
 
