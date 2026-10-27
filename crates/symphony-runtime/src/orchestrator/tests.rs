@@ -2163,82 +2163,157 @@ async fn a_lease_is_stopped_before_a_second_missed_renewal_could_let_it_expire()
     assert!(2 * LEASE_RENEW_EVERY + LEASE_RENEW_EVERY <= LEASE_TTL);
 }
 
-/// Fix 1: the watchdog cancels a run whose lease is within the stop window and leaves a
-/// freshly-renewed one alone — the same window the actor's `expiring_leases` fence uses.
+fn watched(deadline: tokio::time::Instant, cancel: &CancellationToken) -> LeaseWatch {
+    LeaseWatch {
+        deadline,
+        cancel: cancel.clone(),
+        fenced: false,
+    }
+}
+
+/// Fix 1: the watchdog is a strict backstop. It cancels a run only once its lease is within the
+/// backstop margin — which is shorter than `LEASE_STOP_WINDOW`, so a run merely inside the actor's
+/// own (renewal-cadence) fence window, i.e. one tolerated missed renewal, is left alone. On firing
+/// it also sets `fenced` so the actor abandons rather than fails the run.
 #[tokio::test(start_paused = true)]
-async fn fire_expiring_lease_cancels_only_runs_within_the_stop_window() {
+async fn fire_expiring_lease_cancels_only_past_the_backstop() {
+    let backstop = lease_watchdog_backstop(Duration::from_secs(10));
+    assert!(
+        backstop < LEASE_STOP_WINDOW,
+        "the backstop must fire after the actor's own fence"
+    );
     let now = tokio::time::Instant::now();
     let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let fresh = CancellationToken::new();
-    let expiring = CancellationToken::new();
+    let actor_window = CancellationToken::new();
+    let past_backstop = CancellationToken::new();
     {
         let mut guard = map.lock().unwrap();
-        // Just renewed: deadline a full TTL out.
+        // Just renewed: a full TTL out.
+        guard.insert("fresh".to_owned(), watched(now + LEASE_TTL, &fresh));
+        // Inside the actor's LEASE_STOP_WINDOW but not the backstop: one missed renewal, tolerated.
         guard.insert(
-            "fresh".to_owned(),
-            LeaseWatch {
-                deadline: now + LEASE_TTL,
-                cancel: fresh.clone(),
-            },
+            "actor_window".to_owned(),
+            watched(
+                now + LEASE_STOP_WINDOW - Duration::from_secs(1),
+                &actor_window,
+            ),
         );
-        // Renewals have stalled: the deadline sits inside the stop window.
+        // Within the backstop: the actor has been parked far past its own fence.
         guard.insert(
-            "expiring".to_owned(),
-            LeaseWatch {
-                deadline: now + LEASE_STOP_WINDOW - Duration::from_secs(1),
-                cancel: expiring.clone(),
-            },
+            "past_backstop".to_owned(),
+            watched(now + backstop - Duration::from_secs(1), &past_backstop),
         );
     }
-    fire_expiring_lease_cancels(&map);
+    fire_expiring_lease_cancels(&map, backstop);
     assert!(
         !fresh.is_cancelled(),
         "a freshly-renewed lease keeps running"
     );
     assert!(
-        expiring.is_cancelled(),
-        "a lease within the stop window is cancelled"
+        !actor_window.is_cancelled(),
+        "inside the actor's fence window but not the backstop: left for the actor to renew"
+    );
+    assert!(
+        past_backstop.is_cancelled(),
+        "within the backstop: cancelled"
+    );
+    assert!(
+        map.lock().unwrap()["past_backstop"].fenced,
+        "firing marks the run fenced so the actor abandons it"
     );
 }
 
 /// Fix 1: the watchdog task cancels an expiring run on its own schedule, with no actor loop
 /// running at all — proving the fence survives a parked actor that can no longer renew or process
-/// the `LeaseRenew` timer.
+/// the `LeaseRenew` timer. The cancel happens before the lease deadline.
 #[tokio::test(start_paused = true)]
 async fn the_lease_watchdog_cancels_an_unrenewed_run_without_the_actor_loop() {
-    let now = tokio::time::Instant::now();
+    let backstop = lease_watchdog_backstop(Duration::from_secs(10));
+    let start = tokio::time::Instant::now();
+    let deadline = start + LEASE_TTL;
     let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let shutdown = CancellationToken::new();
     let token = CancellationToken::new();
-    map.lock().unwrap().insert(
-        "i-1".to_owned(),
-        LeaseWatch {
-            deadline: now + LEASE_TTL,
-            cancel: token.clone(),
-        },
-    );
-    let watchdog = tokio::spawn(run_lease_watchdog(Arc::clone(&map), shutdown.clone()));
+    map.lock()
+        .unwrap()
+        .insert("i-1".to_owned(), watched(deadline, &token));
+    let watchdog = tokio::spawn(run_lease_watchdog(
+        Arc::clone(&map),
+        shutdown.clone(),
+        backstop,
+    ));
 
-    // Before the stop window the run is left alone.
-    tokio::time::advance(LEASE_TTL - LEASE_STOP_WINDOW - LEASE_RENEW_EVERY).await;
+    // Outside the backstop (still within the actor's tolerated window): left alone.
+    tokio::time::advance(LEASE_TTL - backstop - LEASE_RENEW_EVERY).await;
     tokio::task::yield_now().await;
-    assert!(!token.is_cancelled(), "not yet within the stop window");
+    assert!(!token.is_cancelled(), "not yet within the backstop");
 
-    // Nothing renews the lease (the actor loop is parked); once the clock enters the stop window
-    // the watchdog cancels on its own.
-    for _ in 0..(2 * LEASE_STOP_WINDOW.as_secs() + 2) {
+    // Nothing renews the lease (the actor loop is parked); the watchdog cancels once inside it.
+    for _ in 0..LEASE_TTL.as_secs() {
         if token.is_cancelled() {
             break;
         }
         tokio::time::advance(LEASE_WATCHDOG_INTERVAL).await;
         tokio::task::yield_now().await;
     }
+    assert!(token.is_cancelled(), "the watchdog cancelled the run");
     assert!(
-        token.is_cancelled(),
-        "the watchdog cancelled the run before its lease expired"
+        tokio::time::Instant::now() < deadline,
+        "the cancel happened before the lease deadline"
+    );
+    assert!(
+        map.lock().unwrap()["i-1"].fenced,
+        "the run is marked fenced"
     );
     shutdown.cancel();
     let _ = watchdog.await;
+}
+
+/// Fix (bug 2): a run the watchdog fenced is abandoned, not failed — its lease and claim are
+/// dropped and no failure retry is scheduled (which `handle_agent_down` would do for a plain
+/// `Cancelled` exit). The workspace is kept (already sealed by the runner).
+#[tokio::test(start_paused = true)]
+async fn a_watchdog_fenced_run_is_abandoned_not_retried_as_a_failure() {
+    let store = Store::open_in_memory_shared().unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    assert!(orch.state.leases.contains_key("i-1"));
+
+    // Simulate the watchdog firing: mark fenced and cancel the worker, as `fire_expiring_lease_cancels` does.
+    {
+        let mut watches = orch.lease_watch.lock().unwrap();
+        let watch = watches.get_mut("i-1").expect("the run is watched");
+        watch.fenced = true;
+        watch.cancel.cancel();
+    }
+    // The worker exits `Cancelled`; the actor processes the join as an abandon.
+    run_until(&mut orch, |o| !o.state.running.contains_key("i-1")).await;
+
+    assert!(orch.state.running.is_empty());
+    assert!(
+        !orch.state.claimed.contains("i-1"),
+        "abandoned: the claim is released"
+    );
+    assert!(
+        !orch.state.leases.contains_key("i-1"),
+        "abandoned: the dispatch lease is dropped (a stale renewal can't revive it)"
+    );
+    assert!(
+        !orch.state.retry_attempts.contains_key("i-1"),
+        "abandon must not schedule a failure retry"
+    );
+    assert!(orch.state.blocked.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

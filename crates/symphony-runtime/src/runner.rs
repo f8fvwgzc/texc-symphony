@@ -81,6 +81,8 @@ impl Drop for UidWorkspaceSeal {
         match isolation::seal_workspace(&self.workspace) {
             // The uid is returned to the pool only now that its workspace is root-owned `0700`.
             Ok(()) => drop(lease),
+            // Already gone (e.g. a final run's workspace was removed): nothing to seal, release.
+            Err(_) if !self.workspace.exists() => drop(lease),
             Err(err) => {
                 tracing::error!(
                     "Quarantining task uid {uid}: could not seal {} before releasing it: {err}",

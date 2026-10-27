@@ -120,8 +120,8 @@ pub const LEASE_RENEW_TIMEOUT: Duration = Duration::from_secs(LEASE_RENEW_EVERY.
 const CANCEL_MARGIN: Duration = Duration::from_millis(500);
 /// Bound on waiting for an aborted worker to be dropped.
 const ABORT_WAIT: Duration = Duration::from_secs(5);
-/// How often the lease watchdog checks deadlines — short relative to `LEASE_STOP_WINDOW` so a run
-/// is cancelled well within the window even while the actor loop is parked.
+/// How often the lease watchdog checks deadlines — short relative to its backstop window (see
+/// [`lease_watchdog_backstop`]) so a run is cancelled in time even while the actor loop is parked.
 const LEASE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A running issue's dispatch-lease deadline and the token that cancels its worker. Shared between
@@ -129,41 +129,59 @@ const LEASE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct LeaseWatch {
     pub deadline: Instant,
     pub cancel: CancellationToken,
+    /// Set by the watchdog when it cancels this run, so the actor treats the worker's `Cancelled`
+    /// exit as an abandon (requeue, keep the sealed workspace, drop the lease) rather than a
+    /// failure. Read under the map lock in `handle_worker_joined`; cleared with the entry.
+    pub fenced: bool,
 }
 
 /// Issue id → [`LeaseWatch`]. A plain `std::sync::Mutex`: the critical sections are tiny and hold
 /// no `.await`.
 pub(crate) type LeaseWatchMap = Arc<Mutex<HashMap<String, LeaseWatch>>>;
 
+/// The watchdog backstop: a run is cancelled once its lease would expire within this margin. It
+/// must be (a) long enough to stop a worker before the lease lapses — `worker_cancel_grace` plus
+/// the cancel/abort margins plus a tick — and (b) strictly shorter than `LEASE_STOP_WINDOW`, so
+/// the watchdog fires *after* the actor's own `expiring_leases` fence would have. That ordering is
+/// what keeps the watchdog from undercutting the actor's "tolerate one missed renewal" behaviour:
+/// one timed-out renewal or a brief tracker/reconcile stall must not trip it, only a genuinely
+/// parked actor that has stopped renewing for far longer.
+fn lease_watchdog_backstop(worker_cancel_grace: Duration) -> Duration {
+    worker_cancel_grace + CANCEL_MARGIN + ABORT_WAIT + 2 * LEASE_WATCHDOG_INTERVAL
+}
+
 /// Cancels, independently of the actor loop, the worker of any run whose dispatch lease is within
-/// `LEASE_STOP_WINDOW` of expiry. The actor renews held leases every `LEASE_RENEW_EVERY`, pushing
-/// each deadline out, so this fires only once the actor loop is parked (for example on a slow
-/// store call on the dispatch path) and renewals have stopped — exactly when the actor's own
-/// `expiring_leases` fence cannot run. The cancelled worker exits through the normal path; the
-/// lease then lapses by TTL, and another replica takes the issue only after this run has already
-/// stopped, so two replicas never run one issue at once.
-async fn run_lease_watchdog(map: LeaseWatchMap, shutdown: CancellationToken) {
+/// `backstop` of expiry. The actor renews held leases every `LEASE_RENEW_EVERY`, pushing each
+/// deadline out, so this fires only once the actor loop has been parked long enough that renewals
+/// stopped and its own `expiring_leases` fence never ran. The cancelled worker exits through the
+/// normal path and the actor abandons it (see the `fenced` flag); the lease then lapses by TTL,
+/// and another replica takes the issue only after this run has stopped, so two replicas never run
+/// one issue at once.
+async fn run_lease_watchdog(map: LeaseWatchMap, shutdown: CancellationToken, backstop: Duration) {
     let mut ticker = tokio::time::interval(LEASE_WATCHDOG_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            _ = ticker.tick() => fire_expiring_lease_cancels(&map),
+            _ = ticker.tick() => fire_expiring_lease_cancels(&map, backstop),
         }
     }
 }
 
-/// Cancels the worker of every watched run within `LEASE_STOP_WINDOW` of its deadline. Idempotent:
+/// Marks and cancels the worker of every watched run within `backstop` of its deadline. Idempotent:
 /// an already-cancelled run is skipped, and entries are removed by `drop_lease` on the normal exit.
-fn fire_expiring_lease_cancels(map: &LeaseWatchMap) {
+fn fire_expiring_lease_cancels(map: &LeaseWatchMap, backstop: Duration) {
     let now = Instant::now();
-    let watches = map.lock().unwrap_or_else(|poison| poison.into_inner());
-    for (issue_id, watch) in watches.iter() {
-        if watch.deadline <= now + LEASE_STOP_WINDOW && !watch.cancel.is_cancelled() {
+    let mut watches = map.lock().unwrap_or_else(|poison| poison.into_inner());
+    for (issue_id, watch) in watches.iter_mut() {
+        if watch.deadline <= now + backstop && !watch.cancel.is_cancelled() {
             tracing::warn!(
-                "Stopping issue_id={issue_id}: its dispatch lease is within the stop window and \
+                "Stopping issue_id={issue_id}: its dispatch lease is within the backstop window and \
                  renewals have stalled; cancelling its run independently of the actor loop"
             );
+            // Mark before cancelling (same lock): the worker's `Cancelled` exit can only become
+            // visible after the cancel, so the actor always sees `fenced` first.
+            watch.fenced = true;
             watch.cancel.cancel();
         }
     }
@@ -449,6 +467,7 @@ impl<'w> Orchestrator<'w> {
         let watchdog = tokio::spawn(run_lease_watchdog(
             Arc::clone(&self.lease_watch),
             self.shutdown.clone(),
+            lease_watchdog_backstop(self.ctx.worker_cancel_grace),
         ));
         self.startup().await;
         while self.step().await {}
@@ -627,8 +646,19 @@ impl<'w> Orchestrator<'w> {
                 LeaseWatch {
                     deadline,
                     cancel: cancel.clone(),
+                    fenced: false,
                 },
             );
+    }
+
+    /// Whether the watchdog fenced (cancelled) this run's lease: its worker exit is an abandon, not
+    /// a failure.
+    fn lease_fenced(&self, issue_id: &str) -> bool {
+        self.lease_watch
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(issue_id)
+            .is_some_and(|watch| watch.fenced)
     }
 
     /// Pushes a renewed lease's deadline out in the watchdog map, matching `state.leases`.

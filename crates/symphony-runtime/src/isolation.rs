@@ -78,8 +78,8 @@ impl TaskUidPool {
             }
         }
         Err(unavailable(format!(
-            "no free task uid in {}..{end}: every uid in isolation.task_uids is busy (a live run \
-             or a leftover process)",
+            "no free task uid in {}..{end}: every uid in isolation.task_uids is busy (a live run, \
+             a leftover process, or a uid quarantined after a failed workspace seal)",
             self.first
         )))
     }
@@ -293,8 +293,8 @@ fn make_private(_path: &Path) -> Result<(), RunError> {
 /// restricted to `0700` and handed to root. The files inside keep the task's old uid, but a
 /// reused uid can no longer enter the sealed directory to read or tamper with them (for example to
 /// plant `.git/hooks`). `TaskIsolation::prepare` chowns the directory back to the next lease's uid
-/// when the task resumes. Sealing is an invariant on every uid-leased exit path; its failure must
-/// fail the run rather than leave a uid-owned tree beside a freed uid.
+/// when the task resumes. Sealing is an invariant on every uid-leased exit path; on failure the
+/// caller quarantines the uid (never reuses it) rather than freeing it beside a uid-owned tree.
 #[cfg(unix)]
 pub fn seal_workspace(path: &Path) -> Result<(), RunError> {
     make_private(path)?;
@@ -532,6 +532,34 @@ mod tests {
         let c = pool.lease().unwrap();
         assert_eq!(c.uid(), freed);
         drop((b, c));
+    }
+
+    /// A lease whose workspace could not be sealed is quarantined: its uid is never handed out
+    /// again (a reused uid must not reach an unsealed, uid-owned clone). As a non-root test process
+    /// the seal's `chown` to root fails, which is exactly the path the runner guard quarantines on.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_seal_quarantines_the_uid() {
+        use std::os::unix::fs::MetadataExt;
+        let pool = TaskUidPool::new(free_range(1), leased());
+        let lease = pool.lease().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        if std::fs::metadata(&ws).unwrap().uid() == 0 {
+            // Running as root (not expected in CI): the seal would succeed, so there is nothing to
+            // quarantine. Skip rather than assert the opposite.
+            return;
+        }
+        assert!(
+            seal_workspace(&ws).is_err(),
+            "a non-root process cannot chown the workspace to root"
+        );
+        lease.quarantine();
+        assert!(
+            pool.lease().is_err(),
+            "the quarantined uid is never leased again"
+        );
     }
 
     #[test]

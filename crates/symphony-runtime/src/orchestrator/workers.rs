@@ -141,6 +141,18 @@ impl Orchestrator<'_> {
         };
         self.record_session_completion_totals(&entry);
         let session_id = entry.session_id.clone().unwrap_or_else(|| "n/a".into());
+        // The watchdog cancelled this run because its lease was about to expire while the actor
+        // loop was parked. That `Cancelled` exit is an abandon, not a failure: don't mark the task
+        // Failed or remove its workspace — requeue it and hand the lease back.
+        if self.lease_fenced(&issue_id) {
+            self.abandon_fenced_run(&issue_id, entry);
+            tracing::warn!(
+                "Agent task abandoned for issue_id={issue_id} session_id={session_id}: dispatch \
+                 lease fence (actor loop could not renew in time)"
+            );
+            self.notify();
+            return;
+        }
         let reason = match &result {
             Ok(()) => "normal".to_owned(),
             Err(err) => err.to_string(),
@@ -150,6 +162,22 @@ impl Orchestrator<'_> {
             "Agent task finished for issue_id={issue_id} session_id={session_id} reason={reason}"
         );
         self.notify();
+    }
+
+    /// Cleans up a run the watchdog fenced ([`crate::orchestrator::LeaseWatch::fenced`]): its
+    /// `Cancelled` exit is not a failure. The workspace is kept (the runner already sealed it to
+    /// root) and a task is left `running` for recovery; the lease and claim are dropped so a stale
+    /// renewal cannot revive the lease and another replica can take the issue over.
+    fn abandon_fenced_run(&mut self, issue_id: &str, mut entry: RunningEntry) {
+        self.codex_streams.remove(&entry.run_id);
+        entry.recorder.finish(
+            RunStatus::Cancelled,
+            Some("dispatch lease fence".to_owned()),
+        );
+        self.drop_lease(issue_id);
+        self.state.claimed.remove(issue_id);
+        self.state.blocked.remove(issue_id);
+        self.remove_retry_entry(issue_id);
     }
 
     pub(crate) fn handle_agent_down(
