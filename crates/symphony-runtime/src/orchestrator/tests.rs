@@ -1483,6 +1483,66 @@ async fn an_issue_over_its_budget_is_stopped_and_blocked_with_cost_recorded() {
     assert_eq!(run.cost_micro_usd, 400);
 }
 
+/// Fix 2: on a shared store, `renew_leases` runs `enforce_spend` with no timeout around it, so a
+/// run it stops is released all the way — claim and dispatch lease dropped, not just removed from
+/// `running`. A timeout firing after `state.running.remove` but before `drop_lease`/`claimed.remove`
+/// would strand the task `running` with its lease renewed forever; this drives the exact path.
+#[tokio::test(start_paused = true)]
+async fn shared_store_renew_cycle_releases_a_spend_stopped_run_completely() {
+    let store = Store::open_in_memory_shared().unwrap();
+    assert!(
+        store.is_shared(),
+        "the renew/reconcile block only runs on a shared store"
+    );
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    // A held dispatch lease, as a shared-store run always has.
+    assert!(orch.take_lease("i-1").await);
+    assert!(orch.state.leases.contains_key("i-1"));
+
+    // Engage the kill switch and persist it, so `sync_kill_switch` (which runs first in the block)
+    // sees the store and memory agree and makes no change, leaving `enforce_spend` to stop the run.
+    let (reply, ack) = tokio::sync::oneshot::channel();
+    orch.handle_command(RuntimeCommand::SetPaused {
+        paused: true,
+        reason: Some("runaway spend".into()),
+        reply,
+    })
+    .await;
+    ack.await.unwrap();
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+
+    orch.renew_leases().await;
+
+    assert!(
+        orch.state.running.is_empty(),
+        "the stopped run left `running`"
+    );
+    assert!(
+        !orch.state.claimed.contains("i-1"),
+        "its claim was released"
+    );
+    assert!(
+        !orch.state.leases.contains_key("i-1"),
+        "its dispatch lease was dropped (not left to renew forever)"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stored_history_counts_toward_the_issue_budget_after_a_restart() {
     let store = Store::open_in_memory().unwrap();

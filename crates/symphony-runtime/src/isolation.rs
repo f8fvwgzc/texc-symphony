@@ -281,6 +281,23 @@ fn make_private(_path: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
+/// Seals a task workspace so a uid freed for reuse cannot reach this clone: the top directory is
+/// restricted to `0700` and handed to root. The files inside keep the task's old uid, but a
+/// reused uid can no longer enter the sealed directory to read or tamper with them (for example to
+/// plant `.git/hooks`). `TaskIsolation::prepare` chowns the directory back to the next lease's uid
+/// when the task resumes. Sealing is an invariant on every uid-leased exit path; its failure must
+/// fail the run rather than leave a uid-owned tree beside a freed uid.
+#[cfg(unix)]
+pub fn seal_workspace(path: &Path) -> Result<(), RunError> {
+    make_private(path)?;
+    chown(path, (0, 0))
+}
+
+#[cfg(not(unix))]
+pub fn seal_workspace(_path: &Path) -> Result<(), RunError> {
+    Ok(())
+}
+
 /// A real directory at `path` (not a symlink), created `0700` when missing.
 fn private_dir(path: &Path) -> Result<(), RunError> {
     match std::fs::symlink_metadata(path) {

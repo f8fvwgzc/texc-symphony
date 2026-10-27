@@ -348,26 +348,56 @@ async fn a_task_whose_network_cannot_be_confined_does_not_start_its_agent() {
     assert!(read(&s.trace).is_empty(), "the app-server never started");
 }
 
-/// Under isolation, a task runs as its own uid and must traverse `<root>` and `<root>/.tasks`
-/// (which umask 077 would otherwise leave 0700 root) to reach its own workspace, so both are 0711.
+/// Isolation without `task_uids` runs the task as Symphony's own uid, so it needs no extra
+/// traversal of `<root>`/`.tasks` and must not chmod them (an unconditional chmod EPERM'd on a
+/// root-owned chart volume Symphony does not own). The run completes and the workspace stays
+/// private. The traverse-bit logic itself is unit-tested in `workspace::tests`.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn task_workspace_parents_are_traversable_under_isolation() {
+async fn an_isolated_task_without_task_uids_leaves_provisioned_parents_untouched() {
     use std::os::unix::fs::PermissionsExt;
-    // Isolation present but no task_uids, so the run needs no root.
     let s = setup(json!({"network": {"mode": "allow"}}));
+    // Provision the root 0700, as a restrictive operator would; the run must not change it.
+    let root = s.wf.workspace_root();
+    fs::create_dir_all(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     let (ctx, _rx) = task_context(None);
     s.runner.run(ctx).await.unwrap();
-    for dir in [
-        s.wf.workspace_root(),
-        workspace(&s).parent().unwrap().to_path_buf(),
-    ] {
-        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o711, "{} is {mode:o}", dir.display());
-    }
+    let root_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(root_mode, 0o700, "the provisioned root is left untouched");
     // The task's own workspace stays private.
     let ws_mode = fs::metadata(workspace(&s)).unwrap().permissions().mode() & 0o777;
     assert_eq!(ws_mode, 0o700, "the task workspace is private");
+}
+
+/// Fix 3: the runner seals a task workspace before the uid lease drops on every exit path.
+/// `seal_workspace` always restricts the top directory to `0700` first, then hands it to root. A
+/// non-root process cannot complete the chown, so the failure is surfaced as an error — the runner
+/// turns that into a failed run rather than freeing the uid beside a uid-owned tree. As root the
+/// directory ends up owned by root. (Full root ordering is covered by the root-gated suite.)
+#[cfg(unix)]
+#[test]
+fn seal_workspace_restricts_then_reports_or_hands_to_root() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    fs::create_dir(&ws).unwrap();
+    fs::set_permissions(&ws, fs::Permissions::from_mode(0o777)).unwrap();
+    let result = symphony_runtime::isolation::seal_workspace(&ws);
+    let meta = fs::metadata(&ws).unwrap();
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o700,
+        "the sealed workspace is always restricted first"
+    );
+    match result {
+        Ok(()) => assert_eq!(meta.uid(), 0, "a sealed workspace is handed to root"),
+        Err(_) => assert_ne!(
+            meta.uid(),
+            0,
+            "a non-root process cannot hand it to root, and the failure is surfaced"
+        ),
+    }
 }
 
 fn task(id: i64) -> symphony_runtime::TaskSpec {

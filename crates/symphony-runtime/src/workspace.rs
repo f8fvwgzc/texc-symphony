@@ -422,17 +422,38 @@ impl WorkspaceManager {
                 tokio::fs::create_dir_all(&tasks)
                     .await
                     .map_err(|err| io_error("mkdir_p", &tasks, &err))?;
-                // Under task isolation Symphony runs with umask 077, so `create_dir_all` leaves
-                // the root and `.tasks` at 0700 owned by Symphony. A task runs as its own uid and
-                // must traverse them to reach its own 0700 workspace, so make them 0711
-                // (traverse, not list) — the per-task directory below stays private.
+                // Only under `task_uids` does a task run as a different uid that must traverse
+                // `<root>` and `.tasks` to reach its own `0700` workspace. There Symphony runs as
+                // root (umask 077 would otherwise leave these `0700`) and owns them, so ensure the
+                // "others" execute bit (traverse, not list). Add it only when it is missing, and
+                // never when it is already set: an operator-provisioned root we do not own (for
+                // example a root-owned `/workspaces` on the Helm chart) is already traversable, so
+                // skipping it avoids an EPERM that would fail every isolated task. Without
+                // `task_uids` the task runs as Symphony's own uid, needs no extra traversal, and
+                // Symphony may not own these directories, so leave them untouched.
                 #[cfg(unix)]
-                if self.settings.isolation.is_some() {
+                if self
+                    .settings
+                    .isolation
+                    .as_ref()
+                    .and_then(|iso| iso.task_uids)
+                    .is_some()
+                {
                     use std::os::unix::fs::PermissionsExt;
                     for dir in [root.as_path(), tasks.as_path()] {
-                        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))
+                        let mode = tokio::fs::metadata(dir)
+                            .await
+                            .map_err(|err| io_error("stat", dir, &err))?
+                            .permissions()
+                            .mode();
+                        if mode & 0o001 == 0 {
+                            tokio::fs::set_permissions(
+                                dir,
+                                std::fs::Permissions::from_mode(mode | 0o011),
+                            )
                             .await
                             .map_err(|err| io_error("chmod", dir, &err))?;
+                        }
                     }
                 }
                 path_safety::canonicalize(tasks.join(key))
@@ -968,5 +989,99 @@ mod tests {
             "worker-b ".into(),
         ];
         assert_eq!(worker_hosts(&settings), vec!["worker-a", "worker-b"]);
+    }
+
+    #[cfg(unix)]
+    fn isolation_settings(task_uids: bool) -> symphony_core::config::IsolationSettings {
+        symphony_core::config::IsolationSettings {
+            task_uids: task_uids.then_some(symphony_core::config::TaskUids {
+                first: 200_000,
+                count: 10,
+            }),
+            github_app: None,
+            network: symphony_core::config::NetworkIsolation::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn task_manager(
+        root: &Path,
+        isolation: symphony_core::config::IsolationSettings,
+    ) -> WorkspaceManager {
+        let mut settings = Settings::default();
+        settings.workspace.root = root.display().to_string();
+        settings.isolation = Some(isolation);
+        WorkspaceManager::new(
+            Arc::new(settings),
+            root.join("WORKFLOW.md"),
+            SshConfig::default(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn set_mode(dirs: &[PathBuf], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in dirs {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    fn modes(dirs: &[PathBuf]) -> Vec<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        dirs.iter()
+            .map(|dir| std::fs::metadata(dir).unwrap().permissions().mode() & 0o777)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn task_issue(id: &str) -> IssueContext {
+        IssueContext {
+            issue_id: Some(format!("task:{id}")),
+            identifier: Some(id.to_string()),
+        }
+    }
+
+    /// Under `task_uids` the task runs as a different uid and must traverse `<root>`/`.tasks`: the
+    /// traverse bit is added when missing, but a directory that is already traversable is left
+    /// untouched (so an operator-provisioned root we do not own is never chmod'd into an EPERM).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_parents_get_traverse_bit_only_when_missing_under_task_uids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let mgr = task_manager(&root, isolation_settings(true));
+        let parents = vec![root.clone(), root.join(TASK_WORKSPACES)];
+
+        // Provisioned 0700 (as umask 077 leaves them): create adds the traverse bit -> 0711.
+        std::fs::create_dir_all(root.join(TASK_WORKSPACES)).unwrap();
+        set_mode(&parents, 0o700);
+        mgr.create_for_issue(&task_issue("42"), None).await.unwrap();
+        assert_eq!(modes(&parents), vec![0o711, 0o711]);
+
+        // Already traversable with distinctive bits: create must not re-chmod them.
+        set_mode(&parents, 0o705);
+        mgr.create_for_issue(&task_issue("43"), None).await.unwrap();
+        assert_eq!(
+            modes(&parents),
+            vec![0o705, 0o705],
+            "already-traversable parents must be left untouched"
+        );
+    }
+
+    /// Without `task_uids` the task runs as Symphony's own uid and needs no extra traversal, so the
+    /// parents are left exactly as provisioned — Symphony may not own them (the regression was an
+    /// unconditional chmod that EPERM'd on a root-owned chart volume).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn task_parents_are_untouched_without_task_uids() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspaces");
+        let mgr = task_manager(&root, isolation_settings(false));
+        let parents = vec![root.clone(), root.join(TASK_WORKSPACES)];
+        std::fs::create_dir_all(root.join(TASK_WORKSPACES)).unwrap();
+        set_mode(&parents, 0o700);
+        mgr.create_for_issue(&task_issue("7"), None).await.unwrap();
+        assert_eq!(modes(&parents), vec![0o700, 0o700]);
     }
 }

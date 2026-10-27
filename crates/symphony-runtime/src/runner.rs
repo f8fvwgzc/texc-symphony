@@ -360,6 +360,17 @@ impl AgentRunner {
                     lease.uid()
                 );
             }
+            // Seal the workspace to root before the uid is freed. This is the single exit point
+            // for a uid-leased run, so it covers every outcome — success, failure, cancellation,
+            // timeout, and the blocked/requeued cases that keep the workspace — without each
+            // caller remembering to seal. The next task leased this uid must not be able to read
+            // or tamper with this clone; an unblock re-chowns it. A seal failure is a cross-task
+            // escape, so it fails the run (overriding the outcome) rather than freeing the uid
+            // beside a uid-owned tree.
+            if let Err(err) = isolation::seal_workspace(std::path::Path::new(&workspace)) {
+                drop(uid_lease);
+                return Err(err);
+            }
         }
         drop(uid_lease);
         result

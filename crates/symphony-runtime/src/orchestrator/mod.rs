@@ -377,11 +377,39 @@ impl<'w> Orchestrator<'w> {
                 continue;
             };
             match self.ctx.store.get_task(id).await {
-                Ok(Some(task)) if !task.status.is_final() => {}
+                Ok(Some(task)) if !task.status.is_final() => {
+                    self.seal_kept_task_workspace(id).await;
+                }
                 Ok(_) => self.remove_task_workspace(id),
                 Err(err) => tracing::warn!("Failed to read task {id}: {err}"),
             }
         }
+    }
+
+    /// Startup: a non-final task's workspace survived a crash still owned by the uid it last ran
+    /// as. Seal it to root (only under `task_uids`) so a reused uid cannot tamper with it before
+    /// the task resumes; if it cannot be sealed, remove it so the task re-clones rather than
+    /// resuming beside a uid-owned tree.
+    async fn seal_kept_task_workspace(&self, id: i64) {
+        #[cfg(unix)]
+        if self
+            .settings()
+            .isolation
+            .as_ref()
+            .and_then(|iso| iso.task_uids)
+            .is_some()
+        {
+            let path = self.task_workspace(id);
+            if let Err(err) = crate::isolation::seal_workspace(&path) {
+                tracing::warn!(
+                    "Removing task workspace {} (could not seal it on startup): {err}",
+                    path.display()
+                );
+                self.remove_task_workspace(id);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = id;
     }
 
     pub(crate) fn workspace_manager(&self, settings: &Arc<Settings>) -> WorkspaceManager {
@@ -630,8 +658,16 @@ impl<'w> Orchestrator<'w> {
         // is also bounded, so one stuck job cannot park the actor loop past a lease deadline.
         self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
         if self.ctx.store.is_shared() {
+            // `sync_kill_switch` and `recover_orphans` only read the shared control row and close
+            // other replicas' rows, so a stalled database must not park them past the schedule —
+            // bound each. `enforce_spend` is deliberately NOT bounded: it stops local runs, and
+            // stopping a run removes the `running` entry and then releases the task, the dispatch
+            // lease, and the claim. A timeout firing between those steps would drop the rest,
+            // stranding the task `running` with its lease renewed forever. Run-stopping must run
+            // to completion with no cancellation point; the lease fence above already protects
+            // against a slow `enforce_spend` delaying renewals.
             let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.sync_kill_switch()).await;
-            let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.enforce_spend()).await;
+            self.enforce_spend().await;
             let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.recover_orphans()).await;
         }
     }

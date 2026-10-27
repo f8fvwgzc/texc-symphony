@@ -116,6 +116,20 @@ impl Store {
         )
     }
 
+    /// A private in-memory database that reports [`Store::is_shared`] as `true`, so tests can
+    /// exercise the multi-replica dispatch path (lease renewal, kill-switch sync, orphan
+    /// recovery, spend enforcement) without a live PostgreSQL. SQLite cannot actually be shared
+    /// between processes; this only forces the in-process coordination that a shared store drives.
+    #[doc(hidden)]
+    pub fn open_in_memory_shared() -> Result<Store> {
+        let mut conn = Connection::open_in_memory()?;
+        schema::configure(&conn, false)?;
+        schema::migrate(&mut conn)?;
+        Store::spawn(":memory:".into(), None, true, always_healthy(), move || {
+            Ok(Box::new(SqliteDb(conn)))
+        })
+    }
+
     /// Connect to the PostgreSQL database at `url` (`postgres://user:pass@host:port/db`, libpq
     /// keywords such as `sslmode=require` included) and apply pending migrations. Several
     /// Symphony replicas may share one database: migrations are serialized and dispatch is
