@@ -348,6 +348,28 @@ async fn a_task_whose_network_cannot_be_confined_does_not_start_its_agent() {
     assert!(read(&s.trace).is_empty(), "the app-server never started");
 }
 
+/// Under isolation, a task runs as its own uid and must traverse `<root>` and `<root>/.tasks`
+/// (which umask 077 would otherwise leave 0700 root) to reach its own workspace, so both are 0711.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn task_workspace_parents_are_traversable_under_isolation() {
+    use std::os::unix::fs::PermissionsExt;
+    // Isolation present but no task_uids, so the run needs no root.
+    let s = setup(json!({"network": {"mode": "allow"}}));
+    let (ctx, _rx) = task_context(None);
+    s.runner.run(ctx).await.unwrap();
+    for dir in [
+        s.wf.workspace_root(),
+        workspace(&s).parent().unwrap().to_path_buf(),
+    ] {
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o711, "{} is {mode:o}", dir.display());
+    }
+    // The task's own workspace stays private.
+    let ws_mode = fs::metadata(workspace(&s)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(ws_mode, 0o700, "the task workspace is private");
+}
+
 fn task(id: i64) -> symphony_runtime::TaskSpec {
     symphony_runtime::TaskSpec {
         id,

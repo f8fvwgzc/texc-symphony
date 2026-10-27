@@ -417,10 +417,24 @@ impl WorkspaceManager {
     ) -> Result<String, WorkspaceError> {
         let workspace = match task_workspace_key(issue) {
             Some(key) if worker_host.is_none() => {
-                let tasks = self.local_root().join(TASK_WORKSPACES);
+                let root = self.local_root();
+                let tasks = root.join(TASK_WORKSPACES);
                 tokio::fs::create_dir_all(&tasks)
                     .await
                     .map_err(|err| io_error("mkdir_p", &tasks, &err))?;
+                // Under task isolation Symphony runs with umask 077, so `create_dir_all` leaves
+                // the root and `.tasks` at 0700 owned by Symphony. A task runs as its own uid and
+                // must traverse them to reach its own 0700 workspace, so make them 0711
+                // (traverse, not list) — the per-task directory below stays private.
+                #[cfg(unix)]
+                if self.settings.isolation.is_some() {
+                    use std::os::unix::fs::PermissionsExt;
+                    for dir in [root.as_path(), tasks.as_path()] {
+                        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o711))
+                            .await
+                            .map_err(|err| io_error("chmod", dir, &err))?;
+                    }
+                }
                 path_safety::canonicalize(tasks.join(key))
                     .map(|p| lossy(&p))
                     .map_err(WorkspaceError::Path)?

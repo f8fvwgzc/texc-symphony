@@ -258,6 +258,9 @@ impl Orchestrator<'_> {
         self.remove_retry_entry(issue_id);
         if let Some(task) = task_id(issue_id) {
             self.task_finish(task, TaskStatus::Blocked, None, Some(error.clone()));
+            // A blocked task keeps its workspace; hand it back to root so a re-leased uid cannot
+            // reach the clone before the task is unblocked.
+            self.seal_task_workspace(task);
         }
         self.state.claimed.insert(issue_id.to_owned());
         self.state.blocked.insert(

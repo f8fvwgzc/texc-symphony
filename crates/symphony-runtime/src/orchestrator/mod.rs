@@ -303,6 +303,46 @@ impl<'w> Orchestrator<'w> {
             .join(crate::workspace::TASK_WORKSPACES)
     }
 
+    /// Hands a blocked task's retained workspace back to root (`0700`), so a uid re-leased to the
+    /// next task cannot read or tamper with this task's clone (for example planting `.git/hooks`).
+    /// Only under `task_uids`; `TaskIsolation::prepare` chowns it back when the task is unblocked.
+    pub(crate) fn seal_task_workspace(&self, id: i64) {
+        if self
+            .settings()
+            .isolation
+            .as_ref()
+            .and_then(|iso| iso.task_uids)
+            .is_none()
+        {
+            return;
+        }
+        let path = self.task_workspace(id);
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await
+                {
+                    tracing::warn!(
+                        "Failed to restrict blocked task workspace {}: {err}",
+                        path.display()
+                    );
+                    return;
+                }
+                // The top directory to root: a reused uid then cannot enter it.
+                if let Err(err) = std::os::unix::fs::lchown(&path, Some(0), Some(0)) {
+                    tracing::warn!(
+                        "Failed to hand blocked task workspace {} to root: {err}",
+                        path.display()
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = &path;
+        });
+    }
+
     /// Removes task `id`'s workspace in the background (its agent is already stopped). Task
     /// workspaces run no workflow hooks.
     pub(crate) fn remove_task_workspace(&self, id: i64) {
@@ -584,12 +624,16 @@ impl<'w> Orchestrator<'w> {
                 }
             }
         }
-        if self.ctx.store.is_shared() {
-            self.sync_kill_switch().await;
-            self.enforce_spend().await;
-            self.recover_orphans().await;
-        }
+        // Re-arm the next renewal before the reconciliation calls below, so a store call that
+        // stalls on an unresponsive database cannot delay the schedule — the next renewal (and
+        // its `expiring_leases` check, the lease fence) fires on time. Each reconciliation call
+        // is also bounded, so one stuck job cannot park the actor loop past a lease deadline.
         self.spawn_timer(LEASE_RENEW_EVERY, TimerEvent::LeaseRenew);
+        if self.ctx.store.is_shared() {
+            let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.sync_kill_switch()).await;
+            let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.enforce_spend()).await;
+            let _ = tokio::time::timeout(LEASE_RENEW_TIMEOUT, self.recover_orphans()).await;
+        }
     }
 
     /// Adopts a kill-switch change another replica made (shared store), unless a local change is
