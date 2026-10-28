@@ -74,9 +74,9 @@ pub fn tool_response(success: bool, output: impl Into<String>) -> Value {
     })
 }
 
-/// Pretty JSON (`Jason.encode!(payload, pretty: true)`) used as tool output text.
+/// Compact JSON used as tool output text (Elixir sent pretty JSON; trackers encode the same way).
 pub fn encode_tool_payload(payload: &Value) -> String {
-    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+    payload.to_string()
 }
 
 fn content_items(output: &str) -> Value {
@@ -86,7 +86,7 @@ fn content_items(output: &str) -> Value {
 /// `normalize_dynamic_tool_result/1`.
 ///
 /// - A map with boolean `success` keeps every key; `output` is the existing string `output`, else the
-///   `text` of the first `contentItems` entry, else the pretty JSON of the result; `contentItems` is the
+///   `text` of the first `contentItems` entry, else the compact JSON of the result; `contentItems` is the
 ///   existing list, else `[{"type":"inputText","text":output}]`.
 /// - Anything else becomes a failure whose output is the value's compact JSON (Elixir used `inspect/1`).
 pub fn normalize_tool_result(result: Value) -> Value {
@@ -187,10 +187,10 @@ mod tests {
             "contentItems": [{"type": "inputText", "text": "boom"}]})
         );
 
-        let pretty = normalize_tool_result(json!({"success": true, "data": {"a": 1}}));
+        let derived = normalize_tool_result(json!({"success": true, "data": {"a": 1}}));
         assert_eq!(
-            pretty["output"],
-            json!("{\n  \"data\": {\n    \"a\": 1\n  },\n  \"success\": true\n}")
+            derived["output"],
+            json!(r#"{"data":{"a":1},"success":true}"#)
         );
 
         let odd = normalize_tool_result(json!(["not", "a", "map"]));

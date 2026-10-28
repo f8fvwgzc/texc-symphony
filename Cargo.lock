@@ -2682,6 +2682,8 @@ dependencies = [
  "hex",
  "libc",
  "liquid",
+ "liquid-core",
+ "liquid-lib",
  "serde",
  "serde_json",
  "serde_yaml_ng",

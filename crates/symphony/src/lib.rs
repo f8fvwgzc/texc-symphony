@@ -4,6 +4,7 @@
 //!
 //! - [`cli`]: argument and environment evaluation (exact Elixir usage / banner texts).
 //! - [`app`]: startup order, signal handling and graceful shutdown.
+//! - [`audit`]: `symphony workflow audit`, the build-time token audit of a workflow prompt.
 //! - [`logging`] / [`rotating`]: the 10 MiB × 5 rotating log file plus the stdout stream.
 //! - [`dashboard`]: the ANSI terminal dashboard (golden-fixture exact frames).
 //! - [`control`]: `symphony_server::ControlPlane` over `symphony_runtime::RuntimeHandle`.
@@ -15,6 +16,7 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod audit;
 pub mod before_remove;
 pub mod cli;
 pub mod control;

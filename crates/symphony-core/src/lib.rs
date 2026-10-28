@@ -6,6 +6,7 @@
 //!   `$VAR` resolution, per-tracker preflight validation, sandbox-policy helpers.
 //! - [`issue`]: the normalized tracker [`issue::Issue`] plus normalization helpers shared by adapters.
 //! - [`prompt`]: strict Liquid prompt rendering and continuation guidance.
+//! - [`reference`]: prompt reference sections loaded on demand (progressive disclosure).
 //! - [`path_safety`]: Elixir `Path.expand` semantics and symlink-resolving canonicalization.
 //! - [`workspace_key`]: the per-issue workspace directory name.
 //! - [`task`]: validation rules for tasks from the task API.
@@ -19,6 +20,7 @@ pub mod error;
 pub mod issue;
 pub mod path_safety;
 pub mod prompt;
+pub mod reference;
 pub mod task;
 pub mod workflow;
 pub mod workflow_store;

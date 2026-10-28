@@ -272,3 +272,64 @@ async fn poller_reloads_every_second_and_stops_on_cancel() {
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn malformed_reference_sections_reject_the_workflow_and_keep_the_last_good_one() {
+    let h = Harness::new();
+    let cases = [
+        (
+            "Intro\n<!-- reference rework: when in Rework -->\nbody",
+            "reference `rework` is not closed",
+        ),
+        (
+            "Intro\n<!-- reference Rework: when in Rework -->\nbody\n<!-- /reference -->",
+            "invalid reference name",
+        ),
+        (
+            "{% if attempt %}\n<!-- reference retry: when resuming -->\nRetry.\n<!-- /reference -->\n{% endif %}",
+            "outside Liquid blocks",
+        ),
+    ];
+    for (prompt, fragment) in cases {
+        write_workflow(&h.path(), &[("prompt", json!(prompt))]);
+        match h.store.force_reload() {
+            Err(ConfigError::WorkflowParseError(message)) => {
+                assert!(message.contains(fragment), "{prompt:?}: {message}");
+            }
+            other => panic!("{prompt:?}: unexpected {other:?}"),
+        }
+        assert_eq!(h.store.current().prompt, WORKFLOW_PROMPT);
+    }
+    let error = ConfigError::WorkflowParseError("invalid prompt reference: x".into());
+    assert_eq!(error.tag(), "workflow_parse_error");
+    assert!(
+        error
+            .user_message()
+            .starts_with("Failed to parse WORKFLOW.md: invalid prompt reference")
+    );
+
+    // Errors name the file line of the marker.
+    let content = "---\ntracker:\n  kind: memory\n---\n\nIntro\n<!-- /reference -->\n";
+    fs::write(h.path(), content).unwrap();
+    match h.store.force_reload() {
+        Err(ConfigError::WorkflowParseError(message)) => {
+            assert!(
+                message.starts_with("invalid prompt reference: line 7:"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // Liquid errors stay per-run failures, with or without sections.
+    write_workflow(
+        &h.path(),
+        &[(
+            "prompt",
+            json!(
+                "{{ issue.title | shout }}\n<!-- reference land: when merging -->\nLand.\n<!-- /reference -->"
+            ),
+        )],
+    );
+    assert_eq!(h.store.force_reload(), Ok(()));
+}

@@ -1,6 +1,6 @@
 //! Command-line evaluation (Elixir `SymphonyElixir.CLI`, blueprint A.2.1 / A.6), extended with
 //! `--host`, `--db-path`/`--no-db`, environment fallbacks, `--help`, `--version` and the
-//! `workspace before-remove` subcommand.
+//! `workspace before-remove` and `workflow audit` subcommands.
 //!
 //! [`evaluate`] is pure: the working directory, the environment and the file check are injected
 //! through [`CliContext`], so every rule is unit-tested without touching the process state.
@@ -76,6 +76,7 @@ pub fn acknowledgement_banner() -> String {
         Symphony polls the tracker configured in WORKFLOW.md, gives every eligible issue its own \
         workspace and drives a Codex app-server session in it.\n\n\
         Other commands:\n  symphony workspace before-remove [--branch <name>] [--repo <owner/name>]\n  \
+        symphony workflow audit [path-to-WORKFLOW.md]\n  \
         symphony init -- <command> [args...]",
     disable_help_subcommand = true,
     args_override_self = true
@@ -192,6 +193,36 @@ enum WorkspaceCommand {
     },
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "symphony workflow",
+    about = "WORKFLOW.md helpers.",
+    disable_help_subcommand = true,
+    args_override_self = true
+)]
+struct WorkflowArgs {
+    #[command(subcommand)]
+    command: WorkflowCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    /// Estimate the prompt's token cost and point out what could load on demand.
+    #[command(
+        long_about = "Estimates how many tokens the workflow prompt and the tool specs put in the \
+            agent's context for every model request, lists the reference sections loaded on demand \
+            with the `workflow_reference` tool, and reports bloat: large fenced blocks in the core \
+            prompt, sections too small to be worth a tool call, and a long prompt without sections. \
+            It reads the file only; nothing is sent anywhere.\n\n\
+            Usage:\n\n    symphony workflow audit\n    symphony workflow audit path/to/WORKFLOW.md"
+    )]
+    Audit {
+        /// Workflow file [env: SYMPHONY_WORKFLOW] [default: ./WORKFLOW.md]
+        #[arg(value_name = "path-to-WORKFLOW.md")]
+        workflow: Option<String>,
+    },
+}
+
 /// Run-history database selection from the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbChoice {
@@ -230,6 +261,8 @@ pub enum Command {
         /// `--repo`.
         repo: String,
     },
+    /// `symphony workflow audit`: the workflow file to audit (verified to be a regular file).
+    WorkflowAudit(PathBuf),
     /// `symphony agent-tools --socket <path>` (internal MCP server of the `claude_code` backend).
     AgentTools {
         /// The session's tool relay socket.
@@ -339,6 +372,9 @@ pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliE
     if args.get(1).is_some_and(|arg| arg == "workspace") {
         return evaluate_workspace(args);
     }
+    if args.get(1).is_some_and(|arg| arg == "workflow") {
+        return evaluate_workflow(args, ctx);
+    }
     if args.get(1).is_some_and(|arg| arg == "agent-tools") {
         return evaluate_agent_tools(args);
     }
@@ -405,14 +441,7 @@ pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliE
         (false, None) => DbChoice::FromEnv,
     };
 
-    let workflow = parsed
-        .workflow
-        .or_else(|| ctx.env_value(ENV_WORKFLOW))
-        .unwrap_or_else(|| "WORKFLOW.md".to_owned());
-    let workflow = expand_path(&workflow, Some(&ctx.cwd));
-    if !(ctx.file_regular)(&workflow) {
-        return Err(CliExit::WorkflowNotFound(workflow));
-    }
+    let workflow = workflow_path(parsed.workflow, ctx)?;
 
     Ok(Command::Run(Invocation {
         workflow,
@@ -423,17 +452,35 @@ pub fn evaluate(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliE
     }))
 }
 
+/// The workflow argument, else `SYMPHONY_WORKFLOW`, else `./WORKFLOW.md`; must be a regular file.
+fn workflow_path(argument: Option<String>, ctx: &CliContext<'_>) -> Result<PathBuf, CliExit> {
+    let workflow = argument
+        .or_else(|| ctx.env_value(ENV_WORKFLOW))
+        .unwrap_or_else(|| "WORKFLOW.md".to_owned());
+    let workflow = expand_path(&workflow, Some(&ctx.cwd));
+    if (ctx.file_regular)(&workflow) {
+        Ok(workflow)
+    } else {
+        Err(CliExit::WorkflowNotFound(workflow))
+    }
+}
+
+fn evaluate_workflow(args: &[OsString], ctx: &CliContext<'_>) -> Result<Command, CliExit> {
+    let argv =
+        std::iter::once(OsString::from("symphony workflow")).chain(args.iter().skip(2).cloned());
+    let parsed = WorkflowArgs::try_parse_from(argv).map_err(subcommand_exit)?;
+    match parsed.command {
+        WorkflowCommand::Audit { workflow } => {
+            Ok(Command::WorkflowAudit(workflow_path(workflow, ctx)?))
+        }
+    }
+}
+
 fn evaluate_workspace(args: &[OsString]) -> Result<Command, CliExit> {
     // `symphony workspace <sub> ...` -> program name `symphony workspace`, then `<sub> ...`.
     let argv =
         std::iter::once(OsString::from("symphony workspace")).chain(args.iter().skip(2).cloned());
-    let parsed = WorkspaceArgs::try_parse_from(argv).map_err(|err| match err.kind() {
-        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            CliExit::Help(err.render().to_string())
-        }
-        ErrorKind::DisplayVersion => CliExit::Version(err.render().to_string()),
-        _ => CliExit::InvalidOption(invalid_option_message(&err)),
-    })?;
+    let parsed = WorkspaceArgs::try_parse_from(argv).map_err(subcommand_exit)?;
     match parsed.command {
         WorkspaceCommand::BeforeRemove { branch, repo, .. } => {
             Ok(Command::BeforeRemove { branch, repo })
@@ -441,15 +488,20 @@ fn evaluate_workspace(args: &[OsString]) -> Result<Command, CliExit> {
     }
 }
 
-fn evaluate_agent_tools(args: &[OsString]) -> Result<Command, CliExit> {
-    let argv =
-        std::iter::once(OsString::from("symphony agent-tools")).chain(args.iter().skip(2).cloned());
-    let parsed = AgentToolsArgs::try_parse_from(argv).map_err(|err| match err.kind() {
+/// A subcommand's clap error: help to stdout, anything else is an invalid option.
+fn subcommand_exit(err: clap::Error) -> CliExit {
+    match err.kind() {
         ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
             CliExit::Help(err.render().to_string())
         }
         _ => CliExit::InvalidOption(invalid_option_message(&err)),
-    })?;
+    }
+}
+
+fn evaluate_agent_tools(args: &[OsString]) -> Result<Command, CliExit> {
+    let argv =
+        std::iter::once(OsString::from("symphony agent-tools")).chain(args.iter().skip(2).cloned());
+    let parsed = AgentToolsArgs::try_parse_from(argv).map_err(subcommand_exit)?;
     Ok(Command::AgentTools {
         socket: parsed.socket,
     })
@@ -473,12 +525,7 @@ fn evaluate_egress_shim(args: &[OsString]) -> Result<Command, CliExit> {
 
 fn evaluate_init(args: &[OsString]) -> Result<Command, CliExit> {
     let argv = std::iter::once(OsString::from("symphony init")).chain(args.iter().skip(2).cloned());
-    let parsed = InitArgs::try_parse_from(argv).map_err(|err| match err.kind() {
-        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            CliExit::Help(err.render().to_string())
-        }
-        _ => CliExit::InvalidOption(invalid_option_message(&err)),
-    })?;
+    let parsed = InitArgs::try_parse_from(argv).map_err(subcommand_exit)?;
     Ok(Command::Init {
         command: parsed.command,
     })
@@ -770,6 +817,38 @@ mod tests {
             .unwrap_err();
         assert_eq!(help.exit_code(), 0);
         assert!(help.message().contains("symphony workspace before-remove"));
+    }
+
+    #[test]
+    fn workflow_audit_resolves_the_workflow_like_a_run_without_the_ack_flag() {
+        let mut fx = Fixture::new();
+        assert_eq!(
+            fx.eval(&["workflow", "audit"]),
+            Ok(Command::WorkflowAudit(PathBuf::from("/work/WORKFLOW.md")))
+        );
+        assert_eq!(
+            fx.eval(&["workflow", "audit", "conf/W.md"]),
+            Ok(Command::WorkflowAudit(PathBuf::from("/work/conf/W.md")))
+        );
+        fx.env.insert(ENV_WORKFLOW, "/etc/symphony/WORKFLOW.md");
+        assert_eq!(
+            fx.eval(&["workflow", "audit"]),
+            Ok(Command::WorkflowAudit(PathBuf::from(
+                "/etc/symphony/WORKFLOW.md"
+            )))
+        );
+        fx.regular = false;
+        assert_eq!(
+            fx.eval(&["workflow", "audit", "missing.md"]),
+            Err(CliExit::WorkflowNotFound(PathBuf::from("/work/missing.md")))
+        );
+        let err = fx.eval(&["workflow", "audit", "--wat"]).unwrap_err();
+        assert_eq!(err.message(), "Invalid option(s): [{\"--wat\", nil}]");
+        let help = fx.eval(&["workflow"]).unwrap_err();
+        assert_eq!(help.exit_code(), 0);
+        assert!(help.message().contains("audit"));
+        let top = fx.eval(&["--help"]).unwrap_err();
+        assert!(top.message().contains("symphony workflow audit"));
     }
 
     #[test]

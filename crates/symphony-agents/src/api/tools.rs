@@ -9,6 +9,9 @@
 //! | `shell` | `command`, `timeout_ms?` | `bash -lc` in the sandbox, last 64 KiB of output |
 //! | `tracker` | the tracker tools' own arguments | as configured (scoped) |
 //!
+//! `workflow_reference` (the prompt's reference sections) is offered whenever the session's handler
+//! advertises it, whether or not `tracker` is enabled: the turn-1 prompt names it.
+//!
 //! Paths are relative to the workspace. Absolute paths must lie inside it, `..` is refused, and
 //! the nearest existing ancestor is canonicalized so symlinks cannot lead outside. On Linux the
 //! open and any parent creation are then resolved beneath the workspace directory
@@ -29,6 +32,7 @@ use symphony_codex::DynamicToolHandler;
 use symphony_codex::dynamic_tool::normalize_tool_result;
 use symphony_core::Issue;
 use symphony_core::config::SandboxMode;
+use symphony_core::reference::REFERENCE_TOOL;
 use tokio::io::AsyncReadExt;
 
 use super::sandbox::{self, Confinement, NetworkAccess};
@@ -76,6 +80,7 @@ pub struct Toolbox {
     workspace: PathBuf,
     enabled: Vec<String>,
     handler: Arc<dyn DynamicToolHandler>,
+    /// The handler's tools offered to the model.
     tracker_specs: Vec<Value>,
     shell: ShellPolicy,
 }
@@ -132,18 +137,21 @@ fn head(text: &str, max: usize) -> (&str, bool) {
 
 impl Toolbox {
     /// Tools for `workspace` (canonical): the enabled built-ins plus, with `tracker`, every tool
-    /// `handler` advertises.
+    /// `handler` advertises (without it, only its `workflow_reference`).
     pub fn new(
         workspace: PathBuf,
         enabled: Vec<String>,
         handler: Arc<dyn DynamicToolHandler>,
         shell: ShellPolicy,
     ) -> Self {
-        let tracker_specs = if enabled.iter().any(|t| t == "tracker") {
-            handler.tool_specs()
-        } else {
-            Vec::new()
-        };
+        let tracker = enabled.iter().any(|t| t == "tracker");
+        let tracker_specs = handler
+            .tool_specs()
+            .into_iter()
+            .filter(|spec| {
+                tracker || spec.get("name").and_then(Value::as_str) == Some(REFERENCE_TOOL)
+            })
+            .collect();
         Self {
             workspace,
             enabled,
@@ -933,6 +941,67 @@ mod tests {
             .open_beneath("a/b/c.txt", &ws.join("a/b/c.txt"), true)
             .unwrap();
         assert!(ws.join("a/b/c.txt").is_file());
+    }
+
+    /// A handler advertising a tracker tool and the prompt's `workflow_reference`.
+    struct Advertised;
+
+    #[async_trait::async_trait]
+    impl DynamicToolHandler for Advertised {
+        fn tool_specs(&self) -> Vec<Value> {
+            vec![
+                json!({"name": "linear_graphql", "description": "Linear", "inputSchema": {}}),
+                json!({"name": REFERENCE_TOOL, "description": "Sections", "inputSchema": {}}),
+            ]
+        }
+
+        async fn execute(&self, tool: Option<&str>, _arguments: Value, _issue: &Issue) -> Value {
+            json!({"success": true, "output": format!("ran {}", tool.unwrap_or_default())})
+        }
+    }
+
+    /// The turn-1 prompt names `workflow_reference`, so it is offered without the `tracker` group
+    /// (which still controls the tracker's own tools).
+    #[tokio::test]
+    async fn the_reference_tool_is_offered_without_the_tracker_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = |tools: &Toolbox| {
+            tools
+                .definitions()
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        let base = toolbox(dir.path(), &[]);
+        let with = |enabled: &[&str]| {
+            Toolbox::new(
+                base.workspace.clone(),
+                enabled.iter().map(|t| (*t).to_owned()).collect(),
+                Arc::new(Advertised),
+                base.shell.clone(),
+            )
+        };
+        let tools = with(&["read_file"]);
+        assert_eq!(names(&tools), ["read_file", REFERENCE_TOOL]);
+        let events = symphony_codex::EventSink::default();
+        let emitter = Emitter::new(&events, None);
+        let call = |name: &str| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: Ok(json!({"name": "rework"})),
+        };
+        let served = tools
+            .run(&call(REFERENCE_TOOL), &Issue::default(), &emitter)
+            .await;
+        assert_eq!(served.content, format!("ran {REFERENCE_TOOL}"));
+        assert!(!served.is_error);
+        let refused = tools
+            .run(&call("linear_graphql"), &Issue::default(), &emitter)
+            .await;
+        assert!(refused.is_error, "{}", refused.content);
+
+        let with_tracker = with(&["tracker"]);
+        assert_eq!(names(&with_tracker), ["linear_graphql", REFERENCE_TOOL]);
     }
 
     #[test]

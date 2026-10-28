@@ -308,7 +308,10 @@ impl ClaudeCodeBackend {
         match granted {
             Ok(relay) => Some(relay),
             Err(err) => {
-                tracing::warn!("Claude Code runs without the tracker tools: {err}");
+                // The prompt's reference stubs name `workflow_reference`; say it is gone too.
+                tracing::warn!(
+                    "Claude Code runs without Symphony's dynamic tools (tracker tools, workflow_reference): {err}"
+                );
                 None
             }
         }

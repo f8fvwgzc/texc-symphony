@@ -2,14 +2,17 @@
 //! session running up to `agent.max_turns` turns on the same thread.
 //!
 //! Steps: create/reuse the workspace (running `after_create` when new) → report runtime info →
-//! `before_run` → start the backend's session (`backends.<name>`, see `symphony_agents`; Codex
-//! runs locally through `bash -lc` or over SSH) with the tracker's dynamic tools → turns (turn 1
-//! renders the workflow prompt, wrapped by the backend's `prompt_template`; later turns send the
-//! continuation guidance) with an issue re-fetch between turns → stop the session → `after_run`.
+//! `before_run` → render the turn-1 prompt and its reference sections → start the backend's session
+//! (`backends.<name>`, see `symphony_agents`; Codex runs locally through `bash -lc` or over SSH) with
+//! the tracker's dynamic tools (plus `workflow_reference` when the prompt has reference sections) →
+//! turns (turn 1 sends the rendered prompt, wrapped by the backend's `prompt_template`; later turns
+//! send the continuation guidance) with an issue re-fetch between turns → stop the session →
+//! `after_run`.
 //!
 //! A **task** (task API) differs: no workflow hooks, the workspace starts empty or as a clone of
-//! the task's repository, the task prompt is sent as-is, there is exactly one turn, its final
-//! agent message is reported as the result, and `timeout_ms` bounds the whole run.
+//! the task's repository, the task prompt is sent as-is (no workflow prompt and no reference
+//! sections), there is exactly one turn, its final agent message is reported as the result, and
+//! `timeout_ms` bounds the whole run.
 //!
 //! `after_run` runs whenever the workspace exists: after success, after a failure, and — unlike Elixir
 //! (G4) — also when the orchestrator cancels the run (bounded by the cancellation grace period). It
@@ -30,11 +33,13 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use symphony_agents::{AgentSession, backend_for};
+use symphony_codex::dynamic_tool::{tool_response, unsupported_tool_payload};
 use symphony_codex::{DynamicToolHandler, StartOptions};
 use symphony_core::config::{BackendSettings, HooksSettings};
 use symphony_core::issue::normalize_state;
-use symphony_core::prompt::{build_turn_prompt, render_backend_prompt};
-use symphony_core::{Issue, Settings, WorkflowStore};
+use symphony_core::prompt::{build_run_prompt, continuation_prompt, render_backend_prompt};
+use symphony_core::reference::{self, REFERENCE_TOOL, Reference};
+use symphony_core::{Issue, LoadedWorkflow, Settings, WorkflowStore};
 use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
@@ -131,6 +136,65 @@ impl DynamicToolHandler for TrackerToolHandler {
             .execute(tool, &arguments, Some(issue))
             .await
             .to_value()
+    }
+}
+
+/// The dynamic tools of one agent run: the tracker's tools plus, when the turn-1 prompt has reference
+/// sections, the `workflow_reference` tool serving them (a snapshot rendered with the run's prompt).
+#[derive(Debug, Clone)]
+pub struct RunToolHandler {
+    tracker: TrackerToolHandler,
+    references: Arc<[Reference]>,
+    specs: Vec<Value>,
+}
+
+impl RunToolHandler {
+    /// `tracker`'s tools plus `references` (none: the tracker's tools only).
+    pub fn new(tracker: TrackerToolHandler, references: Vec<Reference>) -> Self {
+        let names: Vec<&str> = references.iter().map(|r| r.name.as_str()).collect();
+        let specs = reference::with_reference_tool(tracker.tool_specs(), &names);
+        Self {
+            tracker,
+            references: references.into(),
+            specs,
+        }
+    }
+
+    fn advertised(&self) -> impl Iterator<Item = &str> {
+        self.specs
+            .iter()
+            .filter_map(|spec| spec.get("name").and_then(Value::as_str))
+    }
+}
+
+#[async_trait]
+impl DynamicToolHandler for RunToolHandler {
+    fn tool_specs(&self) -> Vec<Value> {
+        self.specs.clone()
+    }
+
+    fn secret_environment_names(&self) -> Vec<String> {
+        self.tracker.secret_environment_names()
+    }
+
+    async fn execute(&self, tool: Option<&str>, arguments: Value, issue: &Issue) -> Value {
+        // Without sections every call is the tracker's, exactly as before.
+        if self.references.is_empty() {
+            return self.tracker.execute(tool, arguments, issue).await;
+        }
+        match tool {
+            Some(REFERENCE_TOOL) => match reference::lookup(&self.references, &arguments) {
+                Ok(section) => tool_response(true, section.text.clone()),
+                Err(payload) => tool_response(false, payload.to_string()),
+            },
+            Some(name) if self.advertised().any(|advertised| advertised == name) => {
+                self.tracker.execute(tool, arguments, issue).await
+            }
+            other => {
+                let names: Vec<&str> = self.advertised().collect();
+                tool_response(false, unsupported_tool_payload(other, &names).to_string())
+            }
+        }
     }
 }
 
@@ -310,7 +374,10 @@ impl AgentRunner {
     }
 
     async fn run_inner(&self, ctx: &WorkerContext) -> WorkerResult {
-        let mut settings = self.workflow.settings();
+        // One snapshot for the whole start-up, so the session's settings, tools and prompt come from
+        // the same version of the workflow file.
+        let snapshot = self.workflow.snapshot();
+        let mut settings = Arc::clone(&snapshot.settings);
         if ctx.task.is_some() {
             // Tasks bring their own repository (or none): the workflow's hooks are for issues.
             settings = Arc::new(Settings {
@@ -373,8 +440,15 @@ impl AgentRunner {
                     isolation.finish_workspace(std::path::Path::new(&workspace), cloned)?;
                 }
             }
-            self.run_in_workspace(ctx, &settings, &workspaces, &workspace, isolation.as_ref())
-                .await
+            self.run_in_workspace(
+                ctx,
+                &snapshot.workflow,
+                &settings,
+                &workspaces,
+                &workspace,
+                isolation.as_ref(),
+            )
+            .await
         };
         let limit = ctx
             .task
@@ -421,6 +495,7 @@ impl AgentRunner {
     async fn run_in_workspace(
         &self,
         ctx: &WorkerContext,
+        workflow: &LoadedWorkflow,
         settings: &Arc<Settings>,
         workspaces: &WorkspaceManager,
         workspace: &str,
@@ -439,16 +514,34 @@ impl AgentRunner {
             .backend(Some(&name))
             .ok_or(RunError::UnknownBackend(name))?;
         let backend = backend_for(&backend_settings, self.options.symphony_executable.clone());
+        // Rendered before the session starts: the reference sections decide the advertised tools. A
+        // task sends its own prompt, so it has neither a workflow prompt nor reference sections.
+        let (first_prompt, references) = if ctx.task.is_some() {
+            (None, Vec::new())
+        } else {
+            let run_prompt = build_run_prompt(Ok(workflow), &ctx.issue, ctx.attempt)?;
+            let reference_bytes: usize = run_prompt.references.iter().map(|r| r.text.len()).sum();
+            tracing::info!(
+                "Prepared turn-1 prompt for {} prompt_bytes={} references={} reference_bytes={reference_bytes}",
+                issue_log(&ctx.issue),
+                run_prompt.prompt.len(),
+                run_prompt.references.len()
+            );
+            (Some(run_prompt.prompt), run_prompt.references)
+        };
         // The tracker tools act with the operator's credential from Symphony's own network: an
         // isolated task (another tenant's work) gets none.
-        let tools: Arc<dyn symphony_codex::DynamicToolHandler> = if isolation.is_some() {
+        let tools: Arc<dyn DynamicToolHandler> = if isolation.is_some() {
             Arc::new(symphony_codex::NoDynamicTools)
         } else {
             let binding = self
                 .tracker
                 .bind_agent_tools(settings)
                 .map_err(RunError::ToolBinding)?;
-            Arc::new(TrackerToolHandler::new(binding))
+            Arc::new(RunToolHandler::new(
+                TrackerToolHandler::new(binding),
+                references,
+            ))
         };
         let mut options = StartOptions::new(
             workspace,
@@ -486,6 +579,7 @@ impl AgentRunner {
                 ctx,
                 workspace,
                 &backend_settings,
+                first_prompt,
                 isolation,
             )
             .await;
@@ -499,6 +593,7 @@ impl AgentRunner {
         ctx: &WorkerContext,
         workspace: &str,
         backend: &BackendSettings,
+        first_prompt: Option<String>,
         isolation: Option<&TaskIsolation>,
     ) -> WorkerResult {
         if let Some(task) = &ctx.task {
@@ -537,13 +632,12 @@ impl AgentRunner {
             .max(1);
         let mut issue = ctx.issue.clone();
         let mut turn = 1;
+        let mut first_prompt = first_prompt;
         loop {
-            let workflow = self.workflow.current();
-            let mut prompt =
-                build_turn_prompt(Ok(&workflow), &issue, ctx.attempt, turn, max_turns)?;
-            if turn == 1 {
-                prompt = wrap_prompt(backend, prompt, &issue, ctx.attempt)?;
-            }
+            let prompt = match first_prompt.take() {
+                Some(prompt) => wrap_prompt(backend, prompt, &issue, ctx.attempt)?,
+                None => continuation_prompt(turn, max_turns),
+            };
             let outcome = session.run_turn(&prompt, &issue, &ctx.events).await?;
             tracing::info!(
                 "Completed agent run for {} session_id={} workspace={workspace} turn={turn}/{max_turns}",

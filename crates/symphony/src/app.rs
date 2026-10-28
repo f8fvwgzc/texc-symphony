@@ -29,6 +29,7 @@ use symphony_trackers::TrackerDeps;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::audit;
 use crate::before_remove::{self, SystemRunner};
 use crate::cli::{self, CliContext, CliExit, Command, DbChoice, Invocation};
 use crate::control::RuntimeControlPlane;
@@ -65,6 +66,13 @@ pub fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Ok(Command::WorkflowAudit(path)) => match audit::audit_file(&path) {
+            Ok(report) => {
+                let _ = write!(std::io::stdout().lock(), "{report}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => fail(&message),
+        },
         Ok(Command::Run(invocation)) => run(invocation),
         Ok(Command::Init { command }) => crate::init::run(&command),
         Ok(Command::AgentTools { socket }) => {

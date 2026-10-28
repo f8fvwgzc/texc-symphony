@@ -17,6 +17,8 @@ tracing = { workspace = true }
 tokio-util = { workspace = true }
 serde_yaml_ng = { workspace = true }
 liquid = { workspace = true }
+liquid-core = { workspace = true }
+liquid-lib = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # Declared locally (not `workspace = true`) so this crate only opts into the timer/sync parts of tokio and

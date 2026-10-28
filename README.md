@@ -22,7 +22,9 @@ in it until the issue leaves those states. Everything is configured in one
 [`WORKFLOW.md`](WORKFLOW.md) file: YAML front matter for the tracker, workspace hooks, concurrency
 and Codex settings, and a Liquid template for the agent prompt. Agents reach the tracker through a
 tool that Symphony executes with host-side credentials, so tracker tokens never enter the agent's
-environment.
+environment. To keep token use down, situational parts of the prompt can be
+[reference sections](docs/configuration.md#reference-sections) that the agent loads only when they
+apply, and `symphony workflow audit` shows what a prompt costs per model request.
 
 **Agent backends.** `backends:` in `WORKFLOW.md` defines what runs the work
 ([`docs/agents.md`](docs/agents.md)): `codex` (the Codex app-server, the default), `claude_code`
