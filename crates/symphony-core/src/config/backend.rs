@@ -153,6 +153,9 @@ pub struct ApiBackendSettings {
     pub temperature: Option<f64>,
     /// Stream responses (default `true`); `false` for servers with broken streaming.
     pub stream: bool,
+    /// Anthropic wire: mark prompt-cache breakpoints (`cache_control`) on the tools, the system
+    /// prompt and the newest message (default `true`); `false` for servers that reject the field.
+    pub prompt_cache: bool,
     /// Bound on one model request in ms (`> 0`, default 600 000).
     pub request_timeout_ms: u64,
     /// `shell` confinement.
@@ -430,6 +433,7 @@ fn api_from_contract(llm: &LlmConnection) -> ApiBackendSettings {
         max_output_tokens: 8192,
         temperature: None,
         stream: true,
+        prompt_cache: true,
         request_timeout_ms: llm.timeout_secs.map_or(600_000, |s| s.saturating_mul(1000)),
         sandbox: SandboxMode::Auto,
         network: false,
@@ -599,6 +603,7 @@ fn cast_api(
             .unwrap_or(8192),
         temperature,
         stream: entry.boolean("stream", errors).unwrap_or(true),
+        prompt_cache: entry.boolean("prompt_cache", errors).unwrap_or(true),
         request_timeout_ms: entry
             .positive("request_timeout_ms", errors)
             .unwrap_or_else(|| {

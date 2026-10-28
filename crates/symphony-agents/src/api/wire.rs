@@ -90,6 +90,9 @@ pub struct Request<'a> {
     pub temperature: Option<f64>,
     /// Ask for a streamed response.
     pub stream: bool,
+    /// Mark prompt-cache breakpoints (Anthropic wire; OpenAI-compatible servers cache by
+    /// themselves).
+    pub prompt_cache: bool,
 }
 
 /// Parses `raw` tool arguments (`""` is `{}`).
