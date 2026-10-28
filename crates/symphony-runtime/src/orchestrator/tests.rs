@@ -453,6 +453,42 @@ async fn abnormal_worker_exit_increments_retry_attempt_progressively() {
     assert!((39_500..=40_500).contains(&retry_due_in(&orch, "i-1")));
 }
 
+/// `agent.max_retry_attempts` failed retries in a row block the issue instead of a further retry;
+/// it is released once it leaves the active states.
+#[tokio::test(start_paused = true)]
+async fn failed_retries_stop_at_the_retry_limit_and_block_the_issue() {
+    let mut h = Harness::new(
+        json!({"agent": {"max_retry_attempts": 2}}),
+        result_factory(|| Err(RunError::Other("boom".into()))),
+    );
+    h.memory.set(vec![issue("i-1", "MT-559", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-559", "In Progress"), None, None)
+        .await;
+
+    // The first run and the two retries fail; a third retry would pass the limit.
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    let blocked = &orch.state.blocked["i-1"];
+    assert_eq!(
+        blocked.error,
+        "retry limit reached: 2 retries failed (last error: agent exited: boom)"
+    );
+    assert_eq!(blocked.identifier, "MT-559");
+    assert!(!orch.state.retry_attempts.contains_key("i-1"));
+    assert!(
+        orch.state.claimed.contains("i-1"),
+        "a blocked issue stays claimed"
+    );
+    assert!(orch.state.running.is_empty());
+
+    // Leaving the active states releases it.
+    h.memory.set(vec![issue("i-1", "MT-559", "Backlog")]);
+    orch.reconcile_blocked_issues().await;
+    assert!(!orch.state.blocked.contains_key("i-1"));
+    assert!(!orch.state.claimed.contains("i-1"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn continuation_requeued_without_slots_waits_twenty_seconds() {
     let started = Arc::new(Mutex::new(Vec::new()));

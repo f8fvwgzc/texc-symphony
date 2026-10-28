@@ -254,14 +254,14 @@ impl Orchestrator<'_> {
                     .recorder
                     .finish(RunStatus::Failed, Some(error.clone()));
                 let next = next_retry_attempt_from_running(&entry);
-                self.schedule_issue_retry(
+                self.retry_failed_run(
                     issue_id,
                     next,
                     RetryMeta {
                         error: Some(error),
                         ..meta
                     },
-                    DelayType::Failure,
+                    &entry.issue,
                 );
             }
         }

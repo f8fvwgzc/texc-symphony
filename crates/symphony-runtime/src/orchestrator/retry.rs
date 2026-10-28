@@ -72,6 +72,55 @@ impl Orchestrator<'_> {
         self.remove_retry_entry(issue_id);
     }
 
+    /// Retries a failed run of `issue` (`attempt = None`: previous attempt + 1), unless it would be
+    /// retry number `agent.max_retry_attempts + 1`: then the issue is blocked like one waiting for an
+    /// operator, and released when it leaves the active states or this worker's routing. A run that
+    /// ends normally restarts the count (its continuation is attempt 1).
+    pub(crate) fn retry_failed_run(
+        &mut self,
+        issue_id: &str,
+        attempt: Option<u32>,
+        meta: RetryMeta,
+        issue: &Issue,
+    ) {
+        let attempt = attempt.unwrap_or_else(|| {
+            self.state
+                .retry_attempts
+                .get(issue_id)
+                .map_or(0, |previous| previous.attempt)
+                + 1
+        });
+        let limit = self.settings().agent.max_retry_attempts;
+        if attempt <= limit {
+            self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::Failure);
+            return;
+        }
+        let error = format!(
+            "retry limit reached: {limit} retries failed (last error: {})",
+            meta.error.as_deref().unwrap_or("unknown")
+        );
+        let identifier = meta.identifier.unwrap_or_else(|| issue_id.to_owned());
+        tracing::warn!("Blocking issue_id={issue_id} issue_identifier={identifier}: {error}");
+        self.remove_retry_entry(issue_id);
+        self.state.claimed.insert(issue_id.to_owned());
+        self.state.blocked.insert(
+            issue_id.to_owned(),
+            BlockedEntry {
+                identifier,
+                issue: Some(issue.clone()),
+                worker_host: meta.worker_host,
+                workspace_path: meta.workspace_path,
+                session_id: None,
+                error,
+                blocked_at: Utc::now(),
+                last_codex_message: None,
+                last_codex_event: None,
+                last_codex_timestamp: None,
+            },
+        );
+        self.notify();
+    }
+
     /// `schedule_issue_retry/4`. `attempt = None` means "previous attempt + 1". The issue stays (or
     /// becomes) claimed while queued.
     pub(crate) fn schedule_issue_retry(

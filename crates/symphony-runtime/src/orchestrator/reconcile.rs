@@ -147,6 +147,7 @@ impl Orchestrator<'_> {
                     continue;
                 }
                 let next = next_retry_attempt_from_running(entry);
+                let issue = entry.issue.clone();
                 // G8 fix: keep the host and workspace so the retry prefers the same machine.
                 let meta = RetryMeta {
                     identifier: Some(identifier),
@@ -156,7 +157,7 @@ impl Orchestrator<'_> {
                     workspace_path: entry.workspace_path.clone(),
                 };
                 self.terminate_running_issue(&id, false, &error).await;
-                self.schedule_issue_retry(&id, next, meta, DelayType::Failure);
+                self.retry_failed_run(&id, next, meta, &issue);
             }
         }
     }
