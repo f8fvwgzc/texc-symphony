@@ -327,6 +327,7 @@ mod tests {
             max_tokens: 64,
             temperature: None,
             stream: true,
+            prompt_cache: true,
         };
         let sent = body(&request, false);
         assert_eq!(

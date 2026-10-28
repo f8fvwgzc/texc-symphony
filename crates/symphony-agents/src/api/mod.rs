@@ -263,6 +263,7 @@ impl ApiSession {
             max_tokens: self.api.max_output_tokens,
             temperature: self.api.temperature,
             stream: self.api.stream,
+            prompt_cache: self.api.prompt_cache,
         };
         let body = self.wire.body(&request);
         let url = self.wire.url(&self.api.base_url);

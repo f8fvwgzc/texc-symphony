@@ -80,6 +80,7 @@ fn api(provider: ApiProvider, base_url: &str, stream: bool) -> ApiBackendSetting
         max_output_tokens: 256,
         temperature: None,
         stream,
+        prompt_cache: true,
         request_timeout_ms: 10_000,
         sandbox: SandboxMode::None,
         network: false,

@@ -42,6 +42,7 @@ async fn one_turn(provider: ApiProvider, base_url: String, key_env: &str, model:
             max_output_tokens: 256,
             temperature: Some(0.0),
             stream: true,
+            prompt_cache: true,
             request_timeout_ms: 120_000,
             sandbox: SandboxMode::None,
             network: false,

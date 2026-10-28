@@ -1,6 +1,15 @@
 //! Anthropic Messages API wire format (`POST /v1/messages`, `anthropic-version: 2023-06-01`).
 //!
 //! Input usage counts `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
+//!
+//! Prompt caching ([`Request::prompt_cache`]): an agent loop re-sends its whole conversation on
+//! every model call, so each request marks three cache breakpoints (of the four allowed). The last
+//! tool definition caches the tools, which are the same for every session of a workflow; the
+//! system prompt caches tools and system, fixed for the session; and the last block of the newest
+//! message moves forward with the conversation, so each call reads the previous ones from the cache.
+//! A call appends at most three positions (text, a `tool_use` run, a `tool_result` run), well
+//! inside the 20 positions a breakpoint looks back for an earlier entry. Prefixes below the model's
+//! minimum cacheable length are simply not cached.
 
 use std::collections::BTreeMap;
 
@@ -52,29 +61,55 @@ fn message_json(message: &Message) -> Option<Value> {
     }
 }
 
+fn cache_control() -> Value {
+    json!({"type": "ephemeral"})
+}
+
+/// Marks the last content block of `message` as a cache breakpoint (a string content becomes one
+/// text block).
+fn mark_last_block(message: &mut Value) {
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    if let Value::String(text) = content {
+        *content = json!([{"type": "text", "text": text}]);
+    }
+    if let Some(Value::Object(block)) = content.as_array_mut().and_then(|blocks| blocks.last_mut())
+    {
+        block.insert("cache_control".into(), cache_control());
+    }
+}
+
 pub(super) fn body(request: &Request<'_>) -> Value {
+    let cache = request.prompt_cache;
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("max_tokens".into(), json!(request.max_tokens));
-    body.insert("system".into(), json!(request.system));
-    body.insert(
-        "messages".into(),
-        Value::Array(request.messages.iter().filter_map(message_json).collect()),
-    );
+    // An empty text block is invalid, so an empty system prompt stays a plain string.
+    let system = if cache && !request.system.is_empty() {
+        json!([{"type": "text", "text": request.system, "cache_control": cache_control()}])
+    } else {
+        json!(request.system)
+    };
+    body.insert("system".into(), system);
+    let mut messages: Vec<Value> = request.messages.iter().filter_map(message_json).collect();
+    if cache && let Some(last) = messages.last_mut() {
+        mark_last_block(last);
+    }
+    body.insert("messages".into(), Value::Array(messages));
     if !request.tools.is_empty() {
-        body.insert(
-            "tools".into(),
-            Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({"name": t.name, "description": t.description,
-                        "input_schema": t.schema})
-                    })
-                    .collect(),
-            ),
-        );
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({"name": t.name, "description": t.description,
+                "input_schema": t.schema})
+            })
+            .collect();
+        if cache && let Some(Value::Object(last)) = tools.last_mut() {
+            last.insert("cache_control".into(), cache_control());
+        }
+        body.insert("tools".into(), Value::Array(tools));
     }
     if let Some(temperature) = request.temperature {
         body.insert("temperature".into(), json!(temperature));
@@ -322,6 +357,7 @@ mod tests {
             max_tokens: 100,
             temperature: Some(0.5),
             stream: true,
+            prompt_cache: false,
         });
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
@@ -333,6 +369,79 @@ mod tests {
             json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "hello",
                 "is_error": false})
         );
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_mark_tools_system_and_the_newest_block() {
+        let tools = vec![
+            ToolDef {
+                name: "read_file".into(),
+                description: "Read".into(),
+                schema: json!({"type": "object"}),
+            },
+            ToolDef {
+                name: "shell".into(),
+                description: "Run".into(),
+                schema: json!({"type": "object"}),
+            },
+        ];
+        let request = |messages: &[Message], system: &'static str| {
+            body(&Request {
+                model: "claude-x",
+                system,
+                messages,
+                tools: &tools,
+                max_tokens: 100,
+                temperature: None,
+                stream: true,
+                prompt_cache: true,
+            })
+        };
+        let marker = json!({"type": "ephemeral"});
+        let prompt = vec![Message::User("do it".into())];
+        let sent = request(&prompt, "sys");
+        assert_eq!(sent["tools"][0].get("cache_control"), None);
+        assert_eq!(sent["tools"][1]["cache_control"], marker);
+        assert_eq!(
+            sent["system"],
+            json!([{"type": "text", "text": "sys", "cache_control": marker}])
+        );
+        assert_eq!(
+            sent["messages"][0]["content"],
+            json!([{"type": "text", "text": "do it", "cache_control": marker}])
+        );
+        assert_eq!(request(&prompt, "")["system"], "", "no empty text block");
+
+        // The breakpoint moves to the newest message; earlier ones are sent unmarked.
+        let mut history = prompt.clone();
+        history.push(Message::Assistant {
+            text: "Looking.".into(),
+            tool_calls: vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "shell".into(),
+                arguments: Ok(json!({"command": "ls"})),
+            }],
+        });
+        history.push(Message::ToolResults(vec![
+            ToolOutcome {
+                id: "toolu_1".into(),
+                content: "a".into(),
+                is_error: false,
+            },
+            ToolOutcome {
+                id: "toolu_2".into(),
+                content: "b".into(),
+                is_error: false,
+            },
+        ]));
+        let sent = request(&history, "sys");
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "do it");
+        assert_eq!(messages[1]["content"][1].get("cache_control"), None);
+        assert_eq!(messages[2]["content"][0].get("cache_control"), None);
+        assert_eq!(messages[2]["content"][1]["cache_control"], marker);
+        let marks = sent.to_string().matches("cache_control").count();
+        assert_eq!(marks, 3, "at most four breakpoints are allowed");
     }
 
     #[test]
