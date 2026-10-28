@@ -1340,3 +1340,212 @@ async fn a_failed_dependency_fails_its_dependants_transitively() {
         vec![(a.id, TaskStatus::Queued), (b.id, TaskStatus::Cancelled)]
     );
 }
+
+fn retrying(prompt: &str, retry: symphony_store::TaskRetry) -> symphony_store::NewTask {
+    symphony_store::NewTask {
+        retry,
+        ..task(prompt)
+    }
+}
+
+/// Starts `id` as `owner` would: the dispatch lease first, then the claim.
+async fn start_as(store: &Store, id: i64, owner: &str) {
+    assert!(
+        store
+            .acquire_lease(format!("task:{id}"), owner, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+    store.start_task(id).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn failed_runs_are_retried_by_the_task_policy() {
+    use symphony_store::{TaskFailure, TaskRetry, TaskStatus};
+    let store = memory();
+    let fail = |id: i64, failure: TaskFailure| {
+        store.finish_task_run(
+            id,
+            TaskStatus::Failed,
+            None,
+            Some("agent exited: boom".into()),
+            Some(failure),
+            "a".into(),
+        )
+    };
+    // A long backoff: queued again, but not dispatched before it is over.
+    let slow = store
+        .create_task(retrying(
+            "slow",
+            TaskRetry {
+                max_attempts: 2,
+                backoff_ms: 60_000,
+                max_backoff_ms: 60_000,
+                on: vec![TaskFailure::Error],
+            },
+        ))
+        .await
+        .unwrap();
+    start_as(&store, slow.id, "a").await;
+    let queued = fail(slow.id, TaskFailure::Error).await.unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::Queued);
+    assert_eq!(queued.failed_attempts, 1);
+    assert_eq!(queued.error.as_deref(), Some("agent exited: boom"));
+    let due = queued.next_attempt_at.unwrap() - Utc::now();
+    assert!(due > ChronoDuration::seconds(50), "{due}");
+    assert!(store.queued_tasks(10).await.unwrap().is_empty());
+
+    // No backoff: retried until the attempts run out.
+    let quick = store
+        .create_task(retrying(
+            "quick",
+            TaskRetry {
+                max_attempts: 2,
+                backoff_ms: 0,
+                max_backoff_ms: 0,
+                on: vec![TaskFailure::Error, TaskFailure::Timeout],
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        quick.retry.on,
+        vec![TaskFailure::Error, TaskFailure::Timeout]
+    );
+    start_as(&store, quick.id, "a").await;
+    let again = fail(quick.id, TaskFailure::Timeout).await.unwrap().unwrap();
+    assert_eq!(
+        (again.status, again.next_attempt_at),
+        (TaskStatus::Queued, None)
+    );
+    assert_eq!(store.queued_tasks(10).await.unwrap()[0].id, quick.id);
+    start_as(&store, quick.id, "a").await;
+    let failed = fail(quick.id, TaskFailure::Error).await.unwrap().unwrap();
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert_eq!(failed.failed_attempts, 2);
+    assert_eq!(failed.attempts, 2);
+    assert!(failed.finished_at.is_some());
+    // Unblocking gives the policy's attempts back.
+    let unblocked = store.requeue_task(quick.id, None).await.unwrap().unwrap();
+    assert_eq!(
+        (unblocked.status, unblocked.failed_attempts),
+        (TaskStatus::Queued, 0)
+    );
+
+    // A kind the policy does not retry (the default retries interruptions only) ends the task.
+    let plain = store.create_task(task("plain")).await.unwrap();
+    assert_eq!(plain.retry, TaskRetry::default());
+    start_as(&store, plain.id, "a").await;
+    let ended = fail(plain.id, TaskFailure::Error).await.unwrap().unwrap();
+    assert_eq!(ended.status, TaskStatus::Failed);
+    assert!(matches!(
+        store
+            .create_task(retrying(
+                "bad",
+                TaskRetry {
+                    max_attempts: 0,
+                    ..TaskRetry::default()
+                }
+            ))
+            .await,
+        Err(StoreError::InvalidArgument(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_replica_that_lost_the_lease_cannot_write_the_task() {
+    use symphony_store::TaskStatus;
+    let store = memory();
+    let task_a = store.create_task(task("taken over")).await.unwrap();
+    start_as(&store, task_a.id, "replica-b").await;
+    // Replica a's late finish and release are refused: b holds the lease.
+    assert_eq!(
+        store
+            .finish_task_run(
+                task_a.id,
+                TaskStatus::Succeeded,
+                Some("stale".into()),
+                None,
+                None,
+                "replica-a".into(),
+            )
+            .await
+            .unwrap(),
+        None
+    );
+    let unchanged = store
+        .release_task(task_a.id, "stale", Some("replica-a".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.status, TaskStatus::Running);
+    // The holder's write lands.
+    let done = store
+        .finish_task_run(
+            task_a.id,
+            TaskStatus::Succeeded,
+            Some("fresh".into()),
+            None,
+            None,
+            "replica-b".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.result.as_deref(), Some("fresh"));
+}
+
+#[tokio::test]
+async fn interrupted_runs_use_up_attempts_and_hand_offs_do_not() {
+    use symphony_store::{TaskRetry, TaskStatus};
+    let store = memory();
+    let interrupted = store.create_task(task("crashy")).await.unwrap();
+    // A hand-off (kill switch, shutdown) is not an attempt that failed.
+    store.start_task(interrupted.id).await.unwrap();
+    let handed = store
+        .release_task(interrupted.id, "shutdown; queued again", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (handed.status, handed.failed_attempts),
+        (TaskStatus::Queued, 0)
+    );
+    // The default policy allows three attempts; the third interruption fails the task.
+    for round in 1..=3u32 {
+        store.start_task(interrupted.id).await.unwrap().unwrap();
+        assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
+        let now = store.get_task(interrupted.id).await.unwrap().unwrap();
+        assert_eq!(now.failed_attempts, round);
+        if round < 3 {
+            assert_eq!(now.status, TaskStatus::Queued);
+            assert_eq!(
+                now.next_attempt_at, None,
+                "an interruption is retried at once"
+            );
+        } else {
+            assert_eq!(now.status, TaskStatus::Failed);
+            assert_eq!(
+                now.error.as_deref(),
+                Some("interrupted by restart; no attempts left")
+            );
+        }
+    }
+    // A policy without `interrupted` fails at the first interruption.
+    let strict = store
+        .create_task(retrying(
+            "strict",
+            TaskRetry {
+                on: Vec::new(),
+                ..TaskRetry::default()
+            },
+        ))
+        .await
+        .unwrap();
+    store.start_task(strict.id).await.unwrap();
+    store.requeue_interrupted_tasks().await.unwrap();
+    assert_eq!(
+        store.get_task(strict.id).await.unwrap().unwrap().status,
+        TaskStatus::Failed
+    );
+}

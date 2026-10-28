@@ -426,3 +426,59 @@ async fn the_plan_orders_tasks_without_creating_any() {
     let (status, _) = harness.get("/api/v1/tasks/plan").await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn a_retry_policy_is_validated_and_reported() {
+    let harness = harness();
+    let (status, task) = post(
+        &harness,
+        "/api/v1/tasks",
+        json!({"prompt": "x", "retry": {"max_attempts": 4, "on": ["error", "timeout"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{task}");
+    assert_schema("Task", &task);
+    assert_eq!(
+        task["retry"],
+        json!({"max_attempts": 4, "backoff_ms": 10000, "max_backoff_ms": 300000,
+            "on": ["error", "timeout"]})
+    );
+    assert_eq!(task["failed_attempts"], 0);
+    assert_eq!(task["next_attempt_at"], Value::Null);
+    for (body, message) in [
+        (
+            json!({"max_attempts": 0}),
+            "retry.max_attempts must be between 1 and 20",
+        ),
+        (
+            json!({"max_attempts": 21}),
+            "retry.max_attempts must be between 1 and 20",
+        ),
+        (
+            json!({"backoff_ms": 5000, "max_backoff_ms": 10}),
+            "retry.max_backoff_ms must be at least retry.backoff_ms",
+        ),
+    ] {
+        let (status, error) = post(
+            &harness,
+            "/api/v1/tasks",
+            json!({"prompt": "x", "retry": body.clone()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(error, envelope("invalid_parameter", message), "{body}");
+    }
+    for retry in [json!({"on": ["crash"]}), json!({"tries": 2})] {
+        let (status, _) = post(
+            &harness,
+            "/api/v1/tasks",
+            json!({"prompt": "x", "retry": retry}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown values and fields are refused"
+        );
+    }
+}

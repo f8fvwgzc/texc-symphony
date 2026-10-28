@@ -6,6 +6,13 @@
 //! ones through the orchestrator. A `running` task whose dispatch lease (`task:<id>`, see
 //! `leases`) is gone was interrupted (its process stopped) and goes back to `queued`.
 //!
+//! Retries (`task_retry`): a run that ends in a failure the task's policy retries (`error`,
+//! `timeout`, `interrupted`) while fewer than `max_attempts` attempts have failed goes back to
+//! `queued`, not before `backoff_ms * 2^(failures - 1)` (at most `max_backoff_ms`; at once after an
+//! interruption). A run handed off on purpose (kill switch, daily budget, shutdown) does not count.
+//! Writes for a running task can be fenced by its dispatch lease: a replica that lost the lease
+//! (another took the task over) cannot finish or release it.
+//!
 //! Dependencies (`task_dependencies`, set at creation and only on tasks that already exist, so
 //! there are no cycles): a queued task with a dependency that has not succeeded is `waiting`, a
 //! status derived from the dependencies rather than stored, and is not dispatched. Once a
@@ -112,6 +119,99 @@ pub struct TaskLimits {
     pub timeout_ms: Option<u64>,
 }
 
+/// A kind of failed run a task's retry policy can retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskFailure {
+    /// The agent's run failed.
+    Error,
+    /// The run hit its `timeout_ms` or stalled.
+    Timeout,
+    /// The replica running it stopped (its dispatch lease expired).
+    Interrupted,
+}
+
+impl TaskFailure {
+    /// Every kind.
+    pub const ALL: [TaskFailure; 3] = [
+        TaskFailure::Error,
+        TaskFailure::Timeout,
+        TaskFailure::Interrupted,
+    ];
+
+    /// Wire/database spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskFailure::Error => "error",
+            TaskFailure::Timeout => "timeout",
+            TaskFailure::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Default [`TaskRetry::max_attempts`].
+pub const DEFAULT_TASK_MAX_ATTEMPTS: u32 = 3;
+/// Most attempts a retry policy may allow.
+pub const MAX_TASK_ATTEMPTS: u32 = 20;
+/// Default [`TaskRetry::backoff_ms`].
+pub const DEFAULT_TASK_BACKOFF_MS: u64 = 10_000;
+/// Default [`TaskRetry::max_backoff_ms`].
+pub const DEFAULT_TASK_MAX_BACKOFF_MS: u64 = 300_000;
+
+/// A task's retry policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRetry {
+    /// Attempts that may fail before the task does (`1..=20`; `1`: never retried).
+    pub max_attempts: u32,
+    /// Delay before the first retry; doubled per failed attempt.
+    pub backoff_ms: u64,
+    /// Longest delay between attempts.
+    pub max_backoff_ms: u64,
+    /// Failures that are retried (an interrupted run is retried at once).
+    pub on: Vec<TaskFailure>,
+}
+
+impl Default for TaskRetry {
+    /// Three attempts, retrying only runs interrupted by a stopped replica.
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_TASK_MAX_ATTEMPTS,
+            backoff_ms: DEFAULT_TASK_BACKOFF_MS,
+            max_backoff_ms: DEFAULT_TASK_MAX_BACKOFF_MS,
+            on: vec![TaskFailure::Interrupted],
+        }
+    }
+}
+
+impl TaskRetry {
+    /// Delay before the attempt after `failures` failed ones (`failures >= 1`).
+    pub fn delay_ms(&self, failures: u32, failure: TaskFailure) -> u64 {
+        if failure == TaskFailure::Interrupted {
+            return 0;
+        }
+        let power = failures.saturating_sub(1).min(30);
+        self.backoff_ms
+            .saturating_mul(1u64 << power)
+            .min(self.max_backoff_ms)
+    }
+
+    fn on_text(&self) -> String {
+        let kinds: Vec<&str> = TaskFailure::ALL
+            .into_iter()
+            .filter(|kind| self.on.contains(kind))
+            .map(TaskFailure::as_str)
+            .collect();
+        kinds.join(",")
+    }
+
+    fn on_from_text(text: &str) -> Vec<TaskFailure> {
+        TaskFailure::ALL
+            .into_iter()
+            .filter(|kind| text.split(',').any(|part| part == kind.as_str()))
+            .collect()
+    }
+}
+
 /// Most dependencies one task may have.
 pub const MAX_TASK_DEPENDENCIES: usize = 100;
 
@@ -135,6 +235,9 @@ pub struct NewTask {
     /// Existing tasks that must succeed before this one is dispatched.
     #[serde(default)]
     pub depends_on: Vec<i64>,
+    /// Retry policy.
+    #[serde(default)]
+    pub retry: TaskRetry,
 }
 
 /// One task.
@@ -169,6 +272,12 @@ pub struct TaskRecord {
     pub error: Option<String>,
     /// Runs started so far.
     pub attempts: u32,
+    /// Retry policy.
+    pub retry: TaskRetry,
+    /// Failed attempts counted against `retry.max_attempts` (since creation or the last unblock).
+    pub failed_attempts: u32,
+    /// When a retried task may run again (`None`: as soon as a slot is free).
+    pub next_attempt_at: Option<DateTime<Utc>>,
     /// Creation time (millisecond precision).
     pub created_at: DateTime<Utc>,
     /// Last change.
@@ -234,8 +343,28 @@ const COLUMNS: &str = concat!(
     "(CASE WHEN tasks.status = 'queued' AND ",
     unmet_dependency!(),
     " THEN 'waiting' ELSE tasks.status END), ",
-    "result, error, attempts, created_at, updated_at, started_at, finished_at"
+    "result, error, attempts, created_at, updated_at, started_at, finished_at, ",
+    "COALESCE(r.max_attempts, 3), COALESCE(r.backoff_ms, 10000), ",
+    "COALESCE(r.max_backoff_ms, 300000), COALESCE(r.retry_on, 'interrupted'), ",
+    "COALESCE(r.failures, 0), r.not_before"
 );
+
+/// `tasks` with their retry policy (`r`).
+const TASKS: &str = "tasks LEFT JOIN task_retry r ON r.task_id = tasks.id";
+
+/// The `task:<id>` dispatch lease of the `tasks` row in scope is live and held by `?owner`.
+macro_rules! held_by {
+    ($owner:literal, $now:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM leases WHERE leases.key = 'task:' || tasks.id ",
+            "AND leases.owner = CAST(",
+            $owner,
+            " AS TEXT) AND leases.expires_at > ",
+            $now,
+            ")"
+        )
+    };
+}
 
 fn opt_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
@@ -277,6 +406,14 @@ fn task_from_row(row: &Row) -> Result<TaskRecord> {
         updated_at: timestamp(row.int(14)?)?,
         started_at: row.opt_int(15)?.map(timestamp).transpose()?,
         finished_at: row.opt_int(16)?.map(timestamp).transpose()?,
+        retry: TaskRetry {
+            max_attempts: clamp_u32(row.int(17)?),
+            backoff_ms: opt_u64(Some(row.int(18)?)).unwrap_or(0),
+            max_backoff_ms: opt_u64(Some(row.int(19)?)).unwrap_or(0),
+            on: TaskRetry::on_from_text(&row.text(20)?),
+        },
+        failed_attempts: clamp_u32(row.int(21)?),
+        next_attempt_at: row.opt_int(22)?.map(timestamp).transpose()?,
     })
 }
 
@@ -300,6 +437,13 @@ pub(crate) fn create_task(
         return Err(StoreError::InvalidArgument(
             "prompt must not be empty".into(),
         ));
+    }
+    if !(1..=MAX_TASK_ATTEMPTS).contains(&task.retry.max_attempts)
+        || task.retry.max_backoff_ms < task.retry.backoff_ms
+    {
+        return Err(StoreError::InvalidArgument(format!(
+            "retry: max_attempts must be 1-{MAX_TASK_ATTEMPTS} and max_backoff_ms at least backoff_ms"
+        )));
     }
     let mut depends_on = task.depends_on.clone();
     depends_on.sort_unstable();
@@ -358,6 +502,17 @@ pub(crate) fn create_task(
                 &vals![id, *dependency],
             )?;
         }
+        db.execute(
+            "INSERT INTO task_retry (task_id, max_attempts, backoff_ms, max_backoff_ms, retry_on) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &vals![
+                id,
+                i64::from(task.retry.max_attempts),
+                to_sql(Some(task.retry.backoff_ms)),
+                to_sql(Some(task.retry.max_backoff_ms)),
+                task.retry.on_text(),
+            ],
+        )?;
         Ok(id)
     })?;
     get_task(db, id)?.ok_or_else(|| StoreError::Internal("inserted task vanished".into()))
@@ -414,7 +569,7 @@ fn with_dependencies(db: &mut dyn Db, mut tasks: Vec<TaskRecord>) -> Result<Vec<
 pub(crate) fn get_task(db: &mut dyn Db, id: i64) -> Result<Option<TaskRecord>> {
     let task = db
         .query_opt(
-            &format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"),
+            &format!("SELECT {COLUMNS} FROM {TASKS} WHERE id = ?1"),
             &vals![id],
         )?
         .map(|row| task_from_row(&row))
@@ -447,7 +602,7 @@ pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage>
     };
     values.push(Val::Int(i64::from(limit) + 1));
     let sql = format!(
-        "SELECT {COLUMNS} FROM tasks {where_sql} ORDER BY id DESC LIMIT ?{}",
+        "SELECT {COLUMNS} FROM {TASKS} {where_sql} ORDER BY id DESC LIMIT ?{}",
         values.len()
     );
     let mut tasks = db
@@ -467,16 +622,20 @@ pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage>
     })
 }
 
-/// Queued tasks whose dependencies have all succeeded, oldest first.
-pub(crate) fn queued_tasks(db: &mut dyn Db, limit: u32) -> Result<Vec<TaskRecord>> {
+/// Queued tasks whose dependencies have all succeeded and whose retry delay is over, oldest first.
+pub(crate) fn queued_tasks(
+    db: &mut dyn Db,
+    limit: u32,
+    now: DateTime<Utc>,
+) -> Result<Vec<TaskRecord>> {
     let tasks = db
         .query(
             &format!(
-                "SELECT {COLUMNS} FROM tasks WHERE status = 'queued' AND NOT {} \
-                 ORDER BY id ASC LIMIT ?1",
+                "SELECT {COLUMNS} FROM {TASKS} WHERE status = 'queued' AND NOT {} \
+                 AND (r.not_before IS NULL OR r.not_before <= ?2) ORDER BY id ASC LIMIT ?1",
                 unmet_dependency!()
             ),
-            &vals![i64::from(limit)],
+            &vals![i64::from(limit), now.timestamp_millis()],
         )?
         .iter()
         .map(task_from_row)
@@ -529,14 +688,20 @@ pub(crate) fn settle_dependants(db: &mut dyn Db, now: DateTime<Utc>) -> Result<u
     }
 }
 
-/// `running` → `status` (a final status or `blocked`). `None` when the task was not running. A
-/// failed or cancelled task fails its waiting dependants.
+/// `running` → `status` (a final status or `blocked`). `None` when the task was not running, or
+/// when `owner` is given and no longer holds the task's live dispatch lease (another replica took
+/// it over). A `failed` run of a kind the task's policy retries ([`TaskFailure`]), with attempts
+/// left, goes back to `queued` instead (`next_attempt_at` after its backoff). A task that ends
+/// failed or cancelled fails its waiting dependants.
+#[allow(clippy::too_many_arguments)] // One row's whole outcome; a struct would only rename them.
 pub(crate) fn finish_task(
     db: &mut dyn Db,
     id: i64,
     status: TaskStatus,
     result: Option<&str>,
     error: Option<&str>,
+    failure: Option<TaskFailure>,
+    owner: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
     if matches!(
@@ -551,8 +716,13 @@ pub(crate) fn finish_task(
     let finished = status.is_final().then_some(now_ms);
     let changed = in_transaction(db, |db| {
         let changed = db.execute(
-            "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, \
-             finished_at = ?6 WHERE id = ?1 AND status = 'running'",
+            concat!(
+                "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, ",
+                "finished_at = ?6 WHERE id = ?1 AND status = 'running' ",
+                "AND (CAST(?7 AS TEXT) IS NULL OR ",
+                held_by!("?7", "?5"),
+                ")"
+            ),
             &vals![
                 id,
                 status.as_str(),
@@ -560,17 +730,50 @@ pub(crate) fn finish_task(
                 error.map(|e| truncate(e, 16 * 1024)),
                 now_ms,
                 finished,
+                owner,
             ],
         )?;
-        if changed > 0 && matches!(status, TaskStatus::Failed | TaskStatus::Cancelled) {
-            settle_dependants(db, now)?;
+        if changed == 0 {
+            return Ok(0);
         }
+        if let (TaskStatus::Failed, Some(failure)) = (status, failure) {
+            retry_failed(db, id, failure, now)?;
+        }
+        settle_dependants(db, now)?;
         Ok(changed)
     })?;
     if changed == 0 {
         return Ok(None);
     }
     get_task(db, id)
+}
+
+/// Counts a failed attempt of the just-failed task `id` and, when its policy retries `failure`
+/// and attempts are left, queues it again after its backoff.
+fn retry_failed(db: &mut dyn Db, id: i64, failure: TaskFailure, now: DateTime<Utc>) -> Result<()> {
+    db.execute(
+        "UPDATE task_retry SET failures = failures + 1 WHERE task_id = ?1",
+        &vals![id],
+    )?;
+    let Some(task) = get_task(db, id)? else {
+        return Ok(());
+    };
+    if !task.retry.on.contains(&failure) || task.failed_attempts >= task.retry.max_attempts {
+        return Ok(());
+    }
+    let delay = task.retry.delay_ms(task.failed_attempts, failure);
+    let not_before = now
+        .timestamp_millis()
+        .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX));
+    db.execute(
+        "UPDATE tasks SET status = 'queued', finished_at = NULL WHERE id = ?1",
+        &vals![id],
+    )?;
+    db.execute(
+        "UPDATE task_retry SET not_before = ?2 WHERE task_id = ?1",
+        &vals![id, (delay > 0).then_some(not_before)],
+    )?;
+    Ok(())
 }
 
 /// Cancels a `queued` (or `waiting`) or `blocked` task, failing its waiting dependants; anything
@@ -635,38 +838,72 @@ pub(crate) fn requeue_task(
             MAX_TASK_PROMPT_BYTES
         )));
     }
-    db.execute(
-        "UPDATE tasks SET status = 'queued', prompt = ?2, error = NULL, result = NULL, \
-         finished_at = NULL, updated_at = ?3 WHERE id = ?1 AND status IN ('blocked', 'failed')",
-        &vals![id, prompt, now.timestamp_millis()],
-    )?;
+    in_transaction(db, |db| {
+        db.execute(
+            "UPDATE tasks SET status = 'queued', prompt = ?2, error = NULL, result = NULL, \
+             finished_at = NULL, updated_at = ?3 WHERE id = ?1 AND status IN ('blocked', 'failed')",
+            &vals![id, prompt, now.timestamp_millis()],
+        )?;
+        // An unblocked task gets its policy's attempts again.
+        db.execute(
+            "UPDATE task_retry SET failures = 0, not_before = NULL WHERE task_id = ?1",
+            &vals![id],
+        )
+    })?;
     get_task(db, id)
 }
 
-/// A running task whose run was stopped for an outside reason (kill switch, daily budget) goes
-/// back to `queued`, keeping `reason` as its error. Other statuses are left alone.
+/// A running task whose run was stopped for an outside reason (kill switch, daily budget,
+/// shutdown) goes back to `queued`, keeping `reason` as its error; the attempt does not count
+/// against its retry policy. Other statuses, and a task whose lease `owner` no longer holds, are
+/// left alone.
 pub(crate) fn release_task(
     db: &mut dyn Db,
     id: i64,
     reason: &str,
+    owner: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
     db.execute(
-        "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 \
-         WHERE id = ?1 AND status = 'running'",
-        &vals![id, reason, now.timestamp_millis()],
+        concat!(
+            "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 ",
+            "WHERE id = ?1 AND status = 'running' AND (CAST(?4 AS TEXT) IS NULL OR ",
+            held_by!("?4", "?3"),
+            ")"
+        ),
+        &vals![id, reason, now.timestamp_millis(), owner],
     )?;
     get_task(db, id)
 }
 
-/// Tasks left `running` by a process that is gone (no live `task:<id>` lease) go back to
-/// `queued`. Returns how many.
+/// Tasks left `running` by a process that is gone (no live `task:<id>` lease) were interrupted:
+/// each counts a failed attempt and goes back to `queued` while its policy retries `interrupted`
+/// with attempts left, and fails otherwise (failing its waiting dependants). Returns how many.
 pub(crate) fn requeue_interrupted_tasks(db: &mut dyn Db, now: DateTime<Utc>) -> Result<u64> {
-    db.execute(
-        "UPDATE tasks SET status = 'queued', updated_at = ?1, \
-         error = 'interrupted by restart; queued again' WHERE status = 'running' \
-         AND NOT EXISTS (SELECT 1 FROM leases WHERE leases.key = 'task:' || tasks.id \
-         AND leases.expires_at > ?1)",
-        &vals![now.timestamp_millis()],
-    )
+    in_transaction(db, |db| {
+        let orphaned = "status = 'running' AND NOT EXISTS (SELECT 1 FROM leases \
+             WHERE leases.key = 'task:' || tasks.id AND leases.expires_at > ?1)";
+        db.execute(
+            &format!(
+                "UPDATE task_retry SET failures = failures + 1 \
+                 WHERE task_id IN (SELECT id FROM tasks WHERE {orphaned})"
+            ),
+            &vals![now.timestamp_millis()],
+        )?;
+        let retried = "EXISTS (SELECT 1 FROM task_retry r WHERE r.task_id = tasks.id \
+             AND r.retry_on LIKE '%interrupted%' AND r.failures < r.max_attempts)";
+        let changed = db.execute(
+            &format!(
+                "UPDATE tasks SET updated_at = ?1, \
+                 status = CASE WHEN {retried} THEN 'queued' ELSE 'failed' END, \
+                 finished_at = CASE WHEN {retried} THEN NULL ELSE ?1 END, \
+                 error = CASE WHEN {retried} THEN 'interrupted by restart; queued again' \
+                 ELSE 'interrupted by restart; no attempts left' END \
+                 WHERE {orphaned}"
+            ),
+            &vals![now.timestamp_millis()],
+        )?;
+        settle_dependants(db, now)?;
+        Ok(changed)
+    })
 }

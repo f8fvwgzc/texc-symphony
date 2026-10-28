@@ -246,7 +246,7 @@ impl Orchestrator<'_> {
             };
             if let Some(error) = refusal {
                 tracing::warn!("Not running {}: {error}", issue_context(&issue));
-                self.task_finish(task.id, TaskStatus::Failed, None, Some(error));
+                self.task_finish(task.id, TaskStatus::Failed, None, Some(error), None);
                 self.drop_lease(&issue_id);
                 continue;
             }

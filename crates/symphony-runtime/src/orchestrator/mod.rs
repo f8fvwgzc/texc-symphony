@@ -28,7 +28,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
 use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
-use symphony_store::{NewRun, RetryRecord, RunStatus, TaskRecord, TaskStatus};
+use symphony_store::{NewRun, RetryRecord, RunStatus, TaskFailure, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -263,6 +263,8 @@ pub(crate) enum TaskWrite {
         status: TaskStatus,
         result: Option<String>,
         error: Option<String>,
+        /// Why a `failed` run failed, when the task's retry policy may retry it.
+        failure: Option<TaskFailure>,
     },
     Release {
         id: i64,
@@ -279,10 +281,13 @@ pub(crate) enum TaskWrite {
 /// Applies task writes one after another, so a finish always lands before a later release of the
 /// same task, and retries a write the store refused as busy instead of dropping it (a dropped
 /// finish would leave the task `running` forever). A final status written asks for a poll
-/// ([`TimerEvent::TaskSettled`]), so dependants start without waiting for the next tick.
+/// ([`TimerEvent::TaskSettled`]), so dependants start without waiting for the next tick. Finishes
+/// and releases are fenced by `owner`'s dispatch lease: once another replica has taken a task
+/// over, this one's late writes are refused.
 fn spawn_task_writer(
     store: symphony_store::Store,
     timers: mpsc::UnboundedSender<TimerEvent>,
+    owner: String,
 ) -> mpsc::UnboundedSender<TaskWrite> {
     let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
     tokio::spawn(async move {
@@ -295,13 +300,22 @@ fn spawn_task_writer(
                         status,
                         result,
                         error,
+                        failure,
                     } => store
-                        .finish_task(*id, *status, result.clone(), error.clone())
+                        .finish_task_run(
+                            *id,
+                            *status,
+                            result.clone(),
+                            error.clone(),
+                            *failure,
+                            owner.clone(),
+                        )
                         .await
                         .map(drop),
-                    TaskWrite::Release { id, reason } => {
-                        store.release_task(*id, reason.clone()).await.map(drop)
-                    }
+                    TaskWrite::Release { id, reason } => store
+                        .release_task(*id, reason.clone(), Some(owner.clone()))
+                        .await
+                        .map(drop),
                     TaskWrite::DropLease { key, owner } => {
                         store.release_lease(key.clone(), owner.clone()).await
                     }
@@ -338,7 +352,7 @@ impl<'w> Orchestrator<'w> {
         let settings = ctx.workflow.settings();
         let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
-        let task_writes = spawn_task_writer(ctx_store, timer_tx.clone());
+        let task_writes = spawn_task_writer(ctx_store, timer_tx.clone(), ctx.replica_id.clone());
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         let pause_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pause_writes = spawn_pause_writer(ctx.store.clone(), Arc::clone(&pause_in_flight));
@@ -365,19 +379,22 @@ impl<'w> Orchestrator<'w> {
         self.ctx.workflow.settings()
     }
 
-    /// Records the end of a task's run (`status` final or `blocked`).
+    /// Records the end of a task's run (`status` final or `blocked`); `failure` says why a
+    /// `failed` run failed when the task's retry policy may retry it (`None`: never retried).
     pub(crate) fn task_finish(
         &self,
         id: i64,
         status: TaskStatus,
         result: Option<String>,
         error: Option<String>,
+        failure: Option<TaskFailure>,
     ) {
         let _ = self.task_writes.send(TaskWrite::Finish {
             id,
             status,
             result,
             error,
+            failure,
         });
     }
 
@@ -582,6 +599,7 @@ impl<'w> Orchestrator<'w> {
                         TaskStatus::Cancelled,
                         None,
                         Some("cancelled by client".into()),
+                        None,
                     );
                     self.terminate_running_issue(&issue_id, false, "cancelled by client")
                         .await;
@@ -1041,7 +1059,7 @@ impl<'w> Orchestrator<'w> {
             .collect();
         for (issue_id, task, reason) in over_task_limit {
             tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
-            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()));
+            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()), None);
             self.terminate_running_issue(&issue_id, false, &reason)
                 .await;
         }
