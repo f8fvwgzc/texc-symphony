@@ -83,7 +83,10 @@ fn allowed_hosts_and_origins_are_normalized_and_validated() {
 fn budget_defaults_to_unlimited_and_free() {
     let settings = parse(json!({}), &MapEnv::new()).unwrap();
     assert_eq!(settings.budget, BudgetSettings::default());
-    assert_eq!(settings.budget.cost_micro_usd(1_000_000, 1_000_000), 0);
+    assert_eq!(
+        settings.budget.cost_micro_usd(1_000_000, 1_000, 1_000_000),
+        0
+    );
 }
 
 #[test]
@@ -95,6 +98,7 @@ fn budget_limits_and_prices_are_cast_and_validated() {
             "max_cost_usd_per_issue": 5,
             "max_cost_usd_per_day": "12.5",
             "input_usd_per_million_tokens": 1.25,
+            "cached_input_usd_per_million_tokens": "0.125",
             "output_usd_per_million_tokens": 10,
         }}),
         &MapEnv::new(),
@@ -105,19 +109,31 @@ fn budget_limits_and_prices_are_cast_and_validated() {
     assert_eq!(budget.max_tokens_per_day, Some(20_000_000));
     assert_eq!(budget.max_cost_usd_per_issue, Some(5.0));
     assert_eq!(budget.max_cost_usd_per_day, Some(12.5));
-    // 1M input at $1.25 + 100k output at $10/M = $2.25.
-    assert_eq!(budget.cost_micro_usd(1_000_000, 100_000), 2_250_000);
+    // 1M input at $1.25 + 100k output at $10/M = $2.25, + 1M cache reads at $0.125.
+    assert_eq!(budget.cost_micro_usd(1_000_000, 0, 100_000), 2_250_000);
+    assert_eq!(
+        budget.cost_micro_usd(1_000_000, 1_000_000, 100_000),
+        2_375_000
+    );
+    // Without a cache price, cache reads cost the input price.
+    let unset = BudgetSettings {
+        cached_input_usd_per_million_tokens: None,
+        ..budget.clone()
+    };
+    assert_eq!(unset.cost_micro_usd(0, 1_000_000, 0), 1_250_000);
 
     let message = invalid(json!({"budget": {
         "max_tokens_per_issue": 0,
         "max_cost_usd_per_day": -1,
         "input_usd_per_million_tokens": -0.5,
+        "cached_input_usd_per_million_tokens": -1,
         "output_usd_per_million_tokens": "free",
     }}));
     for fragment in [
         "budget.max_tokens_per_issue must be greater than 0",
         "budget.max_cost_usd_per_day must be greater than 0",
         "budget.input_usd_per_million_tokens must be greater than or equal to 0",
+        "budget.cached_input_usd_per_million_tokens must be greater than or equal to 0",
         "budget.output_usd_per_million_tokens is invalid",
     ] {
         assert!(message.contains(fragment), "{fragment}: {message}");

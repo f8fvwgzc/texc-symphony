@@ -34,6 +34,7 @@ pub fn static_snapshot() -> StateView {
             last_event_at: None,
             tokens: TokenCounts {
                 input_tokens: 4,
+                cached_input_tokens: 0,
                 output_tokens: 8,
                 total_tokens: 12,
             },
@@ -64,6 +65,7 @@ pub fn static_snapshot() -> StateView {
         }],
         codex_totals: CodexTotals {
             input_tokens: 4,
+            cached_input_tokens: 0,
             output_tokens: 8,
             total_tokens: 12,
             seconds_running: 42.5,

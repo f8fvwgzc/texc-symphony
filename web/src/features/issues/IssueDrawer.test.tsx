@@ -50,7 +50,7 @@ describe('IssueDrawer', () => {
     );
     expect(screen.getByText('running')).toHaveAttribute('data-tone', 'active');
     expect(screen.getByText('5m 18s')).toBeInTheDocument();
-    expect(screen.getByText('12 (in 4 / out 8)')).toBeInTheDocument();
+    expect(screen.getByText('12 (in 4 / cached 0 / out 8)')).toBeInTheDocument();
     expect(
       screen.getByRole('link', { name: 'Open MT-HTTP in the issue tracker' }),
     ).toBeInTheDocument();

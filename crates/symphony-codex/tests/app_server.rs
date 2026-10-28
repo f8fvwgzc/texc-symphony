@@ -1238,6 +1238,7 @@ async fn multiple_turns_reuse_request_id_three_on_one_thread() {
         accumulator.totals,
         TokenCounts {
             input_tokens: 10,
+            cached_input_tokens: 0,
             output_tokens: 4,
             total_tokens: 14
         }

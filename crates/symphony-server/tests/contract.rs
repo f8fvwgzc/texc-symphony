@@ -200,6 +200,7 @@ async fn history_responses_match_the_contract() {
             finished,
             TokenUsage {
                 input: 18230,
+                cached: 0,
                 output: 2207,
                 total: 20437,
             },

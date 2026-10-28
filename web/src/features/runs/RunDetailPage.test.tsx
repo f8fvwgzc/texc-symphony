@@ -31,7 +31,7 @@ describe('RunDetailPage', () => {
     ).toBeInTheDocument();
     expect(screen.getByText('succeeded')).toHaveAttribute('data-tone', 'active');
     expect(screen.getByText('21m 28s')).toBeInTheDocument();
-    expect(screen.getByText('20,437 (in 18,230 / out 2,207)')).toBeInTheDocument();
+    expect(screen.getByText('20,437 (in 18,230 / cached 0 / out 2,207)')).toBeInTheDocument();
     expect(screen.getByText('flaky test')).toHaveAttribute('data-tone', 'danger');
     expect(screen.getByText('dm-dev2')).toBeInTheDocument();
 

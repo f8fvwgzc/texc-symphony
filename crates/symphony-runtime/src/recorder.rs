@@ -252,6 +252,7 @@ impl RunRecorder {
         self.send(RecordOp::Usage(
             TokenUsage {
                 input: totals.input_tokens,
+                cached: totals.cached_input_tokens,
                 output: totals.output_tokens,
                 total: totals.total_tokens,
             },
@@ -377,6 +378,7 @@ mod tests {
         recorder.usage(
             TokenCounts {
                 input_tokens: 3,
+                cached_input_tokens: 0,
                 output_tokens: 4,
                 total_tokens: 7,
             },
@@ -444,6 +446,7 @@ mod tests {
             recorder.usage(
                 TokenCounts {
                     input_tokens: n,
+                    cached_input_tokens: 0,
                     output_tokens: n,
                     total_tokens: 2 * n,
                 },

@@ -26,7 +26,7 @@ export function makeSnapshot(overrides: Partial<StateSnapshot> = {}): StateSnaps
         last_message: 'rendered',
         started_at: '2026-02-24T20:10:12Z',
         last_event_at: null,
-        tokens: { input_tokens: 4, output_tokens: 8, total_tokens: 12 },
+        tokens: { input_tokens: 4, cached_input_tokens: 0, output_tokens: 8, total_tokens: 12 },
       },
     ],
     retrying: [
@@ -57,7 +57,13 @@ export function makeSnapshot(overrides: Partial<StateSnapshot> = {}): StateSnaps
         last_event_at: '2026-02-24T20:14:00Z',
       },
     ],
-    codex_totals: { input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42 },
+    codex_totals: {
+      input_tokens: 4,
+      cached_input_tokens: 0,
+      output_tokens: 8,
+      total_tokens: 12,
+      seconds_running: 42,
+    },
     rate_limits: { primary: { remaining: 11 } },
     ...overrides,
   };
@@ -95,7 +101,7 @@ export function makeIssueDetail(overrides: Partial<IssueDetail> = {}): IssueDeta
       last_event: 'notification',
       last_message: 'rendered',
       last_event_at: null,
-      tokens: { input_tokens: 4, output_tokens: 8, total_tokens: 12 },
+      tokens: { input_tokens: 4, cached_input_tokens: 0, output_tokens: 8, total_tokens: 12 },
     },
     retry: null,
     blocked: null,
@@ -122,7 +128,7 @@ export function makeRun(overrides: Partial<RunRecord> = {}): RunRecord {
     started_at: '2026-02-24T20:10:12.004Z',
     finished_at: '2026-02-24T20:31:40.250Z',
     duration_ms: 1_288_246,
-    tokens: { input: 18_230, output: 2_207, total: 20_437 },
+    tokens: { input: 18_230, cached: 0, output: 2_207, total: 20_437 },
     ...overrides,
   };
 }
@@ -143,6 +149,6 @@ export const TOTALS: Totals = {
   runs_total: 128,
   runs_succeeded: 97,
   runs_failed: 21,
-  tokens: { input: 1_830_211, output: 220_407, total: 2_050_618 },
+  tokens: { input: 1_830_211, cached: 0, output: 220_407, total: 2_050_618 },
   runtime_ms: 48_210_933,
 };

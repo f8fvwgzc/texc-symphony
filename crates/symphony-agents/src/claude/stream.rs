@@ -79,6 +79,7 @@ pub(crate) fn result_usage(result: &Value) -> Usage {
         input_tokens: count(usage, "input_tokens")
             .saturating_add(count(usage, "cache_creation_input_tokens"))
             .saturating_add(count(usage, "cache_read_input_tokens")),
+        cached_input_tokens: count(usage, "cache_read_input_tokens"),
         output_tokens: count(usage, "output_tokens"),
     }
 }
@@ -253,6 +254,7 @@ mod tests {
         let mut stream = TurnStream::new("thread", "turn-1");
         let mut usage = Usage {
             input_tokens: 100,
+            cached_input_tokens: 0,
             output_tokens: 10,
         };
         let lines = [
@@ -285,6 +287,7 @@ mod tests {
             usage,
             Usage {
                 input_tokens: 110,
+                cached_input_tokens: 3,
                 output_tokens: 14
             }
         );

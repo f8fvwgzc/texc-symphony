@@ -296,6 +296,7 @@ pub fn frame_data(snapshot: &Snapshot) -> FrameData {
             .collect(),
         totals: Totals {
             input_tokens: snapshot.codex_totals.input_tokens,
+            cached_input_tokens: snapshot.codex_totals.cached_input_tokens,
             output_tokens: snapshot.codex_totals.output_tokens,
             total_tokens: snapshot.codex_totals.total_tokens,
             seconds_running: snapshot.codex_totals.seconds_running,
@@ -432,6 +433,7 @@ mod tests {
             session_id: None,
             codex_app_server_pid: None,
             codex_input_tokens: 0,
+            codex_cached_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
             turn_count: 0,

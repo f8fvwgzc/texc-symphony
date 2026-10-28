@@ -8,6 +8,11 @@
 //!
 //! Incoming payloads are JSON, so only string keys exist; the Elixir atom-key variants collapse into
 //! their string spellings (`:input`/`:output`/`:completion` have no JSON equivalent and are omitted).
+//!
+//! Cache reads are metered apart from input: a payload's input count includes the prompt-cache reads
+//! it reports (`cachedInputTokens`, as Codex and Symphony's own backends do), and [`TokenCounts`]
+//! splits them into `input_tokens` (processed at the full rate) and `cached_input_tokens`, so
+//! `total = input + cached + output` whenever the payload's total is `input + output`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -47,12 +52,19 @@ const OUTPUT_FIELDS: [&str; 4] = [
     "completionTokens",
 ];
 const TOTAL_FIELDS: [&str; 3] = ["total_tokens", "total", "totalTokens"];
+const CACHED_FIELDS: [&str; 3] = [
+    "cached_input_tokens",
+    "cachedInputTokens",
+    "cache_read_input_tokens",
+];
 
 /// Absolute (cumulative) token counters found in one Codex message; a missing field is `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
-    /// Cumulative input/prompt tokens.
+    /// Cumulative input/prompt tokens, prompt-cache reads included.
     pub input_tokens: Option<u64>,
+    /// Cumulative prompt-cache reads (part of `input_tokens`).
+    pub cached_input_tokens: Option<u64>,
     /// Cumulative output/completion tokens.
     pub output_tokens: Option<u64>,
     /// Cumulative total tokens.
@@ -64,6 +76,7 @@ impl TokenUsage {
     pub fn from_map(usage: &Map<String, Value>) -> Self {
         Self {
             input_tokens: first_integer(usage, &INPUT_FIELDS),
+            cached_input_tokens: first_integer(usage, &CACHED_FIELDS),
             output_tokens: first_integer(usage, &OUTPUT_FIELDS),
             total_tokens: first_integer(usage, &TOTAL_FIELDS),
         }
@@ -202,8 +215,11 @@ pub fn extract_rate_limits<'a>(candidates: impl IntoIterator<Item = &'a Value>) 
 /// Token counters (deltas or running totals).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCounts {
-    /// Input tokens.
+    /// Input tokens processed at the full rate (prompt-cache reads are `cached_input_tokens`).
     pub input_tokens: u64,
+    /// Input tokens read from the provider's prompt cache.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
     /// Total tokens.
@@ -214,8 +230,18 @@ impl TokenCounts {
     /// Adds `other` field by field (saturating).
     pub fn add(&mut self, other: TokenCounts) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+    }
+
+    /// Every token the counters cover: input, cache reads and output (budgets count these).
+    pub fn processed(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.output_tokens)
     }
 
     /// `true` when every counter is zero.
@@ -228,7 +254,8 @@ impl TokenCounts {
 /// (`codex_last_reported_*` + `codex_*_tokens` in the Elixir running entry).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAccumulator {
-    /// Highest absolute value reported so far per field (starts at 0).
+    /// Highest absolute value reported so far per field (starts at 0; `input_tokens` is the
+    /// reported input less its cache reads).
     pub last_reported: TokenCounts,
     /// Sum of all applied deltas.
     pub totals: TokenCounts,
@@ -252,8 +279,19 @@ impl TokenAccumulator {
     /// message) is a zero delta.
     pub fn apply(&mut self, usage: Option<&TokenUsage>) -> TokenCounts {
         let usage = usage.copied().unwrap_or_default();
+        // A payload without a cache count keeps the last one, so its input is not counted twice.
+        let cached = usage
+            .cached_input_tokens
+            .unwrap_or(self.last_reported.cached_input_tokens);
         let delta = TokenCounts {
-            input_tokens: field_delta(usage.input_tokens, &mut self.last_reported.input_tokens),
+            input_tokens: field_delta(
+                usage.input_tokens.map(|input| input.saturating_sub(cached)),
+                &mut self.last_reported.input_tokens,
+            ),
+            cached_input_tokens: field_delta(
+                usage.cached_input_tokens,
+                &mut self.last_reported.cached_input_tokens,
+            ),
             output_tokens: field_delta(usage.output_tokens, &mut self.last_reported.output_tokens),
             total_tokens: field_delta(usage.total_tokens, &mut self.last_reported.total_tokens),
         };
@@ -299,6 +337,7 @@ mod tests {
             acc.totals,
             TokenCounts {
                 input_tokens: 10,
+                cached_input_tokens: 0,
                 output_tokens: 5,
                 total_tokens: 15
             }
@@ -315,6 +354,7 @@ mod tests {
             usage_of(payload),
             Some(TokenUsage {
                 input_tokens: Some(200),
+                cached_input_tokens: None,
                 output_tokens: Some(100),
                 total_tokens: Some(300)
             })
@@ -334,6 +374,7 @@ mod tests {
             acc.totals,
             TokenCounts {
                 input_tokens: 10,
+                cached_input_tokens: 0,
                 output_tokens: 4,
                 total_tokens: 14
             }
@@ -346,12 +387,52 @@ mod tests {
             "tokenUsage": {"total": {"inputTokens": 7, "cachedInputTokens": 1, "outputTokens": 2,
                 "reasoningOutputTokens": 0, "totalTokens": 9}, "modelContextWindow": 1000}}});
         assert_eq!(
-            usage_of(payload),
+            usage_of(payload.clone()),
             Some(TokenUsage {
                 input_tokens: Some(7),
+                cached_input_tokens: Some(1),
                 output_tokens: Some(2),
                 total_tokens: Some(9)
             })
+        );
+        let mut acc = TokenAccumulator::default();
+        acc.apply(usage_of(payload).as_ref());
+        assert_eq!(
+            acc.totals,
+            TokenCounts {
+                input_tokens: 6,
+                cached_input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 9
+            }
+        );
+        assert_eq!(acc.totals.processed(), acc.totals.total_tokens);
+    }
+
+    #[test]
+    fn cache_reads_are_metered_apart_from_input() {
+        let mut acc = TokenAccumulator::default();
+        let event = |input: u64, cached: Option<u64>| {
+            let mut total =
+                json!({"inputTokens": input, "outputTokens": 1, "totalTokens": input + 1});
+            if let Some(cached) = cached {
+                total["cachedInputTokens"] = json!(cached);
+            }
+            json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {"total": total}}})
+        };
+        acc.apply(usage_of(event(100, Some(0))).as_ref());
+        acc.apply(usage_of(event(300, Some(150))).as_ref());
+        // No cache count: the last one (150) still applies, so input is not counted twice.
+        acc.apply(usage_of(event(300, None)).as_ref());
+        acc.apply(usage_of(event(500, Some(330))).as_ref());
+        assert_eq!(
+            acc.totals,
+            TokenCounts {
+                input_tokens: 170,
+                cached_input_tokens: 330,
+                output_tokens: 1,
+                total_tokens: 501
+            }
         );
     }
 

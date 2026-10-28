@@ -91,6 +91,8 @@ pub enum SandboxMode {
 pub struct BackendPricing {
     /// USD per million input tokens.
     pub input_usd_per_million_tokens: f64,
+    /// USD per million input tokens read from the prompt cache (default: the input price).
+    pub cached_input_usd_per_million_tokens: Option<f64>,
     /// USD per million output tokens.
     pub output_usd_per_million_tokens: f64,
 }
@@ -388,6 +390,8 @@ fn cast_pricing(entry: &Entry<'_>, errors: &mut Errors) -> Option<BackendPricing
         input_usd_per_million_tokens: pricing
             .price("input_usd_per_million_tokens", errors)
             .unwrap_or(0.0),
+        cached_input_usd_per_million_tokens: pricing
+            .price("cached_input_usd_per_million_tokens", errors),
         output_usd_per_million_tokens: pricing
             .price("output_usd_per_million_tokens", errors)
             .unwrap_or(0.0),

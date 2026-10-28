@@ -179,6 +179,7 @@ async fn run_crud_round_trip() {
             id,
             TokenUsage {
                 input: 4,
+                cached: 3,
                 output: 8,
                 total: 12,
             },
@@ -199,6 +200,7 @@ async fn run_crud_round_trip() {
     assert_eq!(finished.worker_host.as_deref(), Some("dm-dev2"));
     assert_eq!(finished.workspace_path.as_deref(), Some("/workspaces/MT-7"));
     assert_eq!(finished.tokens.total, 12);
+    assert_eq!(finished.tokens.cached, 3);
     let duration = finished.duration_ms.unwrap();
     assert!((90_000..120_000).contains(&duration), "{duration}");
     assert_eq!(store.get_run(id).await.unwrap(), Some(finished));
@@ -525,6 +527,7 @@ async fn totals_aggregate_all_runs() {
                 run,
                 TokenUsage {
                     input: n,
+                    cached: 4 * n,
                     output: 2 * n,
                     total: 3 * n,
                 },
@@ -549,6 +552,7 @@ async fn totals_aggregate_all_runs() {
         totals.tokens,
         TokenUsage {
             input: 111,
+            cached: 444,
             output: 222,
             total: 333
         }
@@ -766,6 +770,7 @@ async fn fire_and_forget_writes_land_and_failures_do_not_panic() {
         id,
         TokenUsage {
             input: 1,
+            cached: 0,
             output: 2,
             total: 3,
         },
@@ -799,6 +804,7 @@ async fn usage_is_summed_per_issue_and_since_a_time_with_cost() {
     let other = store.start_run(new_run("MT-2")).await.unwrap();
     let tokens = |n: u64| TokenUsage {
         input: n,
+        cached: 0,
         output: n,
         total: 2 * n,
     };

@@ -57,7 +57,8 @@ export function RunningTable({ entries, now }: { entries: RunningEntry[]; now: n
               <Cell numeric>
                 <div>{formatInt(entry.tokens.total_tokens)}</div>
                 <div class="text-muted-foreground text-xs">
-                  In {formatInt(entry.tokens.input_tokens)} / Out{' '}
+                  In {formatInt(entry.tokens.input_tokens)} / Cached{' '}
+                  {formatInt(entry.tokens.cached_input_tokens)} / Out{' '}
                   {formatInt(entry.tokens.output_tokens)}
                 </div>
               </Cell>

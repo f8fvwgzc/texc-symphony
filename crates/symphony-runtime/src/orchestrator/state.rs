@@ -483,10 +483,7 @@ impl RunningEntry {
 
     /// Re-prices the cumulative tokens; returns the cost added since the last call.
     pub(crate) fn reprice(&mut self) -> u64 {
-        let totals = self.tokens.totals;
-        let cost = self
-            .pricing
-            .cost_micro_usd(totals.input_tokens, totals.output_tokens);
+        let cost = self.pricing.cost_micro_usd(&self.tokens.totals);
         let delta = cost.saturating_sub(self.cost_micro_usd);
         self.cost_micro_usd = cost.max(self.cost_micro_usd);
         delta
@@ -500,6 +497,9 @@ impl RunningEntry {
 impl CodexTotals {
     pub(crate) fn add_tokens(&mut self, delta: TokenCounts) {
         self.input_tokens = self.input_tokens.saturating_add(delta.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(delta.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(delta.output_tokens);
         self.total_tokens = self.total_tokens.saturating_add(delta.total_tokens);
     }

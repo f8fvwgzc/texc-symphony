@@ -17,10 +17,15 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_spend_controls.sql"),
     include_str!("migrations/0004_tasks.sql"),
     include_str!("migrations/0005_leases.sql"),
+    include_str!("migrations/0006_cached_tokens.sql"),
 ];
 
-/// PostgreSQL migrations (their own numbering; v1 is the SQLite schema up to 0005).
-const POSTGRES_MIGRATIONS: &[&str] = &[include_str!("migrations/postgres/0001_init.sql")];
+/// PostgreSQL migrations (their own numbering; v1 is the SQLite schema up to 0005, later ones
+/// follow the SQLite files from 0006 on).
+const POSTGRES_MIGRATIONS: &[&str] = &[
+    include_str!("migrations/postgres/0001_init.sql"),
+    include_str!("migrations/postgres/0002_cached_tokens.sql"),
+];
 
 /// Schema version a fresh PostgreSQL database is migrated to.
 pub const POSTGRES_SCHEMA_VERSION: u32 = POSTGRES_MIGRATIONS.len() as u32;

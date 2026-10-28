@@ -439,8 +439,9 @@ impl fmt::Debug for ServerSettings {
 
 /// `budget:` section: spend limits (all optional) and the prices used to turn tokens into cost.
 ///
-/// Limits count input + output tokens. A day is a UTC calendar day. Prices default to `0`, so
-/// cost limits only bite once prices are configured.
+/// Limits count input, prompt-cache reads and output tokens. A day is a UTC calendar day. Prices
+/// default to `0`, so cost limits only bite once prices are configured; cache reads cost the input
+/// price unless `cached_input_usd_per_million_tokens` is set.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct BudgetSettings {
     /// Tokens one issue (or task) may use across all of its runs (`> 0`).
@@ -453,15 +454,22 @@ pub struct BudgetSettings {
     pub max_cost_usd_per_day: Option<f64>,
     /// Price of one million input tokens in USD (`>= 0`, default `0`).
     pub input_usd_per_million_tokens: f64,
+    /// Price of one million input tokens read from the prompt cache in USD (`>= 0`, default: the
+    /// input price).
+    pub cached_input_usd_per_million_tokens: Option<f64>,
     /// Price of one million output tokens in USD (`>= 0`, default `0`).
     pub output_usd_per_million_tokens: f64,
 }
 
 impl BudgetSettings {
-    /// Cost of `input` + `output` tokens in micro-USD (rounded; prices are per million tokens,
-    /// so one token at `$1/M` is exactly one micro-dollar).
-    pub fn cost_micro_usd(&self, input: u64, output: u64) -> u64 {
+    /// Cost of `input`, `cached` (prompt-cache reads) and `output` tokens in micro-USD (rounded;
+    /// prices are per million tokens, so one token at `$1/M` is exactly one micro-dollar).
+    pub fn cost_micro_usd(&self, input: u64, cached: u64, output: u64) -> u64 {
+        let cached_price = self
+            .cached_input_usd_per_million_tokens
+            .unwrap_or(self.input_usd_per_million_tokens);
         let micros = input as f64 * self.input_usd_per_million_tokens
+            + cached as f64 * cached_price
             + output as f64 * self.output_usd_per_million_tokens;
         if micros.is_finite() && micros > 0.0 {
             micros.round() as u64
@@ -985,6 +993,7 @@ fn cast_budget(s: &Section<'_>, errors: &mut Errors) -> BudgetSettings {
         max_cost_usd_per_issue,
         max_cost_usd_per_day,
         input_usd_per_million_tokens: price("input_usd_per_million_tokens", errors).unwrap_or(0.0),
+        cached_input_usd_per_million_tokens: price("cached_input_usd_per_million_tokens", errors),
         output_usd_per_million_tokens: price("output_usd_per_million_tokens", errors)
             .unwrap_or(0.0),
     }

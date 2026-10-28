@@ -19,7 +19,7 @@ let store = StoreConfig::from_env()?.open()?;    // or Store::open(path) / open_
 store.mark_interrupted_runs().await?;              // at startup
 let run = store.start_run(NewRun::new(issue_id, identifier)).await?;
 store.append_event(run, "session_started", None, Some(payload)).detach(); // fire-and-forget
-store.update_tokens(run, TokenUsage { input, output, total }).detach();
+store.update_tokens(run, TokenUsage { input, cached, output, total }).detach();
 store.increment_turns(run).detach();
 store.finish_run(run, RunStatus::Failed, Some(error)).await?;
 ```
@@ -54,7 +54,7 @@ thread is gone, calls return `store_unavailable`.
 | `turns` | INTEGER | `increment_turns` |
 | `started_at`, `finished_at` | INTEGER | Unix epoch milliseconds (UTC) |
 | `duration_ms` | INTEGER NULL | `max(0, finished_at - started_at)` |
-| `input_tokens`, `output_tokens`, `total_tokens` | INTEGER | cumulative for the run; `update_tokens` overwrites them |
+| `input_tokens`, `output_tokens`, `total_tokens` | INTEGER | cumulative for the run; `update_tokens` overwrites them (input without prompt-cache reads, which `run_cached_tokens` holds) |
 | `last_event_seq` | INTEGER | per-run seq allocator |
 
 There are indexes on `(issue_identifier, id)`, `(status, id)` and `started_at`.

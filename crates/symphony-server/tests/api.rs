@@ -37,7 +37,7 @@ async fn state_issue_and_refresh_match_the_elixir_payloads() {
                 "last_message": "rendered",
                 "started_at": state["running"][0]["started_at"],
                 "last_event_at": null,
-                "tokens": {"input_tokens": 4, "output_tokens": 8, "total_tokens": 12}
+                "tokens": {"input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 8, "total_tokens": 12}
             }],
             "retrying": [{
                 "issue_id": "issue-retry",
@@ -63,7 +63,7 @@ async fn state_issue_and_refresh_match_the_elixir_payloads() {
                 "last_message": "turn blocked: waiting for user input",
                 "last_event_at": state["blocked"][0]["last_event_at"]
             }],
-            "codex_totals": {"input_tokens": 4, "output_tokens": 8, "total_tokens": 12, "seconds_running": 42.5},
+            "codex_totals": {"input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 8, "total_tokens": 12, "seconds_running": 42.5},
             "rate_limits": {"primary": {"remaining": 11}}
         })
     );
@@ -104,7 +104,7 @@ async fn state_issue_and_refresh_match_the_elixir_payloads() {
                 "last_event": "notification",
                 "last_message": "rendered",
                 "last_event_at": null,
-                "tokens": {"input_tokens": 4, "output_tokens": 8, "total_tokens": 12}
+                "tokens": {"input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 8, "total_tokens": 12}
             },
             "retry": null,
             "blocked": null,

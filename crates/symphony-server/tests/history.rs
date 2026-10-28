@@ -46,6 +46,7 @@ async fn seeded_store() -> Store {
                 run,
                 TokenUsage {
                     input: 10,
+                    cached: 0,
                     output: 5,
                     total: 15,
                 },
@@ -92,7 +93,7 @@ async fn runs_are_listed_newest_first_with_keyset_pagination() {
     assert_eq!(run["error"], "boom");
     assert_eq!(
         run["tokens"],
-        json!({"input": 10, "output": 5, "total": 15})
+        json!({"input": 10, "cached": 0, "output": 5, "total": 15})
     );
     assert!(run["duration_ms"].is_i64());
     assert!(run["finished_at"].is_string());
@@ -234,7 +235,7 @@ async fn totals_aggregate_all_runs() {
     assert_eq!(totals["runs_failed"], 1);
     assert_eq!(
         totals["tokens"],
-        json!({"input": 50, "output": 25, "total": 75})
+        json!({"input": 50, "cached": 0, "output": 25, "total": 75})
     );
     assert!(totals["runtime_ms"].is_u64());
 }

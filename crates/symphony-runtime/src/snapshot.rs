@@ -48,8 +48,11 @@ pub struct RunningSnapshot {
     pub session_id: Option<String>,
     /// OS pid of the app-server (or local ssh) process.
     pub codex_app_server_pid: Option<String>,
-    /// Input tokens accumulated by this run.
+    /// Input tokens accumulated by this run (prompt-cache reads excluded).
     pub codex_input_tokens: u64,
+    /// Prompt-cache reads accumulated by this run.
+    #[serde(default)]
+    pub codex_cached_input_tokens: u64,
     /// Output tokens accumulated by this run.
     pub codex_output_tokens: u64,
     /// Total tokens accumulated by this run.
@@ -125,8 +128,11 @@ pub struct BlockedSnapshot {
 /// Aggregate Codex usage (`codex_totals`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexTotals {
-    /// Input tokens (all runs of this runtime process).
+    /// Input tokens (all runs of this runtime process; prompt-cache reads excluded).
     pub input_tokens: u64,
+    /// Prompt-cache reads.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
     /// Total tokens.

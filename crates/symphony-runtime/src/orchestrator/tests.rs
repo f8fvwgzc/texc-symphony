@@ -784,6 +784,30 @@ async fn token_accounting_prefers_totals_accumulates_monotonically_and_ignores_l
         (10, 4, 14)
     );
 
+    // Prompt-cache reads are part of the reported input and metered apart from it.
+    let (live, _) = snapshot_after_events(vec![notification(
+        json!({"method": "thread/tokenUsage/updated",
+        "params": {"tokenUsage": {"total": {"inputTokens": 100, "cachedInputTokens": 70,
+            "outputTokens": 5, "totalTokens": 105}}}}),
+    )])
+    .await;
+    let row = &live.running[0];
+    assert_eq!(
+        (
+            row.codex_input_tokens,
+            row.codex_cached_input_tokens,
+            row.codex_total_tokens
+        ),
+        (30, 70, 105)
+    );
+    assert_eq!(
+        (
+            live.codex_totals.input_tokens,
+            live.codex_totals.cached_input_tokens
+        ),
+        (30, 70)
+    );
+
     let (live, _) = snapshot_after_events(vec![notification(
         json!({"method": "codex/event/token_count",
         "params": {"msg": {"type": "token_count", "info": {
@@ -1580,6 +1604,7 @@ async fn stored_history_counts_toward_the_issue_budget_after_a_restart() {
             previous,
             symphony_store::TokenUsage {
                 input: 80,
+                cached: 0,
                 output: 30,
                 total: 110,
             },
@@ -2421,6 +2446,7 @@ async fn raising_the_issue_budget_releases_budget_blocked_issues() {
             previous,
             symphony_store::TokenUsage {
                 input: 100,
+                cached: 0,
                 output: 50,
                 total: 150,
             },

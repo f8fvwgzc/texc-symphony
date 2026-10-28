@@ -929,7 +929,7 @@ impl<'w> Orchestrator<'w> {
             .unwrap_or(now);
         let usage = match self.ctx.store.usage_since(midnight).await {
             Ok(usage) => Usage {
-                tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                tokens: usage.tokens.processed(),
                 cost_micro_usd: usage.cost_micro_usd,
             },
             Err(err) => {
@@ -1087,6 +1087,7 @@ impl<'w> Orchestrator<'w> {
                 session_id: entry.session_id.clone(),
                 codex_app_server_pid: entry.codex_app_server_pid.clone(),
                 codex_input_tokens: entry.tokens.totals.input_tokens,
+                codex_cached_input_tokens: entry.tokens.totals.cached_input_tokens,
                 codex_output_tokens: entry.tokens.totals.output_tokens,
                 codex_total_tokens: entry.tokens.totals.total_tokens,
                 turn_count: entry.turn_count,

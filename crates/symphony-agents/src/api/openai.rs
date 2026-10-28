@@ -111,6 +111,10 @@ fn usage(value: &Value) -> Option<Usage> {
     let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     Some(Usage {
         input_tokens: count("prompt_tokens"),
+        cached_input_tokens: usage
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         output_tokens: count("completion_tokens"),
     })
 }
@@ -390,6 +394,7 @@ mod tests {
             reply.usage,
             Usage {
                 input_tokens: 7,
+                cached_input_tokens: 0,
                 output_tokens: 3
             }
         );

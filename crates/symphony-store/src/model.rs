@@ -112,12 +112,25 @@ impl FromStr for RunStatus {
 /// Token counters for a run (cumulative for the run) or an aggregate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
-    /// Input (prompt) tokens.
+    /// Input (prompt) tokens processed at the full rate. Runs recorded before prompt-cache reads
+    /// were metered apart (schema 6) count those reads here too.
     pub input: u64,
+    /// Input tokens read from the prompt cache.
+    #[serde(default)]
+    pub cached: u64,
     /// Output (completion) tokens.
     pub output: u64,
     /// Total tokens as reported by Codex.
     pub total: u64,
+}
+
+impl TokenUsage {
+    /// Input, prompt-cache reads and output: every token the counters cover (budgets count these).
+    pub fn processed(&self) -> u64 {
+        self.input
+            .saturating_add(self.cached)
+            .saturating_add(self.output)
+    }
 }
 
 /// One queued retry, as kept across restarts.
@@ -349,6 +362,7 @@ mod tests {
             duration_ms: None,
             tokens: TokenUsage {
                 input: 4,
+                cached: 0,
                 output: 8,
                 total: 12,
             },
@@ -360,7 +374,7 @@ mod tests {
         assert_eq!(value["started_at"], "2026-02-24T20:15:12Z");
         assert_eq!(
             value["tokens"],
-            serde_json::json!({"input": 4, "output": 8, "total": 12})
+            serde_json::json!({"input": 4, "cached": 0, "output": 8, "total": 12})
         );
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         for key in [
