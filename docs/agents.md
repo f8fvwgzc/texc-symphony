@@ -100,7 +100,7 @@ were made (`agent_limit_exceeded`). The conversation persists across the turns o
 | `stream` | `true` | `false` for servers with broken streaming. |
 | `request_timeout_ms` | `600000` | One model request. |
 | `sandbox` | `auto` | `shell` confinement: `auto` (= `bubblewrap`), `bubblewrap`, `seatbelt` (macOS development only), `none` (needs `unconfined`). |
-| `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt). `false` cannot be set with `sandbox: none`, which cannot enforce it. |
+| `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt; a task's `isolation.network.mode: deny` wins). `false` cannot be set with `sandbox: none`, which cannot enforce it. |
 | `unconfined` | `false` | Must be `true` with `sandbox: none` (commands reach the network and every file and process environment Symphony's user can read) and with `sandbox: seatbelt` (reads are not limited and the sandbox can be escaped). |
 | `shell_timeout_ms` | `600000` | One command (a smaller per-call `timeout_ms` wins). |
 

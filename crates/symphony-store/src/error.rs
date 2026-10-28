@@ -22,6 +22,9 @@ pub enum StoreError {
     /// Any SQLite error raised while executing a statement.
     #[error("store_sqlite_error: {0}")]
     Sqlite(String),
+    /// A PostgreSQL error.
+    #[error("store_postgres_error: {0}")]
+    Postgres(String),
     /// The on-disk schema was written by a newer Symphony; refusing to downgrade it.
     #[error(
         "store_schema_too_new: database schema version {found} is newer than supported version {supported}"
@@ -75,5 +78,15 @@ impl From<rusqlite::Error> for StoreError {
             }
             other => StoreError::Sqlite(other.to_string()),
         }
+    }
+}
+
+impl From<postgres::Error> for StoreError {
+    fn from(err: postgres::Error) -> Self {
+        // `Display` of a server error carries its message and code; never the connection string.
+        StoreError::Postgres(match err.as_db_error() {
+            Some(db) => format!("{}: {}", db.code().code(), db.message()),
+            None => err.to_string(),
+        })
     }
 }

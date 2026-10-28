@@ -86,8 +86,13 @@ holders() {
   done
 }
 env SYMPHONY_IMAGE_TEST_MARKER="$token" sleep 30 & control=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(cat /proc/$control/comm)" = sleep ] && break; sleep 0.1; done
-holders | grep -q "^$control:" || fail "the scan does not find the token in a readable environment"
+# Retried: until env has exec'd sleep (and while execve runs) the marker is not there yet.
+found_control=no
+for _ in $(seq 1 20); do
+  if holders | grep -q "^$control:"; then found_control=yes; break; fi
+  sleep 0.1
+done
+[ "$found_control" = yes ] || fail "the scan does not find the token in a readable environment"
 kill $control; wait $control 2>/dev/null
 found="$(holders)"
 [ -z "$found" ] || fail "the token is readable in the environment of: $found"

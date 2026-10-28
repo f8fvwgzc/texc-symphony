@@ -169,18 +169,22 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    /// Spawns `command` with piped stdio in a new process group, applying `extra_env` and then removing
-    /// `secret_names` from the child environment.
+    /// Spawns `command` with piped stdio in a new process group, applying `extra_env`, then removing
+    /// `secret_names` from the child environment, then applying `task_env`.
     pub(crate) fn spawn(
         mut command: Command,
         secret_names: &[String],
         extra_env: &[(String, String)],
+        task_env: &[(String, String)],
     ) -> Result<Self, CodexError> {
         for (name, value) in extra_env {
             command.env(name, value);
         }
         for name in secret_names {
             command.env_remove(name);
+        }
+        for (name, value) in task_env {
+            command.env(name, value);
         }
         command
             .stdin(std::process::Stdio::piped())

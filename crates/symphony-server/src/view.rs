@@ -412,6 +412,8 @@ impl RefreshAccepted {
 pub enum StoreMode {
     /// Run history endpoints are served from SQLite.
     Sqlite,
+    /// Run history endpoints are served from PostgreSQL (replicas may share it).
+    Postgres,
     /// Persistence is off; history endpoints answer `503 store_disabled`.
     Disabled,
 }
@@ -419,7 +421,7 @@ pub enum StoreMode {
 /// Body of `GET /api/v1/health`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
-    /// Always `ok`.
+    /// `ok`, or `degraded` when the store's database connection is currently lost.
     pub status: String,
     /// Crate version of the binary.
     pub version: String,

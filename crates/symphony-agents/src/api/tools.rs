@@ -10,7 +10,12 @@
 //! | `tracker` | the tracker tools' own arguments | as configured (scoped) |
 //!
 //! Paths are relative to the workspace. Absolute paths must lie inside it, `..` is refused, and
-//! the nearest existing ancestor is canonicalized so symlinks cannot lead outside.
+//! the nearest existing ancestor is canonicalized so symlinks cannot lead outside. On Linux the
+//! open and any parent creation are then resolved beneath the workspace directory
+//! (`openat2(RESOLVE_IN_ROOT)`), which treats the workspace as `/`, so `..` and symlinks stay
+//! inside it: a component swapped for a symlink to `/etc` by a racing task process lands in the
+//! workspace (which, running as root under task isolation, would otherwise be an escalation),
+//! while in-workspace symlinks keep resolving as on other platforms.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -26,7 +31,7 @@ use symphony_core::Issue;
 use symphony_core::config::SandboxMode;
 use tokio::io::AsyncReadExt;
 
-use super::sandbox::{self, Confinement};
+use super::sandbox::{self, Confinement, NetworkAccess};
 use super::wire::{ToolCall, ToolDef, ToolOutcome};
 use crate::events::Emitter;
 use crate::process::GroupChild;
@@ -42,22 +47,28 @@ pub const MAX_SHELL_OUTPUT: usize = 64 * 1024;
 /// Largest file `read_file` reads and `edit_file` edits.
 pub const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// How the `shell` tool runs commands.
+/// How the `shell` tool runs commands (and who owns what the file tools write).
 #[derive(Debug, Clone)]
 pub struct ShellPolicy {
     /// Confinement mode.
     pub sandbox: SandboxMode,
-    /// Allow network access.
-    pub network: bool,
+    /// Network access of commands.
+    pub network: NetworkAccess,
     /// Upper bound of one command.
     pub timeout: Duration,
     /// Env vars removed from commands.
     pub secret_names: Vec<String>,
     /// Env vars added before the secrets are removed.
     pub extra_env: Vec<(String, String)>,
+    /// Env vars added after the secrets are removed (per-task values, see
+    /// [`symphony_codex::StartOptions::task_env`]).
+    pub task_env: Vec<(String, String)>,
     /// Secret files hidden from sandboxed commands (bubblewrap binds `/dev/null` over them,
     /// seatbelt denies reading them).
     pub masked_files: Vec<PathBuf>,
+    /// `(uid, gid)` commands run as, and the owner of files and directories the file tools
+    /// create or write (task isolation).
+    pub run_as: Option<(u32, u32)>,
 }
 
 /// The tools of one session.
@@ -342,11 +353,27 @@ impl Toolbox {
         }
     }
 
-    /// Opens an existing or new regular file inside the workspace without following a symlink at
-    /// the last component and without blocking (FIFOs, devices and directories are refused),
-    /// then checks that the opened file is the one the canonical path names inside the
-    /// workspace, so a path swapped between the checks cannot redirect the access.
+    /// Opens an existing or new regular file inside the workspace (FIFOs, devices and directories
+    /// are refused). On Linux the whole path is resolved beneath the workspace with
+    /// `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS)` so no symlink in any component — swapped
+    /// in by a racing task process or not — can redirect the open or its parent creation outside
+    /// the workspace (F5). Elsewhere it opens the canonical target with `O_NOFOLLOW` and rechecks
+    /// the opened file's identity.
     fn open_regular(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        #[cfg(target_os = "linux")]
+        return self.open_beneath(raw, path, write);
+        #[cfg(not(target_os = "linux"))]
+        self.open_regular_rechecked(raw, path, write)
+    }
+
+    /// The non-Linux open: canonicalize, `O_NOFOLLOW`, dev/ino recheck, and create parents for a
+    /// write (task isolation is Linux-only, so no ownership handoff here).
+    #[cfg(not(target_os = "linux"))]
+    fn open_regular_rechecked(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        if write && let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
+        }
         // The canonical target (symlinks inside the workspace are fine), or for a new file the
         // canonical parent plus its name.
         let target = match std::fs::canonicalize(path) {
@@ -400,6 +427,118 @@ impl Toolbox {
         Ok(file)
     }
 
+    /// Opens `path` resolved beneath the workspace with `openat2(RESOLVE_IN_ROOT)` (the workspace
+    /// is the resolution root, so `..` and symlinks stay inside it) and, for a write, creates any
+    /// missing parent directories one component at a time without following a symlink; new files
+    /// and directories are handed to the task user. A component swapped to a symlink
+    /// mid-operation cannot redirect it to a host path such as `/etc`, while in-workspace symlinks
+    /// keep working.
+    #[cfg(target_os = "linux")]
+    fn open_beneath(&self, raw: &str, path: &Path, write: bool) -> Result<File, String> {
+        use rustix::fs::{Mode, OFlags, ResolveFlags, openat2};
+
+        let rel = path
+            .strip_prefix(&self.workspace)
+            .map_err(|_| format!("`{raw}` resolves outside the workspace"))?;
+        let workspace = self.open_workspace_dir(raw)?;
+        if write && let Some(parent) = rel.parent() {
+            self.create_dirs_beneath(raw, &workspace, parent)?;
+        }
+        let mut flags = OFlags::CLOEXEC | OFlags::NONBLOCK;
+        // `openat2` rejects a nonzero `mode` unless `O_CREAT` is set, so a read passes mode 0.
+        let mode = if write {
+            flags |= OFlags::RDWR | OFlags::CREATE;
+            Mode::from_bits_truncate(0o600)
+        } else {
+            flags |= OFlags::RDONLY;
+            Mode::empty()
+        };
+        // `IN_ROOT` resolves the whole path with the workspace as `/`, so symlinks and `..` stay
+        // inside it (an escape, or a component swapped to a symlink to `/etc`, lands in the
+        // workspace) while in-workspace symlinks keep working, matching the non-Linux contract.
+        let fd = openat2(&workspace, rel, flags, mode, ResolveFlags::IN_ROOT)
+            .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
+        let file = File::from(fd);
+        let meta = file
+            .metadata()
+            .map_err(|err| format!("cannot open `{raw}`: {err}"))?;
+        if !meta.is_file() {
+            return Err(format!("`{raw}` is not a regular file"));
+        }
+        if write && let Some((uid, gid)) = self.shell.run_as {
+            std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+                .map_err(|err| format!("cannot hand `{raw}` to the task user: {err}"))?;
+        }
+        Ok(file)
+    }
+
+    /// The workspace opened as a directory, the root for [`Self::open_beneath`]'s resolution.
+    #[cfg(target_os = "linux")]
+    fn open_workspace_dir(&self, raw: &str) -> Result<std::os::fd::OwnedFd, String> {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            &self.workspace,
+            OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| format!("cannot open the workspace for `{raw}`: {err}"))
+    }
+
+    /// Creates each missing directory of `rel` beneath `workspace`, one component at a time from
+    /// a verified directory fd, refusing a symlink at any step; new directories go to the task
+    /// user. `rel` is already known to be workspace-relative and free of `..`.
+    #[cfg(target_os = "linux")]
+    fn create_dirs_beneath(
+        &self,
+        raw: &str,
+        workspace: &std::os::fd::OwnedFd,
+        rel: &Path,
+    ) -> Result<(), String> {
+        use rustix::fs::{Mode, OFlags, openat};
+        use rustix::io::Errno;
+        use std::os::fd::AsFd;
+
+        let mut dir = workspace
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|err| format!("cannot open the workspace for `{raw}`: {err}"))?;
+        for component in rel.components() {
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            let open_dir = |at: &std::os::fd::OwnedFd| {
+                openat(
+                    at,
+                    name,
+                    OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::RDONLY,
+                    Mode::empty(),
+                )
+            };
+            let next = match open_dir(&dir) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => {
+                    match rustix::fs::mkdirat(&dir, name, Mode::from_bits_truncate(0o700)) {
+                        Ok(()) | Err(Errno::EXIST) => {}
+                        Err(err) => {
+                            return Err(format!("cannot create the parent of `{raw}`: {err}"));
+                        }
+                    }
+                    let fd = open_dir(&dir)
+                        .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
+                    if let Some((uid, gid)) = self.shell.run_as {
+                        std::os::unix::fs::fchown(&fd, Some(uid), Some(gid)).map_err(|err| {
+                            format!("cannot hand the parent of `{raw}` to the task user: {err}")
+                        })?;
+                    }
+                    fd
+                }
+                Err(err) => return Err(format!("cannot create the parent of `{raw}`: {err}")),
+            };
+            dir = next;
+        }
+        Ok(())
+    }
+
     /// Reads at most [`MAX_FILE_BYTES`] of a regular file; `true` when it was longer.
     fn read_capped(&self, raw: &str, path: &Path) -> Result<(Vec<u8>, bool), String> {
         let file = self.open_regular(raw, path, false)?;
@@ -412,12 +551,27 @@ impl Toolbox {
         Ok((bytes, longer))
     }
 
-    /// Replaces the contents of `path` (created if missing) after [`Self::open_regular`] checked it.
+    /// Replaces the contents of `path` (created if missing) after [`Self::open_regular`] checked it;
+    /// under task isolation the file then belongs to the task user.
     fn write_contents(&self, raw: &str, path: &Path, content: &str) -> Result<(), String> {
         let mut file = self.open_regular(raw, path, true)?;
         file.set_len(0)
             .and_then(|()| file.write_all(content.as_bytes()))
-            .map_err(|err| format!("cannot write `{raw}`: {err}"))
+            .map_err(|err| format!("cannot write `{raw}`: {err}"))?;
+        // On Linux `open_beneath` already handed the file to the task user; elsewhere task
+        // isolation does not apply, so nothing to do.
+        Ok(())
+    }
+
+    /// Hands a directory the tools created to the task user (no-op without task isolation).
+    fn own(&self, dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.shell.run_as {
+            std::os::unix::fs::lchown(dir, Some(uid), Some(gid))?;
+        }
+        #[cfg(not(unix))]
+        let _ = dir;
+        Ok(())
     }
 
     fn read_file(&self, args: &Value) -> Result<String, String> {
@@ -455,12 +609,8 @@ impl Toolbox {
             return Err(format!("`{raw}` is a directory"));
         }
         let existed = path.exists();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("cannot create the parent of `{raw}`: {err}"))?;
-        }
-        // The parent now exists; check again so a symlinked parent cannot redirect the write.
-        let path = self.resolve(raw)?;
+        // `write_contents` opens the file (creating any missing parents) resolved beneath the
+        // workspace, so a symlinked component cannot redirect the write or the ownership handoff.
         self.write_contents(raw, &path, content)?;
         let kind = if existed { "update" } else { "add" };
         Ok((
@@ -588,9 +738,11 @@ impl Toolbox {
             .and_then(Value::as_u64)
             .map(Duration::from_millis)
             .map_or(self.shell.timeout, |t| t.min(self.shell.timeout));
-        // A login shell sources profiles that could export the removed secrets again.
-        let names =
+        // A login shell sources profiles that could export the removed secrets again (names the
+        // task sets itself are kept).
+        let mut names =
             symphony_codex::launch::valid_secret_names(self.shell.secret_names.iter().cloned());
+        names.retain(|name| !self.shell.task_env.iter().any(|(set, _)| set == name));
         let script = if names.is_empty() {
             script.to_owned()
         } else {
@@ -599,15 +751,17 @@ impl Toolbox {
         // A private temp dir per command: Symphony's own `$TMPDIR` (MCP relay configs, ...) stays
         // out of the sandbox's reach.
         let tmp = PrivateTmp::create().map_err(|err| format!("cannot create a temp dir: {err}"))?;
+        self.own(tmp.path())
+            .map_err(|err| format!("cannot hand the temp dir to the task user: {err}"))?;
         let mut command = sandbox::command(
             &confinement,
             &self.workspace,
             &script,
-            self.shell.network,
+            &self.shell.network,
             Some(tmp.path()),
             &self.shell.masked_files,
             &self.shell.extra_env,
-        );
+        )?;
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -617,6 +771,13 @@ impl Toolbox {
         }
         for name in &self.shell.secret_names {
             command.env_remove(name);
+        }
+        for (name, value) in &self.shell.task_env {
+            command.env(name, value);
+        }
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.shell.run_as {
+            command.uid(uid).gid(gid);
         }
         let mut child =
             GroupChild::spawn(&mut command).map_err(|err| format!("cannot run bash: {err}"))?;
@@ -734,13 +895,44 @@ mod tests {
             Arc::new(NoDynamicTools),
             ShellPolicy {
                 sandbox: SandboxMode::None,
-                network: false,
+                network: NetworkAccess::Denied,
                 timeout: Duration::from_secs(10),
                 secret_names: Vec::new(),
                 extra_env: Vec::new(),
+                task_env: Vec::new(),
                 masked_files: Vec::new(),
+                run_as: None,
             },
         )
+    }
+
+    /// A symlinked path component, swapped in by a racing task process, cannot redirect a write
+    /// (or its parent creation) outside the workspace: `open_beneath` resolves the whole path
+    /// beneath the workspace and refuses every symlink, so nothing lands on a host path (F5).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_component_cannot_redirect_a_write_out_of_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(dir.path()).unwrap();
+        let tools = toolbox(&ws, &["write_file"]);
+        // `escape` points at a directory outside the workspace, as a swapped component would.
+        std::os::unix::fs::symlink(outside.path(), ws.join("escape")).unwrap();
+        // open_beneath is given a path whose first component is that symlink.
+        let target = ws.join("escape/pwned");
+        let err = tools
+            .open_beneath("escape/pwned", &target, true)
+            .unwrap_err();
+        assert!(err.contains("escape/pwned"), "{err}");
+        assert!(
+            !outside.path().join("pwned").exists(),
+            "a file was created outside the workspace"
+        );
+        // A genuine new path beneath the workspace is created and stays inside.
+        tools
+            .open_beneath("a/b/c.txt", &ws.join("a/b/c.txt"), true)
+            .unwrap();
+        assert!(ws.join("a/b/c.txt").is_file());
     }
 
     #[test]
@@ -920,5 +1112,134 @@ mod tests {
         let (kept, cut) = head(&text, 3);
         assert!(cut);
         assert_eq!(kept, "é");
+    }
+
+    #[cfg(unix)]
+    fn me() -> (u32, u32) {
+        (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_file_tools_hand_what_they_create_to_the_task_user() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["write_file", "edit_file", "shell"]);
+        // Without root only "chown to myself" is allowed; as root a foreign uid is used.
+        let owner = if rustix::process::geteuid().is_root() {
+            (4242, 4242)
+        } else {
+            me()
+        };
+        tools.shell.run_as = Some(owner);
+        tools
+            .write_file(&json!({"path": "made/deep/file.txt", "content": "x"}))
+            .unwrap();
+        tools
+            .edit_file(&json!({"path": "made/deep/file.txt", "old_string": "x", "new_string": "y"}))
+            .unwrap();
+        for path in ["made", "made/deep", "made/deep/file.txt"] {
+            let meta = std::fs::symlink_metadata(dir.path().join(path)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), owner, "{path}");
+        }
+        let (out, code) = tools
+            .exec("id -u; touch \"$TMPDIR/t\"", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert_eq!(
+            out.lines().next(),
+            Some(owner.0.to_string().as_str()),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_variables_survive_the_secret_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["shell"]);
+        tools.shell.secret_names = vec!["GH_TOKEN".into(), "GITHUB_TOKEN".into()];
+        tools.shell.extra_env = vec![
+            ("GH_TOKEN".into(), "operator-token".into()),
+            ("GITHUB_TOKEN".into(), "operator-token".into()),
+            ("HOME".into(), home.path().display().to_string()),
+        ];
+        tools.shell.task_env = vec![("GH_TOKEN".into(), "task-token".into())];
+        let (out, code) = tools
+            .exec("echo \"[$GH_TOKEN][${GITHUB_TOKEN:-}]\"", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("[task-token][]"), "{out}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_lets_a_task_out_only_through_its_egress_proxy() {
+        use tokio::io::AsyncWriteExt;
+        if sandbox::resolve(SandboxMode::Seatbelt).is_err()
+            || symphony_codex::launch::find_executable("curl").is_none()
+        {
+            eprintln!("skipped: sandbox-exec or curl missing");
+            return;
+        }
+        async fn server() -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                }
+            });
+            addr
+        }
+        let allowed = server().await;
+        let other = server().await;
+        let proxy = crate::egress::EgressProxy::start(
+            crate::egress::AllowList::new([symphony_core::config::HostPort::new(
+                "127.0.0.1",
+                allowed.port(),
+            )]),
+            None,
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = toolbox(dir.path(), &["shell"]);
+        tools.shell.sandbox = SandboxMode::Seatbelt;
+        tools.shell.network = NetworkAccess::Proxy {
+            route: proxy.route(),
+            shim: None,
+        };
+        let curl = "curl -sS --fail --max-time 5";
+        let (out, code) = tools
+            .exec(&format!("{curl} http://{allowed}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("ok"), "{out}");
+        // Through the proxy, another target is refused ...
+        let (out, code) = tools
+            .exec(&format!("{curl} http://{other}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_ne!(code, Some(0), "{out}");
+        assert!(out.contains("403"), "{out}");
+        // ... and bypassing it is denied by the sandbox.
+        let (out, code) = tools
+            .exec(&format!("{curl} --noproxy '*' http://{other}/"), &json!({}))
+            .await
+            .unwrap();
+        assert_ne!(code, Some(0), "{out}");
     }
 }

@@ -16,7 +16,17 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_retry_queue.sql"),
     include_str!("migrations/0003_spend_controls.sql"),
     include_str!("migrations/0004_tasks.sql"),
+    include_str!("migrations/0005_leases.sql"),
 ];
+
+/// PostgreSQL migrations (their own numbering; v1 is the SQLite schema up to 0005).
+const POSTGRES_MIGRATIONS: &[&str] = &[include_str!("migrations/postgres/0001_init.sql")];
+
+/// Schema version a fresh PostgreSQL database is migrated to.
+pub const POSTGRES_SCHEMA_VERSION: u32 = POSTGRES_MIGRATIONS.len() as u32;
+
+/// Advisory lock key that serializes migrations of replicas starting at the same time.
+const MIGRATION_LOCK: i64 = 0x5359_4d50_484f_4e59; // "SYMPHONY"
 
 /// Schema version this build creates and understands.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -76,6 +86,64 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<u32> {
         tracing::info!(version = next, "applied symphony-store migration");
         applied += 1;
     }
+}
+
+/// Applies pending PostgreSQL migrations under an advisory lock (two replicas starting together
+/// migrate once). The version lives in `symphony_schema`.
+pub(crate) fn migrate_postgres(client: &mut postgres::Client) -> Result<u32> {
+    let migration_err = |version: u32, err: postgres::Error| StoreError::Migration {
+        version,
+        reason: err.to_string(),
+    };
+    client
+        .batch_execute(&format!("SELECT pg_advisory_lock({MIGRATION_LOCK})"))
+        .map_err(|err| migration_err(0, err))?;
+    let result = (|| {
+        client
+            .batch_execute("CREATE TABLE IF NOT EXISTS symphony_schema (version BIGINT NOT NULL)")
+            .map_err(|err| migration_err(0, err))?;
+        let current: i64 = client
+            .query_opt("SELECT version FROM symphony_schema", &[])
+            .map_err(|err| migration_err(0, err))?
+            .map_or(0, |row| row.get(0));
+        let current = u32::try_from(current)
+            .map_err(|_| StoreError::CorruptRow(format!("invalid schema version {current}")))?;
+        if current > POSTGRES_SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: current,
+                supported: POSTGRES_SCHEMA_VERSION,
+            });
+        }
+        let mut applied = 0;
+        for (index, sql) in POSTGRES_MIGRATIONS
+            .iter()
+            .enumerate()
+            .skip(current as usize)
+        {
+            let next = index as u32 + 1;
+            let mut tx = client
+                .transaction()
+                .map_err(|err| migration_err(next, err))?;
+            tx.batch_execute(sql)
+                .map_err(|err| migration_err(next, err))?;
+            tx.execute("DELETE FROM symphony_schema", &[])
+                .map_err(|err| migration_err(next, err))?;
+            tx.execute(
+                "INSERT INTO symphony_schema (version) VALUES ($1)",
+                &[&i64::from(next)],
+            )
+            .map_err(|err| migration_err(next, err))?;
+            tx.commit().map_err(|err| migration_err(next, err))?;
+            tracing::info!(version = next, "applied symphony-store postgres migration");
+            applied += 1;
+        }
+        Ok(applied)
+    })();
+    if let Err(err) = client.batch_execute(&format!("SELECT pg_advisory_unlock({MIGRATION_LOCK})"))
+    {
+        tracing::warn!(error = %err, "releasing the migration lock failed");
+    }
+    result
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
-//! The `Store` handle: a cheap, cloneable front for one SQLite connection owned by a dedicated
-//! database thread.
+//! The `Store` handle: a cheap, cloneable front for one database connection (SQLite file or
+//! memory, or PostgreSQL) owned by a dedicated database thread.
 
-// Modified 2026-10-25: bounded job queue, usage/control/payload-retention operations (audit A1/A4).
+// Modified 2026-10-25: bounded job queue, usage/control/payload-retention operations (audit A1/A4);
+// PostgreSQL connections and dispatch leases (Part C).
 
 use std::fmt;
 use std::future::Future;
@@ -9,12 +10,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::db::{Db, PostgresDb, SqliteDb};
+use crate::leases;
 
 use crate::error::{Result, StoreError};
 use crate::model::{
@@ -25,7 +30,7 @@ use crate::ops::{self, NewEvent};
 use crate::schema;
 use crate::tasks::{self, NewTask, TaskPage, TaskQuery, TaskRecord, TaskStatus};
 
-type Job = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
+type Job = Box<dyn FnOnce(&mut dyn Db) + Send + 'static>;
 
 /// Operations queued for the database thread at most; beyond this, submissions fail with
 /// [`StoreError::Busy`] instead of growing memory without bound.
@@ -53,16 +58,19 @@ pub struct Store {
 struct Inner {
     jobs: mpsc::Sender<Job>,
     path: Option<PathBuf>,
+    /// What `Debug` shows: the file, `:memory:` or the PostgreSQL URL without its password.
+    label: String,
+    /// `true` for PostgreSQL: other Symphony replicas may use the same database.
+    shared: bool,
+    /// `false` while the (PostgreSQL) connection is lost; always `true` for SQLite.
+    healthy: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             None => f.write_str("Store(disabled)"),
-            Some(inner) => match &inner.path {
-                Some(path) => write!(f, "Store({})", path.display()),
-                None => f.write_str("Store(:memory:)"),
-            },
+            Some(inner) => write!(f, "Store({})", inner.label),
         }
     }
 }
@@ -86,7 +94,12 @@ impl Store {
             Connection::open_with_flags(&path, flags).map_err(|err| open_err(err.to_string()))?;
         schema::configure(&conn, true)?;
         schema::migrate(&mut conn)?;
-        Store::spawn(conn, Some(path))
+        // One process per SQLite file: leases of an earlier process are void.
+        conn.execute("DELETE FROM leases", [])?;
+        let label = path.display().to_string();
+        Store::spawn(label, Some(path), false, always_healthy(), move || {
+            Ok(Box::new(SqliteDb(conn)))
+        })
     }
 
     /// Open a private in-memory database (tests, `SYMPHONY_DB_PATH=:memory:`).
@@ -94,7 +107,69 @@ impl Store {
         let mut conn = Connection::open_in_memory()?;
         schema::configure(&conn, false)?;
         schema::migrate(&mut conn)?;
-        Store::spawn(conn, None)
+        Store::spawn(
+            ":memory:".into(),
+            None,
+            false,
+            always_healthy(),
+            move || Ok(Box::new(SqliteDb(conn))),
+        )
+    }
+
+    /// A private in-memory database that reports [`Store::is_shared`] as `true`, so tests can
+    /// exercise the multi-replica dispatch path (lease renewal, kill-switch sync, orphan
+    /// recovery, spend enforcement) without a live PostgreSQL. SQLite cannot actually be shared
+    /// between processes; this only forces the in-process coordination that a shared store drives.
+    ///
+    /// Behind the `test-util` feature: the production binary never enables it, so a real build can
+    /// never construct a SQLite store that reports [`Store::is_postgres`].
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn open_in_memory_shared() -> Result<Store> {
+        let mut conn = Connection::open_in_memory()?;
+        schema::configure(&conn, false)?;
+        schema::migrate(&mut conn)?;
+        Store::spawn(":memory:".into(), None, true, always_healthy(), move || {
+            Ok(Box::new(SqliteDb(conn)))
+        })
+    }
+
+    /// Connect to the PostgreSQL database at `url` (`postgres://user:pass@host:port/db`, libpq
+    /// keywords such as `sslmode=require` included) and apply pending migrations. Several
+    /// Symphony replicas may share one database: migrations are serialized and dispatch is
+    /// coordinated by leases. TLS uses the system roots (`sslmode=disable` turns it off).
+    pub fn open_postgres(url: &str) -> Result<Store> {
+        let label = redact_url(url);
+        let config = postgres_config(url).map_err(|reason| StoreError::Open {
+            path: label.clone(),
+            reason,
+        })?;
+        let open_label = label.clone();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let db_healthy = Arc::clone(&healthy);
+        let reconnect_label = label.clone();
+        Store::spawn(label, None, true, healthy, move || {
+            // One throttled attempt per reconnect, so a backlog of jobs during an outage does not
+            // each sleep through a backoff; the backoff below is only for the first connect.
+            let reconnect_config = config.clone();
+            let reconnect = move || {
+                connect_postgres(&reconnect_config).map_err(|reason| StoreError::Open {
+                    path: reconnect_label.clone(),
+                    reason,
+                })
+            };
+            let mut client =
+                connect_postgres_with_backoff(&config).map_err(|reason| StoreError::Open {
+                    path: open_label.clone(),
+                    reason,
+                })?;
+            schema::migrate_postgres(&mut client)?;
+            Ok(Box::new(PostgresDb::new(
+                client,
+                Box::new(reconnect),
+                db_healthy,
+            )))
+        })
     }
 
     /// A no-op store used when persistence is turned off: writes succeed without storing
@@ -108,31 +183,74 @@ impl Store {
         self.inner.is_some()
     }
 
+    /// `true` for a PostgreSQL store (replicas may share it); `false` for SQLite and disabled.
+    pub fn is_postgres(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.shared)
+    }
+
+    /// `true` when the store's connection is currently lost (PostgreSQL only); health probes
+    /// report the store as degraded. Always `false` for SQLite and disabled stores.
+    pub fn is_degraded(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| !inner.healthy.load(Ordering::Relaxed))
+    }
+
+    /// `true` when other Symphony replicas may share the database (PostgreSQL): dispatch is then
+    /// coordinated by leases and dead replicas' work is recovered periodically.
+    pub fn is_shared(&self) -> bool {
+        self.inner.as_ref().is_some_and(|inner| inner.shared)
+    }
+
     /// Database file path; `None` for in-memory and disabled stores.
     pub fn path(&self) -> Option<&Path> {
         self.inner.as_ref().and_then(|inner| inner.path.as_deref())
     }
 
-    fn spawn(mut conn: Connection, path: Option<PathBuf>) -> Result<Store> {
+    /// Starts the database thread; `connect` runs on it (a PostgreSQL client must live on the
+    /// thread that created it) and its error is returned here.
+    fn spawn(
+        label: String,
+        path: Option<PathBuf>,
+        shared: bool,
+        healthy: Arc<AtomicBool>,
+        connect: impl FnOnce() -> Result<Box<dyn Db>> + Send + 'static,
+    ) -> Result<Store> {
         let (jobs, mut queue) = mpsc::channel::<Job>(STORE_QUEUE_CAPACITY);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         std::thread::Builder::new()
             .name("symphony-store".to_string())
             .spawn(move || {
+                let mut db = match connect() {
+                    Ok(db) => {
+                        let _ = ready_tx.send(Ok(()));
+                        db
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
                 while let Some(job) = queue.blocking_recv() {
-                    job(&mut conn);
-                }
-                if let Err((_, err)) = conn.close() {
-                    tracing::warn!(error = %err, "closing symphony-store database failed");
+                    job(db.as_mut());
                 }
             })
             .map_err(|err| StoreError::Open {
-                path: path
-                    .as_ref()
-                    .map_or_else(|| ":memory:".to_string(), |p| p.display().to_string()),
+                path: label.clone(),
                 reason: format!("cannot start database thread: {err}"),
             })?;
+        ready_rx.recv().map_err(|_| StoreError::Open {
+            path: label.clone(),
+            reason: "the database thread stopped while connecting".into(),
+        })??;
         Ok(Store {
-            inner: Some(Arc::new(Inner { jobs, path })),
+            inner: Some(Arc::new(Inner {
+                jobs,
+                path,
+                label,
+                shared,
+                healthy,
+            })),
         })
     }
 
@@ -140,7 +258,7 @@ impl Store {
     fn submit<T, F>(&self, name: &'static str, disabled: impl FnOnce() -> T, op: F) -> Pending<T>
     where
         T: Send + 'static,
-        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        F: FnOnce(&mut dyn Db) -> Result<T> + Send + 'static,
     {
         let Some(inner) = &self.inner else {
             return Pending::ready(Ok(disabled()));
@@ -365,7 +483,72 @@ impl Store {
         )
     }
 
-    /// Startup recovery: tasks left `running` go back to `queued`. Returns how many.
+    /// Takes the dispatch lease of `key` (an issue id, `task:<id>` for tasks) for `owner` until
+    /// `ttl` from now. `true` when `owner` holds it afterwards. A disabled store grants every
+    /// lease (there is nothing to share).
+    pub fn acquire_lease(
+        &self,
+        key: impl Into<String>,
+        owner: impl Into<String>,
+        ttl: Duration,
+    ) -> Pending<bool> {
+        let (key, owner, now) = (key.into(), owner.into(), Utc::now());
+        self.submit(
+            "acquire_lease",
+            || true,
+            move |conn| leases::acquire(conn, &key, &owner, now, ttl),
+        )
+    }
+
+    /// Extends `owner`'s leases on `keys` by `ttl`; returns the keys it still held (all of them
+    /// without a database: there is nobody to lose them to).
+    pub fn renew_leases(
+        &self,
+        owner: impl Into<String>,
+        keys: Vec<String>,
+        ttl: Duration,
+    ) -> Pending<Vec<String>> {
+        let (owner, now) = (owner.into(), Utc::now());
+        let all = keys.clone();
+        self.submit(
+            "renew_leases",
+            move || all,
+            move |conn| leases::renew(conn, &owner, &keys, now, ttl),
+        )
+    }
+
+    /// Gives up `owner`'s lease on `key`.
+    pub fn release_lease(&self, key: impl Into<String>, owner: impl Into<String>) -> Pending<()> {
+        let (key, owner) = (key.into(), owner.into());
+        self.submit(
+            "release_lease",
+            || (),
+            move |conn| leases::release(conn, &key, &owner),
+        )
+    }
+
+    /// Drops every lease of `owner` (startup of a replica with a stable id).
+    pub fn release_owner_leases(&self, owner: impl Into<String>) -> Pending<u64> {
+        let owner = owner.into();
+        self.submit(
+            "release_owner_leases",
+            || 0,
+            move |conn| leases::release_owner(conn, &owner),
+        )
+    }
+
+    /// The live holder of the lease on `key`, if any.
+    pub fn lease_holder(&self, key: impl Into<String>) -> Pending<Option<String>> {
+        let (key, now) = (key.into(), Utc::now());
+        self.submit(
+            "lease_holder",
+            || None,
+            move |conn| leases::holder(conn, &key, now),
+        )
+    }
+
+    /// Recovery: tasks left `running` by a process that is gone (no live lease) go back to
+    /// `queued`. Returns how many.
     pub fn requeue_interrupted_tasks(&self) -> Pending<u64> {
         let now = Utc::now();
         self.submit(
@@ -570,9 +753,199 @@ impl<T> Future for Pending<T> {
     }
 }
 
+/// A health flag for a store that never loses its connection (SQLite, in-memory).
+fn always_healthy() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
+/// Bound on opening a PostgreSQL connection (unless the URL sets `connect_timeout`).
+pub const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long unacknowledged data may stay on a PostgreSQL connection before the kernel drops it
+/// (unless the URL sets `tcp_user_timeout`; Linux), with keepalives after this much idleness: a
+/// silently partitioned database surfaces as an error, not a hang.
+pub const POSTGRES_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The client configuration for `url`. TLS unless `sslmode=disable`: `prefer` (also the
+/// default) becomes `require`, because it would fall back to plaintext when anyone on the path
+/// answers the TLS request with a refusal. Connecting and a silent network are bounded.
+pub(crate) fn postgres_config(url: &str) -> std::result::Result<postgres::Config, String> {
+    use postgres::config::SslMode;
+    let mut config: postgres::Config = url
+        .parse()
+        .map_err(|err: postgres::Error| err.to_string())?;
+    if config.get_ssl_mode() == SslMode::Prefer {
+        config.ssl_mode(SslMode::Require);
+    }
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(POSTGRES_CONNECT_TIMEOUT);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(POSTGRES_NETWORK_TIMEOUT);
+    }
+    // The driver's default is two hours of idleness before the first keepalive.
+    if config.get_keepalives_idle() > POSTGRES_NETWORK_TIMEOUT {
+        config
+            .keepalives(true)
+            .keepalives_idle(POSTGRES_NETWORK_TIMEOUT);
+    }
+    Ok(config)
+}
+
+/// Retries a lost connection this many times (1 s, 2 s, 4 s) before giving up, so a brief
+/// database restart or failover recovers without the whole fleet crash-looping.
+const POSTGRES_CONNECT_ATTEMPTS: u32 = 3;
+
+/// A new connection for `config`, with a short backoff, TLS with the system roots unless
+/// `sslmode=disable`, and a server-side `statement_timeout`/`lock_timeout` so a query the
+/// server itself wedges on returns instead of pinning the store thread.
+fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::Client, String> {
+    let mut client = match config.get_ssl_mode() {
+        postgres::config::SslMode::Disable => config.connect(postgres::NoTls),
+        _ => config.connect(postgres_tls().map_err(|err| err.to_string())?),
+    }
+    .map_err(|err| err.to_string())?;
+    // A statement that runs or waits for a lock past the network timeout is aborted, so no single
+    // query pins the store thread indefinitely.
+    let ms = POSTGRES_NETWORK_TIMEOUT.as_millis();
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout = {ms}; SET lock_timeout = {ms}"
+        ))
+        .map_err(|err| err.to_string())?;
+    Ok(client)
+}
+
+/// Opens the first connection, retrying with a short backoff so a database that is briefly down
+/// at startup does not fail the whole process. Used only for the initial connect; a mid-run
+/// reconnect is a single throttled attempt (see [`db::PostgresDb`]).
+fn connect_postgres_with_backoff(
+    config: &postgres::Config,
+) -> std::result::Result<postgres::Client, String> {
+    let mut last = String::new();
+    for attempt in 0..POSTGRES_CONNECT_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+        }
+        match connect_postgres(config) {
+            Ok(client) => return Ok(client),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
+}
+
+/// `url` without its password, in the userinfo or a `password` parameter (for logs and errors).
+pub(crate) fn redact_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("***"));
+            }
+            if parsed
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("password"))
+            {
+                let pairs: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .map(|(key, value)| {
+                        let value = if key.eq_ignore_ascii_case("password") {
+                            "***".to_owned()
+                        } else {
+                            value.into_owned()
+                        };
+                        (key.into_owned(), value)
+                    })
+                    .collect();
+                parsed.query_pairs_mut().clear().extend_pairs(pairs);
+            }
+            parsed.to_string()
+        }
+        // Key/value connection strings: drop the password field.
+        Err(_) => url
+            .split_whitespace()
+            .map(|part| {
+                if part.to_ascii_lowercase().starts_with("password=") {
+                    "password=***"
+                } else {
+                    part
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// TLS for PostgreSQL with the system's root certificates.
+fn postgres_tls() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // A certificate the platform store holds but rustls cannot parse is skipped.
+        let _ = roots.add(cert);
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|err| StoreError::Internal(format!("TLS setup failed: {err}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_never_falls_back_to_plaintext_and_does_not_hang_on_a_silent_network() {
+        use postgres::config::SslMode;
+        let config = postgres_config("postgres://u@db.internal/symphony").unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            SslMode::Require,
+            "the default `prefer`"
+        );
+        let config = postgres_config("postgres://u@db.internal/symphony?sslmode=prefer").unwrap();
+        assert_eq!(config.get_ssl_mode(), SslMode::Require);
+        let config = postgres_config("postgres://u@db.internal/symphony?sslmode=disable").unwrap();
+        assert_eq!(
+            config.get_ssl_mode(),
+            SslMode::Disable,
+            "an explicit opt-out"
+        );
+        assert_eq!(
+            config.get_connect_timeout(),
+            Some(&POSTGRES_CONNECT_TIMEOUT)
+        );
+        assert_eq!(
+            config.get_tcp_user_timeout(),
+            Some(&POSTGRES_NETWORK_TIMEOUT)
+        );
+        assert_eq!(config.get_keepalives_idle(), POSTGRES_NETWORK_TIMEOUT);
+        let config = postgres_config(
+            "postgres://u@db.internal/symphony?connect_timeout=3&tcp_user_timeout=5",
+        )
+        .unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
+        assert!(postgres_config("postgres://u@db/x?sslmode=sometimes").is_err());
+    }
+
+    #[test]
+    fn urls_are_logged_without_any_password() {
+        assert_eq!(
+            redact_url("postgres://symphony:hunter2@db:5432/s?sslmode=require"),
+            "postgres://symphony:***@db:5432/s?sslmode=require"
+        );
+        let redacted = redact_url("postgres://symphony@db/s?password=hunter2&sslmode=require");
+        assert!(!redacted.contains("hunter2"), "{redacted}");
+        assert!(redacted.contains("sslmode=require"), "{redacted}");
+        assert_eq!(
+            redact_url("host=db user=symphony password=hunter2"),
+            "host=db user=symphony password=***"
+        );
+    }
 
     #[test]
     fn handle_is_clone_send_sync() {

@@ -54,8 +54,37 @@ pub struct StartOptions {
     pub remote_launcher: Option<Arc<dyn RemoteLauncher>>,
     /// Extra environment for the child, applied before secret variables are removed.
     pub env: Vec<(String, String)>,
+    /// Environment applied **after** the secret variables are removed (and never `unset` by the
+    /// launch command): per-task values Symphony created for this run (`HOME`, the task's own
+    /// repository token), which may reuse a secret's name such as `GH_TOKEN`.
+    pub task_env: Vec<(String, String)>,
+    /// Run every agent process as this `(uid, gid)` (local sessions only; needs root).
+    pub run_as: Option<(u32, u32)>,
+    /// The task's egress proxy: agent network traffic must go through it (see
+    /// `symphony_agents::egress`). This crate does not interpret it; the agent backends do.
+    pub egress: Option<EgressRoute>,
+    /// Program and arguments the local launch runs under (`<launcher...> bash -lc ...`), such
+    /// as the network confinement of a task (`symphony_agents::egress::network_jail`); empty for
+    /// a plain launch.
+    pub launcher: Vec<std::ffi::OsString>,
     /// How long [`AppServerSession::stop`] waits for a clean exit before killing the process group.
     pub stop_grace: Duration,
+}
+
+/// Where a task's egress proxy listens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressRoute {
+    /// Unix socket of the proxy (in a private directory), for sandboxes without a network.
+    pub socket: Option<PathBuf>,
+    /// The proxy's TCP listener on the loopback interface.
+    pub tcp: std::net::SocketAddr,
+}
+
+impl EgressRoute {
+    /// `http://<tcp>`, the proxy URL for `HTTPS_PROXY` and friends.
+    pub fn proxy_url(&self) -> String {
+        format!("http://{}", self.tcp)
+    }
 }
 
 impl StartOptions {
@@ -73,6 +102,10 @@ impl StartOptions {
             tool_handler: Arc::new(NoDynamicTools),
             remote_launcher: None,
             env: Vec::new(),
+            task_env: Vec::new(),
+            run_as: None,
+            egress: None,
+            launcher: Vec::new(),
             stop_grace: DEFAULT_STOP_GRACE,
         }
     }
@@ -109,6 +142,43 @@ impl StartOptions {
     pub fn with_stop_grace(mut self, grace: Duration) -> Self {
         self.stop_grace = grace;
         self
+    }
+
+    /// Adds one variable set after the secret variables are removed (see [`Self::task_env`]).
+    pub fn with_task_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.task_env.push((name.into(), value.into()));
+        self
+    }
+
+    /// Runs the agent processes as `uid`/`gid` (see [`Self::run_as`]).
+    pub fn with_run_as(mut self, run_as: Option<(u32, u32)>) -> Self {
+        self.run_as = run_as;
+        self
+    }
+
+    /// Routes agent traffic through the task's egress proxy (see [`Self::egress`]).
+    pub fn with_egress(mut self, egress: Option<EgressRoute>) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// Runs the local launch under `launcher` (see [`Self::launcher`]).
+    pub fn with_launcher(mut self, launcher: Vec<std::ffi::OsString>) -> Self {
+        self.launcher = launcher;
+        self
+    }
+
+    /// Secret variable names to remove from (and `unset` in) agent children: the settings'
+    /// secrets and the tool handler's, except names [`Self::task_env`] sets.
+    pub fn secret_names(&self) -> Vec<String> {
+        let mut names = valid_secret_names(
+            self.settings
+                .secret_environment_names()
+                .into_iter()
+                .chain(self.tool_handler.secret_environment_names()),
+        );
+        names.retain(|name| !self.task_env.iter().any(|(set, _)| set == name));
+        names
     }
 }
 
@@ -168,6 +238,7 @@ impl AppServerSession {
     /// (`initialize` → `initialized` → `thread/start`). On failure after launch the process is stopped.
     /// No events are emitted here (Elixir parity).
     pub async fn start(options: StartOptions) -> Result<Self, CodexError> {
+        let secret_names = options.secret_names();
         let StartOptions {
             workspace,
             worker_host,
@@ -176,8 +247,17 @@ impl AppServerSession {
             tool_handler,
             remote_launcher,
             env,
+            task_env,
+            run_as,
+            egress: _,
+            launcher,
             stop_grace,
         } = options;
+        if let (Some(host), Some(_)) = (&worker_host, run_as) {
+            return Err(CodexError::Unsupported(format!(
+                "running as a task uid is not supported on worker hosts (worker_host={host})"
+            )));
+        }
         let span = tracing::info_span!("codex_session", worker_host = worker_host.as_deref());
 
         let workflow_file = path_safety::expand_path(&workflow_path, None);
@@ -199,20 +279,25 @@ impl AppServerSession {
             .map_err(CodexError::SandboxPolicy)?;
 
         let codex = settings.codex.clone();
-        let secret_names = valid_secret_names(
-            settings
-                .secret_environment_names()
-                .into_iter()
-                .chain(tool_handler.secret_environment_names()),
-        );
         let command = match &worker_host {
             None => {
                 let bash = find_executable("bash").ok_or(CodexError::BashNotFound)?;
-                let mut command = Command::new(bash);
+                let mut command = match launcher.split_first() {
+                    Some((program, args)) => {
+                        let mut command = Command::new(program);
+                        command.args(args).arg(bash);
+                        command
+                    }
+                    None => Command::new(bash),
+                };
                 command
                     .arg("-lc")
                     .arg(local_launch_command(&codex_command(&codex), &secret_names))
                     .current_dir(&workspace);
+                #[cfg(unix)]
+                if let Some((uid, gid)) = run_as {
+                    command.uid(uid).gid(gid);
+                }
                 command
             }
             Some(host) => {
@@ -226,7 +311,7 @@ impl AppServerSession {
             }
         };
         // Secrets are stripped from the local `ssh` process too (Elixir inherited the full env there).
-        let transport = Transport::spawn(command, &secret_names, &env)?;
+        let transport = Transport::spawn(command, &secret_names, &env, &task_env)?;
         let pid = transport.pid().map(|pid| pid.to_string());
         tracing::debug!(parent: &span, pid = ?pid, workspace = %workspace, "Codex app-server launched");
 

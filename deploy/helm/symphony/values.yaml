@@ -22,6 +22,16 @@ workflow: |
   ---
   You are working on {{ issue.identifier }}: {{ issue.title }}
 
+# Replicas. More than one needs `database` (PostgreSQL): replicas coordinate through dispatch
+# leases there, and each pod then keeps its logs and workspaces on its own emptyDir volumes.
+replicaCount: 1
+
+# PostgreSQL run history (SYMPHONY_DATABASE_URL) from an existing Secret; "" keeps SQLite on the
+# data volume.
+database:
+  existingSecret: ""
+  key: url
+
 # The API token (required: the pod binds 0.0.0.0). An existing Secret holding it under `key`.
 apiToken:
   existingSecret: symphony-api-token
@@ -31,6 +41,25 @@ apiToken:
 extraEnv: []
 # Extra `envFrom` sources.
 extraEnvFrom: []
+# Extra volumes and their mounts in the Symphony container (for example the GitHub App key of
+# `isolation.github_app`, from a Secret mounted read-only at /var/run/secrets/github-app; give
+# it `defaultMode: 0400`: `isolation.github_app` refuses a key the task uids could read).
+extraVolumes: []
+extraVolumeMounts: []
+
+# Multi-tenant task runs: an `isolation:` section in the workflow front matter (task runs only;
+# see docs/configuration.md#isolation):
+#   isolation:
+#     task_uids: {first: 200000, count: 1000}  # own uid per task: needs root (podSecurityContext
+#                                              # runAsUser: 0, runAsNonRoot: false) and the
+#                                              # capabilities listed at containerSecurityContext
+#     github_app:                              # repository-scoped token per task
+#       app_id: 123456
+#       private_key_file: /var/run/secrets/github-app/private-key.pem   # via extraVolumes
+#     network: {mode: deny, allow: []}         # default deny: git host:443 + LLM gateway
+# Symphony's egress proxy confines every task process (the api shell in bubblewrap, Codex and Claude
+# Code in a bubblewrap network jail), which needs a seccomp profile that allows user namespaces;
+# `networkPolicy` below adds a pod-level layer.
 
 # The platform LLM connection contract (LLM_*), shared by every core.
 global:
@@ -80,6 +109,29 @@ podSecurityContext:
   fsGroup: 10001
   seccompProfile:
     type: RuntimeDefault
+
+# The Symphony container's securityContext. `isolation.task_uids` needs root with
+# `capabilities: {drop: [ALL], add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, FOWNER]}`
+# (switch to, signal and clean up after the task users).
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+# Pod egress control. When enabled, the pod may only reach DNS (kube-dns, UDP/TCP 53) and the
+# `egress` rules listed here: add the LLM gateway (or provider), the tracker API, the git host
+# and, with `database`, the PostgreSQL server (TCP 5432).
+# A pod-level layer under the per-task network jail of `isolation.network.mode: deny`.
+networkPolicy:
+  enabled: false
+  # Extra NetworkPolicy egress rules, for example:
+  #   - to:
+  #       - podSelector: {matchLabels: {app.kubernetes.io/name: llm-gateway}}
+  #     ports: [{protocol: TCP, port: 8080}]
+  #   - to:
+  #       - ipBlock: {cidr: 0.0.0.0/0, except: [10.0.0.0/8, 169.254.169.254/32]}
+  #     ports: [{protocol: TCP, port: 443}]
+  egress: []
 
 nodeSelector: {}
 tolerations: []

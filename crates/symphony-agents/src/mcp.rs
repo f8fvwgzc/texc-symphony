@@ -113,6 +113,15 @@ impl ToolRelay {
     pub fn set_issue(&self, issue: &Issue) {
         *self.issue.lock().unwrap_or_else(PoisonError::into_inner) = issue.clone();
     }
+
+    /// Hands the relay's directory, socket and config to `uid`/`gid`, so an agent running as
+    /// that task user can reach it (the directory stays `0700`).
+    pub fn grant(&self, uid: u32, gid: u32) -> io::Result<()> {
+        for path in [&self.dir, &self.socket, &self.config] {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ToolRelay {

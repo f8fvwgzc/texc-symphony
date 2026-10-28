@@ -410,6 +410,99 @@ and holds all dispatch until `POST /api/v1/resume`, also across restarts (it is 
 run-history store). `GET /api/v1/state` reports usage and limits under `spend`, run records carry
 `cost_micro_usd`, and `GET /api/v1/metrics` exposes them for Prometheus.
 
+### `isolation`
+
+Per-task isolation for multi-tenant [task](tasks.md) runs; tracker issues are not affected. The
+section is optional; once it is present, the network defaults to `deny`. A run that cannot be
+isolated as configured fails with `isolation_unavailable: ...` instead of running unisolated.
+
+```yaml
+isolation:
+  task_uids: {first: 200000, count: 1000}
+  github_app:
+    app_id: 123456
+    private_key_file: /var/run/secrets/github-app/private-key.pem
+  network:
+    mode: deny
+    git_hosts: ["github.com"]
+    allow: ["pypi.org:443", "files.pythonhosted.org:443"]
+```
+
+| Key | Type | Default | Validation and notes | Reload |
+|---|---|---|---|---|
+| `isolation.task_uids.first` | integer | none | `> 0`. First uid (and gid) of the task range. | new runs |
+| `isolation.task_uids.count` | integer | none | `> 0`; `first + count - 1` must stay below `2^32 - 1`. Each run leases a free uid from the range; the range must hold at least as many uids as the peak number of concurrent tasks. | new runs |
+| `isolation.github_app.app_id` | integer or string | none | The App id (or client id), the JWT `iss`. | new runs |
+| `isolation.github_app.private_key_file` | string | none | Absolute path of the App's PEM key (PKCS#1 or PKCS#8), read for every task. | new runs |
+| `isolation.github_app.api_url` | string | `https://api.github.com` | REST root (GitHub Enterprise: `https://<host>/api/v3`); `https`, or `http` to a loopback host. | new runs |
+| `isolation.github_app.git_host` | string | `github.com` | Repositories `https://<git_host>/OWNER/REPO[.git]` and `git@<git_host>:OWNER/REPO[.git]` get a token. | new runs |
+| `isolation.network.mode` | string | `deny` | `deny` or `allow` (no restriction beyond the backend's own `network`). | new runs |
+| `isolation.network.allow` | list of strings | `[]` | Extra `host:port` entries (exact host, case-insensitive; `[v6]:port`). | new runs |
+| `isolation.network.git_hosts` | list of strings | `[]` | Git hosts a task's `repo` may use (`github_app.git_host` is always allowed). In deny mode a task whose repo host is not listed is refused. | new runs |
+
+What each part does:
+
+- **Own uid per task** (`task_uids`). Each run leases a free uid from the range: no two live
+  runs share one, and a uid with a live process (including one left by an earlier task, or one
+  another replica on the same host already has a process for) is skipped; a task is refused when
+  the range is exhausted rather than sharing a uid. Across replicas on one host the `/proc` scan
+  sees a uid only once the other replica has spawned a process, so give each replica its own uid
+  range (or one host per replica) to rule out the brief overlap window. Before the clone the workspace is made `0700` and handed
+  to the task uid; the clone, Codex, Claude Code and the `api` backend's shell run as it, and
+  the `api` file tools (which run inside Symphony) hand the files and directories they write to
+  it. When the run ends, every process still running as the uid is killed before the uid is
+  freed, so a `setsid` daemon (or anything left under `sandbox: none`) cannot reach the next
+  task; the deny-mode agents are already reaped by the jail's own PID namespace.
+  Switching users needs root (or `CAP_SETUID`, `CAP_SETGID` and `CAP_CHOWN`, plus `CAP_KILL`,
+  `CAP_DAC_OVERRIDE` and `CAP_FOWNER` to stop and clean up after the task users); Symphony checks
+  its effective uid and refuses the run when it is not root. bubblewrap then runs as the task
+  user, so it needs unprivileged user namespaces.
+- **Every task process** gets `HOME=<workspace>/.home` (created `0700`, the task's, excluded from
+  git in a fresh clone), so the operator's `~/.gitconfig`, `gh` login or agent logins are never
+  visible. Isolated Codex and Claude Code runs therefore need their model access from the
+  environment (the [LLM connection contract](#llm-connection-contract) or `api_key_env`).
+- **Short-lived repository credentials** (`github_app`). For a repository on `git_host`, Symphony
+  signs an App JWT (RS256, 9 minutes), finds the repository's installation and creates an
+  installation token for that one repository (`contents: write`, `pull_requests: write`,
+  `metadata: read`). The repository is cloned over https with it (a `git@` URL too), and the
+  agent gets it for `git push` and `gh`: a git credential helper for `https://<git_host>` reading
+  `$SYMPHONY_GIT_TOKEN` (configured through `GIT_CONFIG_*`, after resetting other helpers), and
+  `GH_TOKEN`; under `network.mode: deny` the task may reach the host of `api_url` too (`gh` calls
+  the REST API there). The token is never in argv, set after the operator's secrets are removed,
+  and redacted from the run's events, result and error. The operator's tokens (`GITHUB_TOKEN`,
+  ...) are never given to task agents. A failure is `task_credentials_failed: ...`. The App key
+  itself mints tokens for every repository the App is installed on, so no agent may read it:
+  `github_app` requires `task_uids` (refused at config load otherwise), and the key file must not
+  be readable by group or others (mode `0400` or `0600`; a Kubernetes Secret volume needs
+  `defaultMode: 0400`), else the run fails with `isolation_unavailable`. Under `network.mode:
+  deny` the key is additionally masked (reads as empty) wherever agents run — the `api` shell's
+  sandbox and the network jail.
+- **Default-deny network** (`network.mode: deny`). Symphony starts an egress proxy for the run
+  that reaches only the repository's git host on port 443 (https; never 22), the LLM gateway
+  (`LLM_GATEWAY_URL`) when one is configured, and `network.allow`; everything else gets `403`.
+  The submitter chooses `repo`, so the repository host must be one the operator allowed
+  (`network.git_hosts` or `github_app.git_host`); a task with any other repo host is refused
+  (`isolation_unavailable`) rather than being able to pick a host to reach. The proxy also
+  resolves each hostname and refuses an answer in a loopback, private, link-local or
+  carrier-grade-NAT range, so a tenant-controlled name cannot reach an internal service; an
+  operator may still name such an address as an IP literal in `allow`.
+  Nothing in the task can bypass it: the `api` backend's bubblewrap shell has an empty network
+  namespace and reaches the proxy only through `symphony egress-shim`; Codex, Claude Code and a
+  `sandbox: none` shell run in the **network jail** (`bwrap --dev-bind / / --unshare-net` with
+  the shim inside: the host's files and tools, but no route out except the proxy, also for
+  every command they start); under seatbelt (macOS development) every connection but the
+  proxy's loopback port is denied. This wins over the backend's `network: true`. The jail needs
+  Linux and unprivileged user namespaces (the image's bubblewrap, and in Kubernetes a seccomp
+  profile that allows them, see [agents.md](agents.md#image-and-requirements)); where it cannot
+  run, the agent does not start (Codex, Claude Code) or the command is refused (`sandbox:
+  none`). Codex and Claude Code reach their model through the proxy too, so use the gateway or
+  list the provider's host in `allow`. The chart's `networkPolicy` adds a pod-level layer.
+
+Limits: SSH workers are not supported (`isolation_unavailable`); the token lives one hour and is
+not refreshed, so a longer run loses push access; model calls of the `api` backend are made by
+Symphony itself and do not go through the proxy; the proxy also listens on loopback, so on a
+shared host another local process could use a running task's allow-list.
+
 ## Tracker kinds
 
 `tracker.kind` selects an adapter. Adapter settings live under `tracker.provider`; the states and

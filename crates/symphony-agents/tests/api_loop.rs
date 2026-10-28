@@ -1217,3 +1217,81 @@ async fn key_files_win_and_max_retries_bounds_retries() {
     };
     assert!(err.to_string().contains("missing-key"), "{err}");
 }
+
+#[tokio::test]
+async fn task_variables_reach_the_shell_after_the_secrets_are_removed() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        ApiProvider::OpenAi,
+        vec![
+            openai_tool_call(
+                false,
+                "shell",
+                json!({"command": "echo \"gh=${GH_TOKEN:-unset} tracker=${GITHUB_TOKEN:-unset}\""}),
+            ),
+            openai_text(false, "ran it"),
+        ],
+    )
+    .await;
+    let env = Env::new();
+    let backend = backend(backend_settings(api(
+        ApiProvider::OpenAi,
+        &server.uri(),
+        false,
+    )));
+    let options = env
+        .options(env.settings(Some("github")))
+        .with_env("GITHUB_TOKEN", "ghp_operator_should_not_reach_the_shell")
+        .with_env("GH_TOKEN", "operator-gh-should-not-reach-the-shell")
+        .with_task_env("GH_TOKEN", "task-scoped-token");
+    let mut session = backend.start(options).await.unwrap();
+    let (events, _rx) = sink();
+    session.run_turn("run", &issue(), &events).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let (_, content) = sent_tool_result(ApiProvider::OpenAi, &request_json(&requests[1]));
+    assert!(
+        content.contains("gh=task-scoped-token tracker=unset"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn a_default_deny_network_that_cannot_be_enforced_refuses_an_unconfined_shell() {
+    let server = MockServer::start().await;
+    mount_sequence(
+        &server,
+        ApiProvider::OpenAi,
+        vec![
+            openai_tool_call(false, "shell", json!({"command": "echo ran > ran.txt"})),
+            openai_text(false, "done"),
+        ],
+    )
+    .await;
+    let env = Env::new();
+    // `network: true` and no sandbox: the task's default-deny network still wins.
+    let mut settings = api(ApiProvider::OpenAi, &server.uri(), false);
+    settings.network = true;
+    let backend = backend(backend_settings(settings));
+    // A proxy without a Unix socket (or, off Linux, no bubblewrap): no jail can be built, and
+    // proxy variables alone are not a boundary.
+    let options =
+        env.options(env.settings(Some("github")))
+            .with_egress(Some(symphony_codex::EgressRoute {
+                socket: None,
+                tcp: "127.0.0.1:41999".parse().unwrap(),
+            }));
+    let mut session = backend.start(options).await.unwrap();
+    let (events, _rx) = sink();
+    session.run_turn("run", &issue(), &events).await.unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let (_, content) = sent_tool_result(ApiProvider::OpenAi, &request_json(&requests[1]));
+    assert!(
+        content.contains("bubblewrap") || content.contains("Unix socket"),
+        "{content}"
+    );
+    assert!(
+        !env.workspace.join("ran.txt").exists(),
+        "the command did not run"
+    );
+}

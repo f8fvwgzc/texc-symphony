@@ -98,8 +98,15 @@ const READ_INIT_ENVIRONMENT: &str = r#"
     init=$1
     [ "$(cat /proc/$init/comm)" = symphony ] || { echo "pid $init is $(cat /proc/$init/comm)"; exit 1; }
     sleep 5 & control=$!
-    tr '\0' '\n' < /proc/$control/environ | grep -q "^SYMPHONY_INIT_TEST_SECRET=" \
-        || { echo "control environment unreadable"; exit 1; }
+    # Retried: while the child is still in execve, its environ can read as empty.
+    readable=no
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        if tr '\0' '\n' < /proc/$control/environ 2>/dev/null | grep -q "^SYMPHONY_INIT_TEST_SECRET="; then
+            readable=yes; break
+        fi
+        sleep 0.05
+    done
+    [ "$readable" = yes ] || { echo "control environment unreadable"; exit 1; }
     kill $control; wait $control
     if cat /proc/$init/environ > /dev/null 2>&1; then echo "init environment readable"; exit 1; fi
 "#;

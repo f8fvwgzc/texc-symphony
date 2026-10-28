@@ -10,6 +10,7 @@
 //! finish within the grace period is aborted (dropped).
 
 // Modified 2026-10-25: backend selection and task specs on the worker context (Part B).
+// Modified 2026-10-26: task isolation errors.
 
 use std::future::Future;
 use std::time::Duration;
@@ -169,6 +170,13 @@ pub enum RunError {
     /// A task's repository could not be cloned.
     #[error("task_clone_failed: {0}")]
     TaskClone(String),
+    /// `isolation:` cannot be applied to this task run (no root for `task_uids`, an SSH worker,
+    /// a failed chown or proxy start). The run fails instead of running unisolated.
+    #[error("isolation_unavailable: {0}")]
+    IsolationUnavailable(String),
+    /// The task's repository token (`isolation.github_app`) could not be minted.
+    #[error("task_credentials_failed: {0}")]
+    TaskCredentials(crate::credentials::CredentialError),
     /// The run was cancelled by the orchestrator.
     #[error("cancelled")]
     Cancelled,

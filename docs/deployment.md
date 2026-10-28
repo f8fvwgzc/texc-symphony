@@ -30,7 +30,9 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_HOST` | `127.0.0.1` | HTTP bind address (`0.0.0.0` in containers) |
 | `SYMPHONY_PORT` | unset (no HTTP server) | HTTP port; same as `--port` or `server.port` in `WORKFLOW.md`; `0` picks a free port |
 | `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
-| `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`) |
+| `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`); a `postgres://` URL selects PostgreSQL |
+| `SYMPHONY_DATABASE_URL` | unset | PostgreSQL connection string (wins over `SYMPHONY_DB_PATH`), see [PostgreSQL and replicas](#postgresql-and-replicas) |
+| `SYMPHONY_REPLICA_ID` | `local` (SQLite), `<host>-<pid>-<random>` (PostgreSQL) | this process in dispatch leases; a stable id (StatefulSet pod name) lets a restarted replica recover its work at once |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
 | `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
 | `SYMPHONY_API_TOKEN` | unset | API bearer token when `server.api_token` is not set; required for a non-loopback `SYMPHONY_HOST` |
@@ -226,6 +228,45 @@ If the stream is blocked anyway, the dashboard falls back to polling `GET /api/v
 5 s and shows `Polling` in its connection badge; everything still works, just less promptly. Test
 the stream through the proxy with `curl -N https://symphony.example.com/api/v1/events`: events
 must appear immediately, not in bursts.
+
+## PostgreSQL and replicas
+
+Instead of SQLite, Symphony can keep run history, tasks, the retry queue, the kill switch and
+dispatch leases in PostgreSQL (12 or newer):
+
+```sh
+export SYMPHONY_DATABASE_URL='postgres://symphony:secret@db.internal:5432/symphony?sslmode=require'
+```
+
+- Symphony creates and migrates its own tables at start (`symphony_schema` holds the version;
+  replicas starting together migrate once, under an advisory lock). The user needs `CREATE` on the
+  database or schema; put Symphony in its own schema with `options=-csearch_path%3Dsymphony`.
+- TLS uses the system root certificates and is required unless `sslmode=disable`: `prefer` (also
+  the default without `sslmode`) is treated as `require`, so nobody on the path can downgrade the
+  connection to plaintext. Connecting is bounded (10 s unless `connect_timeout` is set), a silent
+  network drops the connection after 30 s (`tcp_user_timeout`, keepalives), and each session sets
+  `statement_timeout`/`lock_timeout` to 30 s, so no single query can pin the store thread. A lost
+  connection (a database restart or failover) is reopened by the next operation, retried with a
+  short backoff; the operation that met it fails, and `GET /api/v1/health` reports
+  `status: degraded` (and `store: postgres`) in the body until it reconnects (the status code
+  stays 200), so operators can alert on it. The password never appears in logs (userinfo or
+  `password=`).
+- **Several replicas** may share one database. Each dispatch takes a lease on the issue (or
+  `task:<id>`) in the `leases` table: a replica skips issues and tasks another live replica
+  holds, renews its leases every 15 s (a renewal waits at most 7 s) and releases them with the
+  claim or at shutdown. A replica that cannot renew stops its runs before their leases could
+  lapse (after two missed renewals), and one that finds a lease taken by another replica stops
+  that run at once, leaving its task to the new owner. A replica
+  that dies leaves leases that expire after 60 s; the others then close its runs
+  (`interrupted by restart`) and queue its tasks again. Give each replica a distinct
+  `SYMPHONY_REPLICA_ID` (or leave it unset). Leases are judged by the replicas' clocks, so keep
+  them in sync (NTP). The kill switch is shared: a pause or resume on one replica reaches the
+  others within 15 s. Each replica still needs its own workspace volume, and daily budgets and the
+  live dashboard count per replica.
+- Helm: `--set database.existingSecret=<secret> --set replicaCount=3` (the Secret holds the URL
+  under `url`). The chart refuses `replicaCount > 1` without it, sets `SYMPHONY_REPLICA_ID` to the
+  pod name and gives replicas `emptyDir` volumes for logs and workspaces (run history is in
+  PostgreSQL).
 
 ## Data and backups
 
