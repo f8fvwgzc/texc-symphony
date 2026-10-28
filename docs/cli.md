@@ -241,7 +241,8 @@ The command exits 0 with a report. It exits 1 with:
 - `Invalid option(s): ...` for an unknown option or a second path;
 - the reason `symphony` would print at startup, without its
   `Failed to start Symphony with workflow <path>:` prefix, when the file cannot be read, is not
-  UTF-8, has front matter that is not a YAML mapping, or has a malformed reference marker.
+  UTF-8, has front matter that is not valid YAML or not a YAML mapping, or has a malformed
+  reference marker.
 
 It does not check the settings themselves (for example `agent.max_turns`) or tracker credentials.
 

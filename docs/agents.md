@@ -133,6 +133,8 @@ Tools:
     Symphony, its run history and its secret files live in it.
 - `tracker`: the tracker's scoped tools (`linear_graphql`, `github_api`, ...), executed by
   Symphony with the host-side credential ([agent tool scope](configuration.md#agent-tool-scope)).
+  `workflow_reference`, which serves the prompt's reference sections, is offered whenever the
+  prompt has sections, with or without `tracker`.
 
 Events use the Codex vocabulary, so the dashboard, run history and budgets work unchanged:
 `session_started`, `item/agentMessage/delta`, `agentMessage` / `commandExecution` / `fileChange`

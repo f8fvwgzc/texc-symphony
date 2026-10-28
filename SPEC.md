@@ -538,6 +538,8 @@ Dispatch gating behavior:
 
 - Workflow file read/YAML errors block new dispatches until fixed.
 - Template errors fail only the affected run attempt.
+- An implementation of the reference sections extension (Section 12.5) treats a malformed reference
+  marker like a workflow parse error: it blocks new dispatches until fixed.
 
 ## 6. Configuration Specification
 
@@ -610,6 +612,8 @@ Validation checks:
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
 - `codex.command` is present and non-empty.
+- With the reference sections extension (Section 12.5), the prompt's reference markers are
+  well-formed.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -2004,6 +2008,10 @@ function dispatch_issue(issue, state, attempt):
 ```
 
 ### 16.5 Worker Attempt (Workspace + Prompt + Agent)
+
+With the reference sections extension (Section 12.5), the first-turn prompt is rendered after
+`before_run` and before `start_session`, because its sections decide the advertised tools; a render
+failure then fails the worker without a session to stop (`after_run` still runs).
 
 ```text
 function run_agent_attempt(issue, attempt, orchestrator_channel):
