@@ -330,7 +330,7 @@ once `LLM_PROVIDER` or `LLM_GATEWAY_URL` is set; values from `WORKFLOW.md` alway
 | `LLM_MODEL_SMALL` | | A small, fast model (Claude Code's background calls). |
 | `LLM_TIMEOUT_SECS` | | Timeout of one model request (`> 0`). |
 | `LLM_MAX_RETRIES` | | Retries of one request (`0..=10`). |
-| `LLM_GATEWAY_URL` | | **Gateway mode**: every model call goes to the platform's model gateway (attache), which speaks Anthropic Messages (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`). The root URL; a trailing `/v1` is ignored. Symphony then uses no provider key. |
+| `LLM_GATEWAY_URL` | | **Gateway mode**: every model call goes to the platform's model gateway (attache's `agentsc-gateway`), which speaks Anthropic Messages (`/v1/messages`), OpenAI Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`). The root URL; a trailing `/v1` is ignored. Symphony then uses no provider key. The gateway listens on `127.0.0.1:8090` by default, so a local run uses `http://127.0.0.1:8090`; in a cluster it listens on `0.0.0.0:8090` behind a Service named `agentsc-gateway`, so `http://agentsc-gateway:8090` (change the URL if your Service maps another port). |
 | `LLM_GATEWAY_TOKEN_FILE` | with the gateway | File holding the gateway token, sent as a bearer token. |
 
 Errors name the variable (`LLM_PROVIDER is invalid`, `LLM_MODEL can't be blank`) and fail the

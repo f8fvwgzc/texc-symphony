@@ -121,13 +121,17 @@ The chart in [`deploy/helm/symphony`](../deploy/helm/symphony) runs one replica 
 
 ```sh
 kubectl create secret generic symphony-api-token --from-literal=token="$(openssl rand -hex 32)"
-kubectl create configmap llm-config --from-literal=LLM_GATEWAY_URL=http://attache-gateway:8080 \
+kubectl create configmap llm-config --from-literal=LLM_GATEWAY_URL=http://agentsc-gateway:8090 \
   --from-literal=LLM_MODEL=claude-sonnet-4-5          # usually shared by every core
 kubectl create secret generic llm-credentials --from-file=gateway-token=./gateway-token
 helm install symphony deploy/helm/symphony --set acknowledgeGuardrails=true \
-  --set global.llm.gatewayUrl=http://attache-gateway:8080
+  --set global.llm.gatewayUrl=http://agentsc-gateway:8090
 ```
 
+- `http://agentsc-gateway:8090` is attache's model gateway (`agentsc-gateway`) behind a Service of
+  that name on its default port 8090; the binary binds `127.0.0.1:8090` unless started with
+  `--listen 0.0.0.0:8090`, so a Service needs that flag. Use your Service's name and port if they
+  differ.
 - `global.llm.*` (`provider`, `baseUrl`, `model`, `modelSmall`, `timeoutSecs`, `maxRetries`,
   `gatewayUrl`) set `LLM_*` explicitly and win over the `llm-config` ConfigMap. Set
   `global.llm.gatewayUrl` in gateway mode so only the gateway token is mounted.

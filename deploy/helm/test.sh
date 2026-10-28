@@ -26,9 +26,9 @@ has "$out" 'value: "openai-compatible"' "explicit provider"
 has "$out" 'value: "5"' "explicit retries"
 lacks "$out" "LLM_API_KEY_FILE" "keyless provider"
 
-out=$(helm template t "$chart" --set global.llm.gatewayUrl=http://attache-gateway:8080 \
+out=$(helm template t "$chart" --set global.llm.gatewayUrl=http://agentsc-gateway:8090 \
   --set global.llm.model=claude-sonnet-4-5)
-has "$out" 'value: "http://attache-gateway:8080"' "gateway"
+has "$out" 'value: "http://agentsc-gateway:8090"' "gateway"
 has "$out" 'value: "/var/run/secrets/llm/gateway-token"' "gateway"
 lacks "$out" "api-key" "gateway mode mounts no provider key"
 
