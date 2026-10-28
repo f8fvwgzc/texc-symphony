@@ -52,6 +52,7 @@ mod config;
 mod control;
 mod error;
 mod history;
+mod plan;
 pub mod presenter;
 mod security;
 mod server;

@@ -277,3 +277,152 @@ async fn the_task_stream_sends_the_record_and_run_events_until_the_task_is_final
     let (status, _) = harness.get("/api/v1/tasks/999/events").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn dependencies_make_a_task_wait_and_a_failed_one_is_refused() {
+    let harness = harness();
+    let (_, build) = post(&harness, "/api/v1/tasks", json!({"prompt": "build"})).await;
+    let build_id = build["id"].as_i64().unwrap();
+    let (status, deploy) = post(
+        &harness,
+        "/api/v1/tasks",
+        json!({"prompt": "deploy", "depends_on": [build_id]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{deploy}");
+    assert_schema("Task", &deploy);
+    assert_eq!(deploy["status"], "waiting");
+    assert_eq!(deploy["depends_on"], json!([build_id]));
+    let (_, page) = harness.get("/api/v1/tasks?status=waiting").await;
+    assert_schema("TaskPage", &page);
+    assert_eq!(page["tasks"][0]["id"], deploy["id"]);
+
+    for (body, status, code) in [
+        (
+            json!({"prompt": "x", "depends_on": [0]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_parameter",
+        ),
+        (
+            json!({"prompt": "x", "depends_on": [999]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_parameter",
+        ),
+        (
+            json!({"prompt": "x", "depends_on": "1"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_parameter",
+        ),
+    ] {
+        let (got, error) = post(&harness, "/api/v1/tasks", body.clone()).await;
+        assert_eq!(
+            (got, error["error"]["code"].as_str()),
+            (status, Some(code)),
+            "{body}"
+        );
+    }
+    let too_many: Vec<i64> = (1..=101).collect();
+    let (status, _) = post(
+        &harness,
+        "/api/v1/tasks",
+        json!({"prompt": "x", "depends_on": too_many}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Cancelling the dependency fails the waiting task; a new dependant of it is refused.
+    let (_, cancelled) = post(
+        &harness,
+        &format!("/api/v1/tasks/{build_id}/cancel"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(cancelled["status"], "cancelled");
+    let (_, failed) = harness
+        .get(&format!("/api/v1/tasks/{}", deploy["id"]))
+        .await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(
+        failed["error"],
+        format!("dependency task-{build_id} did not succeed")
+    );
+    let (status, error) = post(
+        &harness,
+        "/api/v1/tasks",
+        json!({"prompt": "x", "depends_on": [build_id]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["error"]["code"], "task_conflict");
+    let (status, _) = post(
+        &harness,
+        &format!("/api/v1/tasks/{}/unblock", deploy["id"]),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "unblock the dependency first");
+}
+
+#[tokio::test]
+async fn the_plan_orders_tasks_without_creating_any() {
+    let harness = harness();
+    let (_, done) = post(&harness, "/api/v1/tasks", json!({"prompt": "done"})).await;
+    let done_id = done["id"].as_i64().unwrap();
+    harness.store.start_task(done_id).await.unwrap();
+    harness
+        .store
+        .finish_task(done_id, TaskStatus::Succeeded, Some("ok".into()), None)
+        .await
+        .unwrap();
+    let (_, running) = post(&harness, "/api/v1/tasks", json!({"prompt": "running"})).await;
+    let running_id = running["id"].as_i64().unwrap();
+    harness.store.start_task(running_id).await.unwrap();
+
+    let request = json!({"tasks": [
+        {"key": "deploy", "depends_on": ["test", running_id]},
+        {"key": "test", "depends_on": ["build", done_id]},
+        {"key": "build"},
+    ]});
+    assert_schema("TaskPlanRequest", &request);
+    let (status, plan) = post(&harness, "/api/v1/tasks/plan", request).await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_schema("TaskPlan", &plan);
+    assert_eq!(plan["order"], json!(["build", "test", "deploy"]));
+    assert_eq!(plan["waves"], json!([["build"], ["test"], ["deploy"]]));
+    assert_eq!(plan["tasks"][0]["waiting_for"], json!(["test", running_id]));
+    assert_eq!(plan["tasks"][1]["waiting_for"], json!(["build"]));
+    assert_eq!(plan["tasks"][2]["status"], "queued");
+    let (_, page) = harness.get("/api/v1/tasks").await;
+    assert_eq!(
+        page["tasks"].as_array().unwrap().len(),
+        2,
+        "nothing was created"
+    );
+
+    let (status, error) = post(
+        &harness,
+        "/api/v1/tasks/plan",
+        json!({"tasks": [{"key": "a", "depends_on": ["b"]}, {"key": "b", "depends_on": ["a"]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error,
+        envelope("invalid_parameter", "dependency cycle: a -> b -> a")
+    );
+    let (status, error) = post(
+        &harness,
+        "/api/v1/tasks/plan",
+        json!({"tasks": [{"key": "a", "depends_on": [12345]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("12345")
+    );
+    let (status, _) = harness.get("/api/v1/tasks/plan").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}

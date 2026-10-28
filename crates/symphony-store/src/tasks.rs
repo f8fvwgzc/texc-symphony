@@ -5,6 +5,13 @@
 //! re-queued with an operator message; queued and blocked tasks can be cancelled directly, running
 //! ones through the orchestrator. A `running` task whose dispatch lease (`task:<id>`, see
 //! `leases`) is gone was interrupted (its process stopped) and goes back to `queued`.
+//!
+//! Dependencies (`task_dependencies`, set at creation and only on tasks that already exist, so
+//! there are no cycles): a queued task with a dependency that has not succeeded is `waiting`, a
+//! status derived from the dependencies rather than stored, and is not dispatched. Once a
+//! dependency has failed or was cancelled, its waiting dependants fail too, transitively
+//! ([`settle_dependants`]: when a task finishes, and on every dispatch pass for writes that
+//! raced).
 
 use std::fmt;
 use std::str::FromStr;
@@ -12,7 +19,7 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::db::{Db, Row, Val, vals};
+use crate::db::{Db, Row, Val, in_transaction, vals};
 use crate::error::{Result, StoreError};
 use crate::ops::{clamp_u32, timestamp};
 
@@ -31,6 +38,8 @@ pub const MAX_TASK_RESULT_BYTES: usize = 256 * 1024;
 pub enum TaskStatus {
     /// Waiting for a free agent slot.
     Queued,
+    /// Queued, but a dependency has not succeeded yet (derived, never stored).
+    Waiting,
     /// An agent is working on it.
     Running,
     /// The agent finished; `result` holds its final message.
@@ -45,8 +54,9 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     /// Every status.
-    pub const ALL: [TaskStatus; 6] = [
+    pub const ALL: [TaskStatus; 7] = [
         TaskStatus::Queued,
+        TaskStatus::Waiting,
         TaskStatus::Running,
         TaskStatus::Succeeded,
         TaskStatus::Failed,
@@ -58,6 +68,7 @@ impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             TaskStatus::Queued => "queued",
+            TaskStatus::Waiting => "waiting",
             TaskStatus::Running => "running",
             TaskStatus::Succeeded => "succeeded",
             TaskStatus::Failed => "failed",
@@ -101,6 +112,9 @@ pub struct TaskLimits {
     pub timeout_ms: Option<u64>,
 }
 
+/// Most dependencies one task may have.
+pub const MAX_TASK_DEPENDENCIES: usize = 100;
+
 /// Arguments of `Store::create_task` (validated by the caller).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NewTask {
@@ -118,6 +132,9 @@ pub struct NewTask {
     pub limits: TaskLimits,
     /// Free-form JSON object kept with the task for the submitter.
     pub metadata: Option<serde_json::Value>,
+    /// Existing tasks that must succeed before this one is dispatched.
+    #[serde(default)]
+    pub depends_on: Vec<i64>,
 }
 
 /// One task.
@@ -141,6 +158,9 @@ pub struct TaskRecord {
     pub limits: TaskLimits,
     /// Submitter metadata.
     pub metadata: Option<serde_json::Value>,
+    /// Tasks that must succeed before this one runs (ascending ids).
+    #[serde(default)]
+    pub depends_on: Vec<i64>,
     /// Current status.
     pub status: TaskStatus,
     /// Final agent message of a succeeded task.
@@ -186,8 +206,36 @@ pub struct TaskPage {
     pub next_before_id: Option<i64>,
 }
 
-const COLUMNS: &str = "id, title, prompt, repo, branch, backend, max_tokens, timeout_ms, metadata, \
-     status, result, error, attempts, created_at, updated_at, started_at, finished_at";
+/// A dependency of the `tasks` row in scope that has not succeeded.
+macro_rules! unmet_dependency {
+    () => {
+        "EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on \
+         WHERE d.task_id = tasks.id AND p.status <> 'succeeded')"
+    };
+}
+
+/// A dependency of the `tasks` row in scope that failed or was cancelled.
+macro_rules! failed_dependency {
+    () => {
+        "EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id = d.depends_on \
+         WHERE d.task_id = tasks.id AND p.status IN ('failed', 'cancelled'))"
+    };
+}
+
+/// The reported status: `waiting` for a queued task with an unmet dependency.
+const STATUS: &str = concat!(
+    "(CASE WHEN tasks.status = 'queued' AND ",
+    unmet_dependency!(),
+    " THEN 'waiting' ELSE tasks.status END)"
+);
+
+const COLUMNS: &str = concat!(
+    "id, title, prompt, repo, branch, backend, max_tokens, timeout_ms, metadata, ",
+    "(CASE WHEN tasks.status = 'queued' AND ",
+    unmet_dependency!(),
+    " THEN 'waiting' ELSE tasks.status END), ",
+    "result, error, attempts, created_at, updated_at, started_at, finished_at"
+);
 
 fn opt_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
@@ -220,6 +268,7 @@ fn task_from_row(row: &Row) -> Result<TaskRecord> {
             timeout_ms: opt_u64(row.opt_int(7)?),
         },
         metadata,
+        depends_on: Vec::new(),
         status,
         result: row.opt_text(10)?,
         error: row.opt_text(11)?,
@@ -252,6 +301,14 @@ pub(crate) fn create_task(
             "prompt must not be empty".into(),
         ));
     }
+    let mut depends_on = task.depends_on.clone();
+    depends_on.sort_unstable();
+    depends_on.dedup();
+    if depends_on.len() > MAX_TASK_DEPENDENCIES {
+        return Err(StoreError::InvalidArgument(format!(
+            "depends_on must list at most {MAX_TASK_DEPENDENCIES} tasks"
+        )));
+    }
     let metadata = task
         .metadata
         .as_ref()
@@ -259,34 +316,113 @@ pub(crate) fn create_task(
         .transpose()
         .map_err(|err| StoreError::InvalidArgument(format!("metadata: {err}")))?;
     let now_ms = now.timestamp_millis();
-    let id = db
-        .query_one(
-            "INSERT INTO tasks (title, prompt, repo, branch, backend, max_tokens, timeout_ms, \
-             metadata, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9) RETURNING id",
-            &vals![
-                task.title.as_deref(),
-                task.prompt.as_str(),
-                task.repo.as_deref(),
-                task.branch.as_deref(),
-                task.backend.as_deref(),
-                to_sql(task.limits.max_tokens),
-                to_sql(task.limits.timeout_ms),
-                metadata,
-                now_ms,
-            ],
-        )?
-        .int(0)?;
+    let id = in_transaction(db, |db| {
+        let states = task_states(db, &depends_on)?;
+        for dependency in &depends_on {
+            match states.iter().find(|(id, _)| id == dependency) {
+                None => {
+                    return Err(StoreError::InvalidArgument(format!(
+                        "depends_on: task {dependency} does not exist"
+                    )));
+                }
+                Some((_, status @ (TaskStatus::Failed | TaskStatus::Cancelled))) => {
+                    return Err(StoreError::Conflict(format!(
+                        "dependency {} is {status}; unblock it first",
+                        task_identifier(*dependency)
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        let id = db
+            .query_one(
+                "INSERT INTO tasks (title, prompt, repo, branch, backend, max_tokens, timeout_ms, \
+                 metadata, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued', ?9, ?9) RETURNING id",
+                &vals![
+                    task.title.as_deref(),
+                    task.prompt.as_str(),
+                    task.repo.as_deref(),
+                    task.branch.as_deref(),
+                    task.backend.as_deref(),
+                    to_sql(task.limits.max_tokens),
+                    to_sql(task.limits.timeout_ms),
+                    metadata,
+                    now_ms,
+                ],
+            )?
+            .int(0)?;
+        for dependency in &depends_on {
+            db.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+                &vals![id, *dependency],
+            )?;
+        }
+        Ok(id)
+    })?;
     get_task(db, id)?.ok_or_else(|| StoreError::Internal("inserted task vanished".into()))
 }
 
-pub(crate) fn get_task(db: &mut dyn Db, id: i64) -> Result<Option<TaskRecord>> {
-    db.query_opt(
-        &format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"),
-        &vals![id],
+/// The reported status of each of `ids` that exists.
+pub(crate) fn task_states(db: &mut dyn Db, ids: &[i64]) -> Result<Vec<(i64, TaskStatus)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let values: Vec<Val> = ids.iter().map(|id| Val::Int(*id)).collect();
+    db.query(
+        &format!(
+            "SELECT id, {STATUS} FROM tasks WHERE id IN ({}) ORDER BY id",
+            placeholders.join(", ")
+        ),
+        &values,
     )?
-    .map(|row| task_from_row(&row))
-    .transpose()
+    .iter()
+    .map(|row| Ok((row.int(0)?, row.text(1)?.parse::<TaskStatus>()?)))
+    .collect()
+}
+
+/// Fills `depends_on` of `tasks`.
+fn attach_dependencies(db: &mut dyn Db, tasks: &mut [TaskRecord]) -> Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let placeholders: Vec<String> = (1..=tasks.len()).map(|i| format!("?{i}")).collect();
+    let values: Vec<Val> = tasks.iter().map(|t| Val::Int(t.id)).collect();
+    let rows = db.query(
+        &format!(
+            "SELECT task_id, depends_on FROM task_dependencies WHERE task_id IN ({}) \
+             ORDER BY task_id, depends_on",
+            placeholders.join(", ")
+        ),
+        &values,
+    )?;
+    for row in rows {
+        let (task_id, dependency) = (row.int(0)?, row.int(1)?);
+        if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
+            task.depends_on.push(dependency);
+        }
+    }
+    Ok(())
+}
+
+fn with_dependencies(db: &mut dyn Db, mut tasks: Vec<TaskRecord>) -> Result<Vec<TaskRecord>> {
+    attach_dependencies(db, &mut tasks)?;
+    Ok(tasks)
+}
+
+pub(crate) fn get_task(db: &mut dyn Db, id: i64) -> Result<Option<TaskRecord>> {
+    let task = db
+        .query_opt(
+            &format!("SELECT {COLUMNS} FROM tasks WHERE id = ?1"),
+            &vals![id],
+        )?
+        .map(|row| task_from_row(&row))
+        .transpose()?;
+    Ok(match task {
+        Some(task) => with_dependencies(db, vec![task])?.pop(),
+        None => None,
+    })
 }
 
 pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage> {
@@ -302,7 +438,7 @@ pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage>
     }
     if let Some(status) = query.status {
         values.push(Val::Text(status.as_str().to_owned()));
-        clauses.push(format!("status = ?{}", values.len()));
+        clauses.push(format!("{STATUS} = ?{}", values.len()));
     }
     let where_sql = if clauses.is_empty() {
         String::new()
@@ -326,31 +462,41 @@ pub(crate) fn list_tasks(db: &mut dyn Db, query: &TaskQuery) -> Result<TaskPage>
         None
     };
     Ok(TaskPage {
-        tasks,
+        tasks: with_dependencies(db, tasks)?,
         next_before_id,
     })
 }
 
+/// Queued tasks whose dependencies have all succeeded, oldest first.
 pub(crate) fn queued_tasks(db: &mut dyn Db, limit: u32) -> Result<Vec<TaskRecord>> {
-    db.query(
-        &format!("SELECT {COLUMNS} FROM tasks WHERE status = 'queued' ORDER BY id ASC LIMIT ?1"),
-        &vals![i64::from(limit)],
-    )?
-    .iter()
-    .map(task_from_row)
-    .collect()
+    let tasks = db
+        .query(
+            &format!(
+                "SELECT {COLUMNS} FROM tasks WHERE status = 'queued' AND NOT {} \
+                 ORDER BY id ASC LIMIT ?1",
+                unmet_dependency!()
+            ),
+            &vals![i64::from(limit)],
+        )?
+        .iter()
+        .map(task_from_row)
+        .collect::<Result<Vec<_>>>()?;
+    with_dependencies(db, tasks)
 }
 
-/// `queued` → `running` (attempts + 1). `None` when the task was not queued (any more): the
-/// conditional update makes one claimant win, also across replicas.
+/// `queued` → `running` (attempts + 1). `None` when the task was not queued (any more) or waits
+/// for a dependency: the conditional update makes one claimant win, also across replicas.
 pub(crate) fn start_task(
     db: &mut dyn Db,
     id: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
     let changed = db.execute(
-        "UPDATE tasks SET status = 'running', attempts = attempts + 1, started_at = ?2, \
-         updated_at = ?2, error = NULL WHERE id = ?1 AND status = 'queued'",
+        concat!(
+            "UPDATE tasks SET status = 'running', attempts = attempts + 1, started_at = ?2, ",
+            "updated_at = ?2, error = NULL WHERE id = ?1 AND status = 'queued' AND NOT ",
+            unmet_dependency!()
+        ),
         &vals![id, now.timestamp_millis()],
     )?;
     if changed == 0 {
@@ -359,7 +505,32 @@ pub(crate) fn start_task(
     get_task(db, id)
 }
 
-/// `running` → `status` (a final status or `blocked`). `None` when the task was not running.
+/// Fails every queued task with a dependency that failed or was cancelled, transitively; returns
+/// how many.
+pub(crate) fn settle_dependants(db: &mut dyn Db, now: DateTime<Utc>) -> Result<u64> {
+    let mut failed = 0;
+    // Each pass fails one more level of dependants; a level with none ends it.
+    loop {
+        let changed = db.execute(
+            concat!(
+                "UPDATE tasks SET status = 'failed', updated_at = ?1, finished_at = ?1, ",
+                "error = 'dependency task-' || (SELECT MIN(p.id) FROM task_dependencies d ",
+                "JOIN tasks p ON p.id = d.depends_on WHERE d.task_id = tasks.id ",
+                "AND p.status IN ('failed', 'cancelled')) || ' did not succeed' ",
+                "WHERE status = 'queued' AND ",
+                failed_dependency!()
+            ),
+            &vals![now.timestamp_millis()],
+        )?;
+        if changed == 0 {
+            return Ok(failed);
+        }
+        failed += changed;
+    }
+}
+
+/// `running` → `status` (a final status or `blocked`). `None` when the task was not running. A
+/// failed or cancelled task fails its waiting dependants.
 pub(crate) fn finish_task(
     db: &mut dyn Db,
     id: i64,
@@ -368,49 +539,67 @@ pub(crate) fn finish_task(
     error: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    if matches!(status, TaskStatus::Queued | TaskStatus::Running) {
+    if matches!(
+        status,
+        TaskStatus::Queued | TaskStatus::Waiting | TaskStatus::Running
+    ) {
         return Err(StoreError::InvalidArgument(
             "finish_task needs a final or blocked status".into(),
         ));
     }
     let now_ms = now.timestamp_millis();
     let finished = status.is_final().then_some(now_ms);
-    let changed = db.execute(
-        "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, \
-         finished_at = ?6 WHERE id = ?1 AND status = 'running'",
-        &vals![
-            id,
-            status.as_str(),
-            result.map(|r| truncate(r, MAX_TASK_RESULT_BYTES)),
-            error.map(|e| truncate(e, 16 * 1024)),
-            now_ms,
-            finished,
-        ],
-    )?;
+    let changed = in_transaction(db, |db| {
+        let changed = db.execute(
+            "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, \
+             finished_at = ?6 WHERE id = ?1 AND status = 'running'",
+            &vals![
+                id,
+                status.as_str(),
+                result.map(|r| truncate(r, MAX_TASK_RESULT_BYTES)),
+                error.map(|e| truncate(e, 16 * 1024)),
+                now_ms,
+                finished,
+            ],
+        )?;
+        if changed > 0 && matches!(status, TaskStatus::Failed | TaskStatus::Cancelled) {
+            settle_dependants(db, now)?;
+        }
+        Ok(changed)
+    })?;
     if changed == 0 {
         return Ok(None);
     }
     get_task(db, id)
 }
 
-/// Cancels a `queued` or `blocked` task; anything else is returned unchanged (a running task is
-/// cancelled by the orchestrator). `None` for an unknown id.
+/// Cancels a `queued` (or `waiting`) or `blocked` task, failing its waiting dependants; anything
+/// else is returned unchanged (a running task is cancelled by the orchestrator). `None` for an
+/// unknown id.
 pub(crate) fn cancel_task(
     db: &mut dyn Db,
     id: i64,
     reason: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
-    db.execute(
-        "UPDATE tasks SET status = 'cancelled', error = ?2, updated_at = ?3, finished_at = ?3 \
-         WHERE id = ?1 AND status IN ('queued', 'blocked')",
-        &vals![id, reason, now.timestamp_millis()],
-    )?;
+    in_transaction(db, |db| {
+        let changed = db.execute(
+            "UPDATE tasks SET status = 'cancelled', error = ?2, updated_at = ?3, finished_at = ?3 \
+             WHERE id = ?1 AND status IN ('queued', 'blocked')",
+            &vals![id, reason, now.timestamp_millis()],
+        )?;
+        if changed > 0 {
+            settle_dependants(db, now)?;
+        }
+        Ok(())
+    })?;
     get_task(db, id)
 }
 
-/// Puts a `blocked` or `failed` task back to `queued`, appending `message` (the operator's reply)
-/// to its prompt. Other statuses are refused with [`StoreError::InvalidArgument`].
+/// Puts a `blocked` or `failed` task back to `queued` (or `waiting`), appending `message` (the
+/// operator's reply) to its prompt. Other statuses are refused with
+/// [`StoreError::InvalidArgument`], and a task with a failed or cancelled dependency with
+/// [`StoreError::Conflict`] (unblock the dependency first).
 pub(crate) fn requeue_task(
     db: &mut dyn Db,
     id: i64,
@@ -424,6 +613,15 @@ pub(crate) fn requeue_task(
         return Err(StoreError::InvalidArgument(format!(
             "task {id} is {}; only blocked or failed tasks can be unblocked",
             task.status
+        )));
+    }
+    if let Some((dependency, status)) = task_states(db, &task.depends_on)?
+        .into_iter()
+        .find(|(_, status)| matches!(status, TaskStatus::Failed | TaskStatus::Cancelled))
+    {
+        return Err(StoreError::Conflict(format!(
+            "task {id} depends on {}, which is {status}; unblock it first",
+            task_identifier(dependency)
         )));
     }
     let prompt = match message.map(str::trim).filter(|m| !m.is_empty()) {

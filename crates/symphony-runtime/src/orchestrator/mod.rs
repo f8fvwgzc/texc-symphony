@@ -200,10 +200,17 @@ fn fire_expiring_lease_cancels(map: &LeaseWatchMap, backstop: Duration) {
 /// Timer events (each tick/retry carries its token).
 #[derive(Debug)]
 pub(crate) enum TimerEvent {
-    Tick { token: u64 },
+    Tick {
+        token: u64,
+    },
     RunPollCycle,
-    RetryDue { issue_id: String, token: u64 },
+    RetryDue {
+        issue_id: String,
+        token: u64,
+    },
     LeaseRenew,
+    /// A task reached a final status: its dependants may be dispatchable (or failed) now.
+    TaskSettled,
 }
 
 /// `refresh_issue_for_dispatch/1` outcome.
@@ -271,8 +278,12 @@ pub(crate) enum TaskWrite {
 
 /// Applies task writes one after another, so a finish always lands before a later release of the
 /// same task, and retries a write the store refused as busy instead of dropping it (a dropped
-/// finish would leave the task `running` forever).
-fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<TaskWrite> {
+/// finish would leave the task `running` forever). A final status written asks for a poll
+/// ([`TimerEvent::TaskSettled`]), so dependants start without waiting for the next tick.
+fn spawn_task_writer(
+    store: symphony_store::Store,
+    timers: mpsc::UnboundedSender<TimerEvent>,
+) -> mpsc::UnboundedSender<TaskWrite> {
     let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
     tokio::spawn(async move {
         while let Some(write) = rx.recv().await {
@@ -304,7 +315,12 @@ fn spawn_task_writer(store: symphony_store::Store) -> mpsc::UnboundedSender<Task
                         tracing::error!("Failed to record a task status change: {err}");
                         break;
                     }
-                    Ok(()) => break,
+                    Ok(()) => {
+                        if matches!(&write, TaskWrite::Finish { status, .. } if status.is_final()) {
+                            let _ = timers.send(TimerEvent::TaskSettled);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -322,6 +338,7 @@ impl<'w> Orchestrator<'w> {
         let settings = ctx.workflow.settings();
         let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
+        let task_writes = spawn_task_writer(ctx_store, timer_tx.clone());
         let (worker_tx, worker_rx) = mpsc::unbounded_channel();
         let pause_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pause_writes = spawn_pause_writer(ctx.store.clone(), Arc::clone(&pause_in_flight));
@@ -337,7 +354,7 @@ impl<'w> Orchestrator<'w> {
             codex_streams: StreamMap::new(),
             shutdown,
             tokens: Counter::default(),
-            task_writes: spawn_task_writer(ctx_store),
+            task_writes,
             pause_writes,
             pause_in_flight,
             lease_watch: Arc::new(Mutex::new(HashMap::new())),
@@ -603,6 +620,9 @@ impl<'w> Orchestrator<'w> {
                 self.handle_retry_due(&issue_id, token).await
             }
             TimerEvent::LeaseRenew => self.renew_leases().await,
+            TimerEvent::TaskSettled => {
+                self.request_refresh();
+            }
         }
     }
 

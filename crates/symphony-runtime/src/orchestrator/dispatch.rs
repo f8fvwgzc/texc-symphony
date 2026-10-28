@@ -201,6 +201,12 @@ impl Orchestrator<'_> {
         {
             return;
         }
+        // Dependants of a task that failed while they were being created are failed here.
+        match self.ctx.store.settle_task_dependencies().await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("Failed {count} tasks whose dependency did not succeed"),
+            Err(err) => tracing::warn!("Failed to settle task dependencies: {err}"),
+        }
         let queued = match self
             .ctx
             .store

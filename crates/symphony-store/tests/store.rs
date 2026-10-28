@@ -1224,3 +1224,119 @@ async fn unblocking_cannot_grow_a_prompt_past_the_limit() {
     let still = store.get_task(task.id).await.unwrap().unwrap();
     assert_eq!(still.status, TaskStatus::Blocked);
 }
+
+fn after(prompt: &str, depends_on: &[i64]) -> symphony_store::NewTask {
+    symphony_store::NewTask {
+        depends_on: depends_on.to_vec(),
+        ..task(prompt)
+    }
+}
+
+#[tokio::test]
+async fn dependants_wait_for_their_dependencies_to_succeed() {
+    use symphony_store::{TaskQuery, TaskStatus};
+    let store = memory();
+    let build = store.create_task(task("build")).await.unwrap();
+    let lint = store.create_task(task("lint")).await.unwrap();
+    // Duplicates are ignored; ids come back sorted.
+    let deploy = store
+        .create_task(after("deploy", &[lint.id, build.id, build.id]))
+        .await
+        .unwrap();
+    assert_eq!(deploy.status, TaskStatus::Waiting);
+    assert_eq!(deploy.depends_on, vec![build.id, lint.id]);
+    let waiting = store
+        .list_tasks(TaskQuery {
+            status: Some(TaskStatus::Waiting),
+            ..TaskQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.tasks.len(), 1);
+    assert_eq!(waiting.tasks[0].depends_on, vec![build.id, lint.id]);
+    let queued: Vec<i64> = store
+        .queued_tasks(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(
+        queued,
+        vec![build.id, lint.id],
+        "a waiting task is not dispatched"
+    );
+    assert_eq!(store.start_task(deploy.id).await.unwrap(), None);
+
+    for dependency in [build.id, lint.id] {
+        store.start_task(dependency).await.unwrap().unwrap();
+        store
+            .finish_task(dependency, TaskStatus::Succeeded, Some("ok".into()), None)
+            .await
+            .unwrap();
+    }
+    let ready = store.get_task(deploy.id).await.unwrap().unwrap();
+    assert_eq!(ready.status, TaskStatus::Queued);
+    assert_eq!(store.queued_tasks(10).await.unwrap()[0].id, deploy.id);
+    assert!(store.start_task(deploy.id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_failed_dependency_fails_its_dependants_transitively() {
+    use symphony_store::TaskStatus;
+    let store = memory();
+    let a = store.create_task(task("a")).await.unwrap();
+    let b = store.create_task(after("b", &[a.id])).await.unwrap();
+    let c = store.create_task(after("c", &[b.id])).await.unwrap();
+    let other = store.create_task(task("other")).await.unwrap();
+    store.start_task(a.id).await.unwrap();
+    store
+        .finish_task(a.id, TaskStatus::Failed, None, Some("boom".into()))
+        .await
+        .unwrap();
+    for (id, failed_on) in [(b.id, a.id), (c.id, b.id)] {
+        let task = store.get_task(id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error,
+            Some(format!("dependency task-{failed_on} did not succeed"))
+        );
+        assert!(task.finished_at.is_some());
+    }
+    assert_eq!(
+        store.get_task(other.id).await.unwrap().unwrap().status,
+        TaskStatus::Queued
+    );
+    assert_eq!(store.settle_task_dependencies().await.unwrap(), 0);
+
+    // A new dependant of a failed task is refused; so is unblocking one before its dependency.
+    assert!(matches!(
+        store.create_task(after("d", &[a.id])).await,
+        Err(StoreError::Conflict(message)) if message.contains(&format!("task-{}", a.id))
+    ));
+    assert!(matches!(
+        store.requeue_task(b.id, None).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.create_task(after("e", &[9_999])).await,
+        Err(StoreError::InvalidArgument(message)) if message.contains("9999")
+    ));
+    // Unblocking the dependency, then the dependant, makes it wait again.
+    store.requeue_task(a.id, None).await.unwrap();
+    let b = store.requeue_task(b.id, None).await.unwrap().unwrap();
+    assert_eq!(b.status, TaskStatus::Waiting);
+
+    // Cancelling a waiting task fails its own dependants.
+    let f = store.create_task(after("f", &[b.id])).await.unwrap();
+    store.cancel_task(b.id, "not needed").await.unwrap();
+    assert_eq!(
+        store.get_task(f.id).await.unwrap().unwrap().status,
+        TaskStatus::Failed
+    );
+    let states = store.task_states(vec![a.id, b.id, 9_999]).await.unwrap();
+    assert_eq!(
+        states,
+        vec![(a.id, TaskStatus::Queued), (b.id, TaskStatus::Cancelled)]
+    );
+}

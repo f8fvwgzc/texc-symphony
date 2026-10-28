@@ -1,7 +1,10 @@
 //! The task API: work assigned by products directly, without a tracker issue.
 //!
 //! * `POST /api/v1/tasks` queues a task (prompt, optional repository, backend, limits,
-//!   metadata) and asks the orchestrator to poll now.
+//!   metadata, the existing tasks it depends on) and asks the orchestrator to poll now. A task
+//!   waits (`waiting`) until its dependencies have succeeded, and fails once one of them fails.
+//! * `POST /api/v1/tasks/plan` plans a set of tasks without creating or running anything
+//!   ([`crate::plan`]): their order, waves and what each would wait for.
 //! * `GET /api/v1/tasks` / `GET /api/v1/tasks/{id}` read them from the store.
 //! * `POST /api/v1/tasks/{id}/cancel` stops a running task (through the orchestrator) or
 //!   cancels a queued / blocked one.
@@ -28,7 +31,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use symphony_core::task::{MAX_TASK_PROMPT_BYTES, valid_branch, valid_repo_url};
 use symphony_store::{
-    NewTask, RunQuery, RunStatus, TaskLimits, TaskPage, TaskQuery, TaskRecord, TaskStatus,
+    MAX_TASK_DEPENDENCIES, NewTask, RunQuery, RunStatus, TaskLimits, TaskPage, TaskQuery,
+    TaskRecord, TaskStatus,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -39,6 +43,8 @@ use crate::history::{enabled_store, invalid, limit_param, parse_query};
 
 // The API's prompt limit is the store's (operator replies may not grow a prompt past it either).
 const _: () = assert!(MAX_TASK_PROMPT_BYTES == symphony_store::MAX_TASK_PROMPT_BYTES);
+// The messages above name the limit.
+const _: () = assert!(MAX_TASK_DEPENDENCIES == 100);
 
 /// Default and maximum page size of `GET /api/v1/tasks`.
 const TASKS_LIMIT: (u32, u32) = (50, 200);
@@ -61,6 +67,8 @@ pub(crate) struct CreateTask {
     #[serde(default)]
     limits: Option<CreateLimits>,
     metadata: Option<Value>,
+    #[serde(default)]
+    depends_on: Vec<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -141,6 +149,15 @@ fn validate(app: &AppState, request: CreateTask) -> Result<NewTask, ApiError> {
             return Err(invalid("metadata must be at most 16384 bytes of JSON"));
         }
     }
+    let mut depends_on = request.depends_on;
+    depends_on.sort_unstable();
+    depends_on.dedup();
+    if depends_on.iter().any(|id| *id < 1) {
+        return Err(invalid("depends_on must list positive task ids"));
+    }
+    if depends_on.len() > MAX_TASK_DEPENDENCIES {
+        return Err(invalid("depends_on must list at most 100 tasks"));
+    }
     Ok(NewTask {
         title,
         prompt,
@@ -152,6 +169,7 @@ fn validate(app: &AppState, request: CreateTask) -> Result<NewTask, ApiError> {
             timeout_ms: limits.timeout_ms,
         },
         metadata: request.metadata,
+        depends_on,
     })
 }
 
@@ -195,7 +213,9 @@ pub(crate) async fn list(
     let status = match params.get("status") {
         None => None,
         Some(raw) => Some(raw.parse::<TaskStatus>().map_err(|_| {
-            invalid("status must be one of queued, running, succeeded, failed, cancelled, blocked")
+            invalid(
+                "status must be one of queued, waiting, running, succeeded, failed, cancelled, blocked",
+            )
         })?),
     };
     let store = enabled_store(&app)?;

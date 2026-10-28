@@ -152,6 +152,7 @@ impl From<StoreError> for ApiError {
         match err {
             StoreError::RunNotFound(_) => ApiError::RunNotFound,
             StoreError::InvalidArgument(message) => ApiError::InvalidParameter(message),
+            StoreError::Conflict(message) => ApiError::Conflict(message),
             StoreError::Unavailable => {
                 tracing::warn!(error = %err, "run history store unavailable");
                 ApiError::request_failed(StatusCode::SERVICE_UNAVAILABLE)
