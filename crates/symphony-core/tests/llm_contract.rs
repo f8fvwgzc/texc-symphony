@@ -124,7 +124,7 @@ fn gateway_mode_sends_everything_to_the_gateway_with_its_token() {
     let env = MapEnv::new()
         .with(
             "LLM_GATEWAY_URL",
-            "http://attache-gateway.platform:8080/v1/",
+            "http://agentsc-gateway.platform:8090/v1/",
         )
         .with(
             "LLM_GATEWAY_TOKEN_FILE",
@@ -136,7 +136,7 @@ fn gateway_mode_sends_everything_to_the_gateway_with_its_token() {
     let llm = settings.llm.clone().unwrap();
     assert_eq!(
         llm.gateway.as_ref().unwrap().url,
-        "http://attache-gateway.platform:8080"
+        "http://agentsc-gateway.platform:8090"
     );
     assert_eq!(
         llm.credential(),
@@ -150,21 +150,21 @@ fn gateway_mode_sends_everything_to_the_gateway_with_its_token() {
         ApiProvider::Anthropic,
         "the default wire in gateway mode"
     );
-    assert_eq!(api.base_url, "http://attache-gateway.platform:8080");
+    assert_eq!(api.base_url, "http://agentsc-gateway.platform:8090");
     assert_eq!(
         api.api_key_file.as_deref(),
         Some(std::path::Path::new("/var/run/secrets/llm/gateway-token"))
     );
     assert_eq!(api.api_key_env, None, "no provider key in gateway mode");
     let codex = settings.codex.provider.clone().unwrap();
-    assert_eq!(codex.base_url, "http://attache-gateway.platform:8080/v1");
+    assert_eq!(codex.base_url, "http://agentsc-gateway.platform:8090/v1");
 
     // OpenAI wire through the gateway.
     let env = env.with("LLM_PROVIDER", "openai");
     let settings = parse(&env, json!({})).unwrap();
     assert_eq!(
         api_url(&settings),
-        "http://attache-gateway.platform:8080/v1"
+        "http://agentsc-gateway.platform:8090/v1"
     );
 }
 
