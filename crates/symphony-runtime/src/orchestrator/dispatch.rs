@@ -56,8 +56,18 @@ impl Orchestrator<'_> {
             }
             return;
         }
+        let Some(issue_id) = issue.id.clone() else {
+            return;
+        };
+        if !self.take_lease(&issue_id).await {
+            return;
+        }
         if let Revalidation::Ok(refreshed) = self.refresh_issue_for_dispatch(&issue).await {
             self.do_dispatch_issue(refreshed, attempt, preferred);
+        }
+        // Lease held ⇔ claimed.
+        if !self.state.claimed.contains(&issue_id) {
+            self.drop_lease(&issue_id);
         }
     }
 
@@ -213,7 +223,11 @@ impl Orchestrator<'_> {
                 continue;
             }
             let issue = task_issue(&task);
+            if !self.take_lease(&issue_id).await {
+                continue;
+            }
             let Ok(Some(task)) = self.ctx.store.start_task(task.id).await else {
+                self.drop_lease(&issue_id);
                 continue;
             };
             let refusal = if settings.backend(task.backend.as_deref()).is_none() {
@@ -227,6 +241,7 @@ impl Orchestrator<'_> {
             if let Some(error) = refusal {
                 tracing::warn!("Not running {}: {error}", issue_context(&issue));
                 self.task_finish(task.id, TaskStatus::Failed, None, Some(error));
+                self.drop_lease(&issue_id);
                 continue;
             }
             let plan = RunPlan {
@@ -298,6 +313,7 @@ impl Orchestrator<'_> {
         let (codex_tx, codex_rx) = mpsc::unbounded_channel();
         let (done_tx, done_rx) = oneshot::channel::<()>();
         let cancel = self.shutdown.child_token();
+        let cancel_for_watch = cancel.clone();
         let ctx = WorkerContext {
             issue: issue.clone(),
             attempt,
@@ -391,6 +407,9 @@ impl Orchestrator<'_> {
             },
         );
         self.state.claimed.insert(issue_id.clone());
+        // Watch this run's lease so the watchdog can cancel it near expiry even if the actor loop
+        // parks; the lease (shared stores only) was taken just before this spawn.
+        self.watch_lease(&issue_id, &cancel_for_watch);
         self.remove_retry_entry(&issue_id);
     }
 }

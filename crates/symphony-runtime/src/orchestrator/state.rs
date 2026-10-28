@@ -282,6 +282,9 @@ pub(crate) struct State {
     pub codex_rate_limits: Option<Value>,
     /// Budget counters and the kill switch.
     pub spend: Spend,
+    /// Dispatch leases this replica holds (issue ids; renewed until the claim is released), each
+    /// with the local time by which it expires unless renewed again.
+    pub leases: HashMap<String, Instant>,
 }
 
 impl State {

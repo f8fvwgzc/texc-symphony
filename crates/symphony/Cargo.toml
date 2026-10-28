@@ -41,7 +41,7 @@ unicode-segmentation = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 # Terminal size (`tcgetwinsize`) and `PR_SET_DUMPABLE` without `unsafe`; same version as the
 # other crates.
-rustix = { version = "1.1.5", features = ["process", "termios"] }
+rustix = { version = "1.1.5", features = ["process", "termios", "fs"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
@@ -50,7 +50,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "1.1.5", features = ["process", "termios"] }
+rustix = { version = "1.1.5", features = ["process", "termios", "fs"] }
 
 [lints]
 workspace = true

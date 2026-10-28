@@ -371,24 +371,56 @@ impl Serialize for CodexEvent {
     }
 }
 
+/// A rewrite applied to every event before it is delivered (see [`EventSink::with_filter`]).
+pub type EventFilter = std::sync::Arc<dyn Fn(CodexEvent) -> CodexEvent + Send + Sync>;
+
 /// Where a turn's events go (Elixir's `on_message`). Sends never block; a dropped receiver is ignored.
-#[derive(Debug, Clone, Default)]
-pub struct EventSink(Option<UnboundedSender<CodexEvent>>);
+#[derive(Clone, Default)]
+pub struct EventSink {
+    tx: Option<UnboundedSender<CodexEvent>>,
+    filter: Option<EventFilter>,
+}
+
+impl std::fmt::Debug for EventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventSink")
+            .field("connected", &self.tx.is_some())
+            .field("filtered", &self.filter.is_some())
+            .finish()
+    }
+}
 
 impl EventSink {
     /// Forwards events to `tx`.
     pub fn new(tx: UnboundedSender<CodexEvent>) -> Self {
-        Self(Some(tx))
+        Self {
+            tx: Some(tx),
+            filter: None,
+        }
     }
 
     /// Discards events (Elixir's default no-op `on_message`).
     pub fn none() -> Self {
-        Self(None)
+        Self::default()
+    }
+
+    /// This sink with `filter` applied to every event first (after any earlier filter), e.g.
+    /// to redact a per-run secret before events leave the run.
+    pub fn with_filter(mut self, filter: EventFilter) -> Self {
+        self.filter = Some(match self.filter.take() {
+            None => filter,
+            Some(first) => std::sync::Arc::new(move |event| filter(first(event))),
+        });
+        self
     }
 
     /// Delivers one event.
     pub fn emit(&self, event: CodexEvent) {
-        if let Some(tx) = &self.0 {
+        if let Some(tx) = &self.tx {
+            let event = match &self.filter {
+                Some(filter) => filter(event),
+                None => event,
+            };
             // The receiver may be gone (worker torn down); events are best-effort like `send/2`.
             let _ = tx.send(event);
         }

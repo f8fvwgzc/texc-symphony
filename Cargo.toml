@@ -53,6 +53,9 @@ percent-encoding = "2.3.2"
 base64 = "0.23.1"
 httpdate = "1.0.3"
 wiremock = "0.6.5"
+# GitHub App JWTs (RS256) for task credentials (symphony-runtime); the same aws-lc-rs build
+# rustls already uses, so no second crypto stack.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # HTTP server stack (symphony-server)
 axum = "0.8.9"
 tower = "0.5.3"

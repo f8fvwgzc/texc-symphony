@@ -63,6 +63,7 @@ impl Orchestrator<'_> {
 
     /// `release_issue_claim/2`.
     pub(crate) fn release_issue_claim(&mut self, issue_id: &str) {
+        self.drop_lease(issue_id);
         self.state.claimed.remove(issue_id);
         self.state.blocked.remove(issue_id);
         // Bookkeeping sets must not grow with every issue ever seen.
@@ -292,6 +293,15 @@ impl Orchestrator<'_> {
             );
             let meta = no_slots(meta, &issue);
             self.schedule_issue_retry(issue_id, Some(attempt + 1), meta, DelayType::Failure);
+            return;
+        }
+        if !self.take_lease(issue_id).await {
+            // Another replica took the issue over (a shared store restored the same retry).
+            tracing::info!(
+                "Dropping the retry of {}: another replica holds it",
+                issue_context(&issue)
+            );
+            self.release_issue_claim(issue_id);
             return;
         }
         match self.refresh_issue_for_dispatch(&issue).await {

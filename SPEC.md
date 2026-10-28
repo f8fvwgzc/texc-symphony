@@ -1696,6 +1696,15 @@ Agent backends:
 - A backend that executes tools itself (instead of the agent CLI) MUST confine file access to the
   workspace and SHOULD confine shell commands with an OS sandbox.
 
+Shared state and isolation (extensions):
+
+- Several orchestrator replicas MAY share one database. They then MUST NOT run the same issue or
+  task at once (Symphony: a renewed dispatch lease per issue id), and MUST recover the work of a
+  replica that stopped (its runs closed, its tasks queued again) once its leases expire.
+- For multi-tenant task runs an implementation MAY run each task as its own OS user, with
+  short-lived credentials scoped to the task's repository instead of the operator's, and with
+  network egress denied except the model gateway and that repository's host.
+
 ## 14. Failure Model and Recovery Strategy
 
 ### 14.1 Failure Classes

@@ -1102,13 +1102,13 @@ components:
       additionalProperties: false
       properties:
         auth_required: { type: boolean, description: 'Whether `/api/*` needs `Authorization: Bearer <token>`.' }
-        status: { type: string, const: ok }
+        status: { type: string, enum: [ok, degraded], description: '`degraded` when the store database connection is lost.' }
         version: { type: string, description: 'Crate version of the `symphony` binary.' }
         uptime_seconds: { type: integer, minimum: 0, description: 'Whole seconds since the HTTP server started.' }
         store:
           type: string
-          enum: [sqlite, disabled]
-          description: Whether run history endpoints are available.
+          enum: [sqlite, postgres, disabled]
+          description: Whether run history endpoints are available, and which database serves them.
 
     TaskStatus:
       type: string

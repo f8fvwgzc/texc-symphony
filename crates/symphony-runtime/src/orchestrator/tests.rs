@@ -49,11 +49,12 @@ impl Harness {
     ) -> Self {
         let wf = TestWorkflow::new(config);
         let memory = MemoryIssues::new();
-        let options = RuntimeOptions::new(Arc::clone(&wf.store), TrackerDeps::new().unwrap())
+        let mut options = RuntimeOptions::new(Arc::clone(&wf.store), TrackerDeps::new().unwrap())
             .with_tracker(Arc::new(MemoryTracker::new(memory.clone())))
             .with_worker_factory(factory);
-        let mut options = customize(options);
+        // Default cancel grace, set before `customize` so a test can override it.
         options.worker_cancel_grace = Duration::from_millis(500);
+        let options = customize(options);
         let (gen_tx, generation) = watch::channel(0);
         let ctx = Arc::new(RuntimeContext::from_options(&options, gen_tx));
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -96,6 +97,19 @@ fn blocking_factory(started: Started) -> Arc<dyn WorkerFactory> {
             ctx.cancel.cancelled().await;
             Err(RunError::Cancelled)
         }
+    }))
+}
+
+/// Worker that records its start, then ignores cancellation entirely — only an abort after the
+/// cancel grace stops it. Lets a test make `stop_worker` take the full grace.
+fn uncancellable_factory(started: Started) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        started.lock().unwrap().push((
+            ctx.issue.id.clone().unwrap_or_default(),
+            ctx.attempt,
+            ctx.worker_host.clone(),
+        ));
+        async move { std::future::pending::<WorkerResult>().await }
     }))
 }
 
@@ -1483,6 +1497,77 @@ async fn an_issue_over_its_budget_is_stopped_and_blocked_with_cost_recorded() {
     assert_eq!(run.cost_micro_usd, 400);
 }
 
+/// Fix 2: on a shared store, `renew_leases` runs `enforce_spend` with no timeout around it, so a
+/// run it stops is released all the way — claim and dispatch lease dropped, not just removed from
+/// `running`. A timeout firing after `state.running.remove` but before `drop_lease`/`claimed.remove`
+/// would strand the task `running` with its lease renewed forever; this drives the exact path.
+///
+/// Guard: the worker ignores cancellation and the cancel grace (9s) exceeds `LEASE_RENEW_TIMEOUT`
+/// (7.5s), so `stop_running_issue` sits in `stop_worker` past that bound. If a timeout were
+/// restored around `enforce_spend`, it would fire mid-stop and the final assertions would fail.
+#[tokio::test(start_paused = true)]
+async fn shared_store_renew_cycle_releases_a_spend_stopped_run_completely() {
+    let store = Store::open_in_memory_shared().unwrap();
+    assert!(
+        store.is_shared(),
+        "the renew/reconcile block only runs on a shared store"
+    );
+    let started: Started = Arc::default();
+    let store_for_opts = store.clone();
+    let mut h = Harness::build(
+        json!({}),
+        uncancellable_factory(Arc::clone(&started)),
+        |options| {
+            let mut options = options.with_store(store_for_opts);
+            // Longer than LEASE_RENEW_TIMEOUT (7.5s): a restored `enforce_spend` timeout would fire
+            // before this worker's forced abort, stranding the run.
+            options.worker_cancel_grace = LEASE_RENEW_TIMEOUT + Duration::from_secs(2);
+            options
+        },
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    // A held dispatch lease, as a shared-store run always has.
+    assert!(orch.take_lease("i-1").await);
+    assert!(orch.state.leases.contains_key("i-1"));
+
+    // Engage the kill switch and persist it, so `sync_kill_switch` (which runs first in the block)
+    // sees the store and memory agree and makes no change, leaving `enforce_spend` to stop the run.
+    let (reply, ack) = tokio::sync::oneshot::channel();
+    orch.handle_command(RuntimeCommand::SetPaused {
+        paused: true,
+        reason: Some("runaway spend".into()),
+        reply,
+    })
+    .await;
+    ack.await.unwrap();
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(ms(10)).await;
+    }
+
+    orch.renew_leases().await;
+
+    assert!(
+        orch.state.running.is_empty(),
+        "the stopped run left `running`"
+    );
+    assert!(
+        !orch.state.claimed.contains("i-1"),
+        "its claim was released"
+    );
+    assert!(
+        !orch.state.leases.contains_key("i-1"),
+        "its dispatch lease was dropped (not left to renew forever)"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn stored_history_counts_toward_the_issue_budget_after_a_restart() {
     let store = Store::open_in_memory().unwrap();
@@ -1856,10 +1941,441 @@ async fn the_kill_switch_puts_running_tasks_back_in_the_queue_and_restarts_reque
     let _ = orch.set_paused(false, None);
     orch.maybe_dispatch().await;
     assert!(orch.state.running.contains_key(&format!("task:{id}")));
-    // A process that dies mid-run leaves the task running; the next start queues it again.
+    // A process that dies mid-run leaves the task running under its lease: nothing recovers it
+    // while the lease lives. A restart drops the old process's leases and queues it again.
     drop(orch);
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 0);
+    store.release_owner_leases("local").await.unwrap();
     assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
     task_status(&store, id, TaskStatus::Queued).await;
+}
+
+// ----- dispatch leases (replicas sharing a store) -----------------------------------------
+
+/// A second orchestrator ("replica") on the same store.
+fn replica(store: &Store, id: &str, factory: Arc<dyn WorkerFactory>, config: Value) -> Harness {
+    let id = id.to_owned();
+    let store = store.clone();
+    Harness::build(config, factory, move |options| {
+        options.with_store(store).with_replica_id(id)
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn replicas_never_run_the_same_issue_or_task_at_once() {
+    let store = Store::open_in_memory().unwrap();
+    let started_a: Started = Arc::default();
+    let started_b: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started_a)),
+        json!({}),
+    );
+    let mut b = replica(
+        &store,
+        "b",
+        blocking_factory(Arc::clone(&started_b)),
+        json!({}),
+    );
+    for h in [&a, &b] {
+        h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    }
+    let mut workers_a = WorkerSet::default();
+    let mut workers_b = WorkerSet::default();
+    let mut orch_a = a.orchestrator(&mut workers_a);
+    let mut orch_b = b.orchestrator(&mut workers_b);
+
+    orch_a
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_a.state.running.contains_key("i-1"));
+    assert!(orch_b.state.running.is_empty(), "b sees a's lease");
+    assert!(!orch_b.state.claimed.contains("i-1"));
+    assert_eq!(
+        store.lease_holder("i-1").await.unwrap().as_deref(),
+        Some("a")
+    );
+
+    // A task queued once is started by one replica only.
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    orch_b.maybe_dispatch().await;
+    orch_a.maybe_dispatch().await;
+    let key = format!("task:{}", task.id);
+    assert!(orch_b.state.running.contains_key(&key));
+    assert!(!orch_a.state.running.contains_key(&key));
+    assert_eq!(
+        store.lease_holder(&key).await.unwrap().as_deref(),
+        Some("b")
+    );
+
+    // Released with the claim: the other replica may take the issue now.
+    orch_a.terminate_running_issue("i-1", false, "test").await;
+    assert!(!orch_a.state.leases.contains_key("i-1"));
+    let mut released = false;
+    for _ in 0..100 {
+        if store.lease_holder("i-1").await.unwrap().is_none() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(released);
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_b.state.running.contains_key("i-1"));
+    assert_eq!(started_a.lock().unwrap().len(), 1);
+    assert_eq!(started_b.lock().unwrap().len(), 2);
+
+    // Renewal keeps held leases alive and reports none lost.
+    orch_b.renew_leases().await;
+    assert_eq!(
+        store.lease_holder("i-1").await.unwrap().as_deref(),
+        Some("b")
+    );
+    orch_b.terminate_running_issue("i-1", false, "test").await;
+    orch_b.terminate_running_issue(&key, false, "test").await;
+}
+
+// Real time: under a paused clock the renewal's timeout would fire while the store thread is
+// still answering (the clock jumps whenever the runtime idles).
+#[tokio::test]
+async fn a_replica_that_lost_its_leases_stops_the_runs_and_leaves_the_task_to_the_new_owner() {
+    use symphony_store::TaskStatus;
+    let store = Store::open_in_memory().unwrap();
+    let started: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    a.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = a.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    let task = store
+        .create_task(symphony_store::NewTask {
+            prompt: "x".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    orch.maybe_dispatch().await;
+    let key = format!("task:{}", task.id);
+    assert!(orch.state.running.contains_key("i-1"));
+    assert!(orch.state.running.contains_key(&key));
+
+    // `a` was cut off long enough for both leases to expire, and `b` took them.
+    for lease in ["i-1", key.as_str()] {
+        store.release_lease(lease, "a").await.unwrap();
+        assert!(
+            store
+                .acquire_lease(lease, "b", std::time::Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+    }
+    orch.renew_leases().await;
+    assert!(orch.state.running.is_empty(), "a stopped both runs");
+    assert!(orch.state.leases.is_empty());
+    tokio::time::sleep(ms(50)).await;
+    for lease in ["i-1", key.as_str()] {
+        assert_eq!(
+            store.lease_holder(lease).await.unwrap().as_deref(),
+            Some("b"),
+            "b's lease is left alone"
+        );
+    }
+    // The task is b's now: a did not put it back to `queued` (b runs it).
+    assert_eq!(
+        store.get_task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Running
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_renewal_stuck_on_the_database_is_not_waited_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    let started: Started = Arc::default();
+    let mut h = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    // Another connection holds the write lock: the renewal waits on it (an unresponsive
+    // database), and the orchestrator must move on after LEASE_RENEW_TIMEOUT.
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let deadline = orch.state.leases["i-1"];
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let real = std::time::Instant::now();
+    orch.renew_leases().await;
+    assert_eq!(
+        orch.state.leases["i-1"], deadline,
+        "the renewal did not succeed (the lock held)"
+    );
+    assert!(
+        real.elapsed() < symphony_store::BUSY_TIMEOUT / 2,
+        "renew_leases waited for the stuck store ({:?})",
+        real.elapsed()
+    );
+    assert!(
+        orch.state.running.contains_key("i-1"),
+        "one failed renewal is tolerated"
+    );
+    drop(lock);
+    orch.terminate_running_issue("i-1", false, "test").await;
+}
+
+#[tokio::test]
+async fn a_lease_is_stopped_before_a_second_missed_renewal_could_let_it_expire() {
+    use std::collections::HashMap;
+    let renewed = tokio::time::Instant::now();
+    let leases = HashMap::from([("k".to_owned(), renewed + LEASE_TTL)]);
+    // One failed renewal is tolerated; at the second the lease would expire before the third.
+    assert!(expiring_leases(&leases, renewed + LEASE_RENEW_EVERY).is_empty());
+    assert_eq!(
+        expiring_leases(&leases, renewed + 2 * LEASE_RENEW_EVERY),
+        vec!["k".to_owned()]
+    );
+    // Stopped while the lease is still ours, with at least a renewal period to spare.
+    assert!(2 * LEASE_RENEW_EVERY + LEASE_RENEW_EVERY <= LEASE_TTL);
+}
+
+fn watched(deadline: tokio::time::Instant, cancel: &CancellationToken) -> LeaseWatch {
+    LeaseWatch {
+        deadline,
+        cancel: cancel.clone(),
+        fenced: false,
+    }
+}
+
+/// Fix 1: the watchdog is a strict backstop. It cancels a run only once its lease is within the
+/// backstop margin — which is shorter than `LEASE_STOP_WINDOW`, so a run merely inside the actor's
+/// own (renewal-cadence) fence window, i.e. one tolerated missed renewal, is left alone. On firing
+/// it also sets `fenced` so the actor abandons rather than fails the run.
+#[tokio::test(start_paused = true)]
+async fn fire_expiring_lease_cancels_only_past_the_backstop() {
+    let backstop = lease_watchdog_backstop(Duration::from_secs(10));
+    assert!(
+        backstop < LEASE_STOP_WINDOW,
+        "the backstop must fire after the actor's own fence"
+    );
+    let now = tokio::time::Instant::now();
+    let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let fresh = CancellationToken::new();
+    let actor_window = CancellationToken::new();
+    let past_backstop = CancellationToken::new();
+    {
+        let mut guard = map.lock().unwrap();
+        // Just renewed: a full TTL out.
+        guard.insert("fresh".to_owned(), watched(now + LEASE_TTL, &fresh));
+        // Inside the actor's LEASE_STOP_WINDOW but not the backstop: one missed renewal, tolerated.
+        guard.insert(
+            "actor_window".to_owned(),
+            watched(
+                now + LEASE_STOP_WINDOW - Duration::from_secs(1),
+                &actor_window,
+            ),
+        );
+        // Within the backstop: the actor has been parked far past its own fence.
+        guard.insert(
+            "past_backstop".to_owned(),
+            watched(now + backstop - Duration::from_secs(1), &past_backstop),
+        );
+    }
+    fire_expiring_lease_cancels(&map, backstop);
+    assert!(
+        !fresh.is_cancelled(),
+        "a freshly-renewed lease keeps running"
+    );
+    assert!(
+        !actor_window.is_cancelled(),
+        "inside the actor's fence window but not the backstop: left for the actor to renew"
+    );
+    assert!(
+        past_backstop.is_cancelled(),
+        "within the backstop: cancelled"
+    );
+    assert!(
+        map.lock().unwrap()["past_backstop"].fenced,
+        "firing marks the run fenced so the actor abandons it"
+    );
+}
+
+/// Fix 1: the watchdog task cancels an expiring run on its own schedule, with no actor loop
+/// running at all — proving the fence survives a parked actor that can no longer renew or process
+/// the `LeaseRenew` timer. The cancel happens before the lease deadline.
+#[tokio::test(start_paused = true)]
+async fn the_lease_watchdog_cancels_an_unrenewed_run_without_the_actor_loop() {
+    let backstop = lease_watchdog_backstop(Duration::from_secs(10));
+    let start = tokio::time::Instant::now();
+    let deadline = start + LEASE_TTL;
+    let map: LeaseWatchMap = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let shutdown = CancellationToken::new();
+    let token = CancellationToken::new();
+    map.lock()
+        .unwrap()
+        .insert("i-1".to_owned(), watched(deadline, &token));
+    let watchdog = tokio::spawn(run_lease_watchdog(
+        Arc::clone(&map),
+        shutdown.clone(),
+        backstop,
+    ));
+
+    // Outside the backstop (still within the actor's tolerated window): left alone.
+    tokio::time::advance(LEASE_TTL - backstop - LEASE_RENEW_EVERY).await;
+    tokio::task::yield_now().await;
+    assert!(!token.is_cancelled(), "not yet within the backstop");
+
+    // Nothing renews the lease (the actor loop is parked); the watchdog cancels once inside it.
+    for _ in 0..LEASE_TTL.as_secs() {
+        if token.is_cancelled() {
+            break;
+        }
+        tokio::time::advance(LEASE_WATCHDOG_INTERVAL).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(token.is_cancelled(), "the watchdog cancelled the run");
+    assert!(
+        tokio::time::Instant::now() < deadline,
+        "the cancel happened before the lease deadline"
+    );
+    assert!(
+        map.lock().unwrap()["i-1"].fenced,
+        "the run is marked fenced"
+    );
+    shutdown.cancel();
+    let _ = watchdog.await;
+}
+
+/// Fix (bug 2): a run the watchdog fenced is abandoned, not failed — its lease and claim are
+/// dropped and no failure retry is scheduled (which `handle_agent_down` would do for a plain
+/// `Cancelled` exit). The workspace is kept (already sealed by the runner).
+#[tokio::test(start_paused = true)]
+async fn a_watchdog_fenced_run_is_abandoned_not_retried_as_a_failure() {
+    let store = Store::open_in_memory_shared().unwrap();
+    let started: Started = Arc::default();
+    let mut h = Harness::with_store(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.running.contains_key("i-1"));
+    assert!(orch.state.leases.contains_key("i-1"));
+
+    // Simulate the watchdog firing: mark fenced and cancel the worker, as `fire_expiring_lease_cancels` does.
+    {
+        let mut watches = orch.lease_watch.lock().unwrap();
+        let watch = watches.get_mut("i-1").expect("the run is watched");
+        watch.fenced = true;
+        watch.cancel.cancel();
+    }
+    // The worker exits `Cancelled`; the actor processes the join as an abandon.
+    run_until(&mut orch, |o| !o.state.running.contains_key("i-1")).await;
+
+    assert!(orch.state.running.is_empty());
+    assert!(
+        !orch.state.claimed.contains("i-1"),
+        "abandoned: the claim is released"
+    );
+    assert!(
+        !orch.state.leases.contains_key("i-1"),
+        "abandoned: the dispatch lease is dropped (a stale renewal can't revive it)"
+    );
+    assert!(
+        !orch.state.retry_attempts.contains_key("i-1"),
+        "abandon must not schedule a failure retry"
+    );
+    assert!(orch.state.blocked.is_empty());
+}
+
+/// A run that finished on its own (here `Ok`) while the actor was parked trips the fence flag too
+/// (its lease neared the deadline), but it was never cancelled and carries a real outcome. Since we
+/// fence before expiry, the lease is still ours: the outcome must be recorded, not abandoned and
+/// requeued (which would re-run the agent — duplicate PRs/spend).
+#[tokio::test(start_paused = true)]
+async fn a_fenced_flag_does_not_abandon_a_run_that_finished_on_its_own() {
+    let store = Store::open_in_memory_shared().unwrap();
+    let mut h = Harness::with_store(json!({}), result_factory(|| Ok(())), store.clone());
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch.state.leases.contains_key("i-1"));
+    // The watchdog flags it (lease near its deadline) even though the worker finished Ok and was
+    // never cancelled.
+    orch.lease_watch
+        .lock()
+        .unwrap()
+        .get_mut("i-1")
+        .expect("the run is watched")
+        .fenced = true;
+    run_until(&mut orch, |o| o.state.completed.contains("i-1")).await;
+    assert!(
+        orch.state.completed.contains("i-1"),
+        "the Ok outcome is recorded (not abandoned as a fence)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_drops_a_restored_retry_that_another_replica_holds() {
+    let store = Store::open_in_memory().unwrap();
+    store
+        .acquire_lease("i-1", "other", std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let mut h = replica(
+        &store,
+        "me",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.state.claimed.insert("i-1".into());
+    orch.schedule_issue_retry(
+        "i-1",
+        Some(1),
+        RetryMeta {
+            identifier: Some("MT-1".into()),
+            ..RetryMeta::default()
+        },
+        DelayType::Continuation,
+    );
+    run_until(&mut orch, |o| !o.state.claimed.contains("i-1")).await;
+    assert!(orch.state.running.is_empty());
+    assert!(orch.state.retry_attempts.is_empty());
+    assert!(started.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1936,6 +2452,58 @@ async fn raising_the_issue_budget_releases_budget_blocked_issues() {
         .await;
     assert!(orch.state.running.contains_key("i-1"));
     orch.terminate_running_issue("i-1", false, "test").await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_of_one_replica_reaches_the_others() {
+    let store = Store::open_in_memory().unwrap();
+    let started: Started = Arc::default();
+    let mut a = replica(
+        &store,
+        "a",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    let mut b = replica(
+        &store,
+        "b",
+        blocking_factory(Arc::clone(&started)),
+        json!({}),
+    );
+    b.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers_a = WorkerSet::default();
+    let mut workers_b = WorkerSet::default();
+    let mut orch_a = a.orchestrator(&mut workers_a);
+    let mut orch_b = b.orchestrator(&mut workers_b);
+    orch_b
+        .dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert!(orch_b.state.running.contains_key("i-1"));
+
+    let _ = orch_a.set_paused(true, Some("incident".into()));
+    let mut persisted = false;
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_some() {
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(persisted);
+    orch_b.sync_kill_switch().await;
+    orch_b.enforce_spend().await;
+    assert_eq!(orch_b.state.spend.paused.as_deref(), Some("incident"));
+    assert!(orch_b.state.running.is_empty(), "b stopped its agents");
+
+    let _ = orch_a.set_paused(false, None);
+    for _ in 0..100 {
+        if store.control(PAUSED_CONTROL_KEY).await.unwrap().is_none() {
+            break;
+        }
+        tokio::time::sleep(ms(5)).await;
+    }
+    orch_b.sync_kill_switch().await;
+    assert_eq!(orch_b.state.spend.paused, None);
 }
 
 #[tokio::test]

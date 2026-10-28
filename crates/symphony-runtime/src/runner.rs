@@ -17,10 +17,16 @@
 //! `after_run` runs whenever the workspace exists: after success, after a failure, and — unlike Elixir
 //! (G4) — also when the orchestrator cancels the run (bounded by the cancellation grace period). It
 //! does not run if the worker is aborted outright or panics.
+//!
+//! With `isolation:` a task run is isolated ([`crate::isolation`]): its own uid, a repository
+//! token of its own and a default-deny network, set up before the clone and torn down with the run.
 
 // Modified 2026-10-25: runs every backend through symphony_agents::AgentBackend; task runs (Part B).
+// Modified 2026-10-26: task isolation (uid, repository token, egress proxy).
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,11 +44,69 @@ use symphony_trackers::ToolBinding;
 use tracing::Instrument;
 
 use crate::agents;
+use crate::isolation::{self, LeasedUids, TaskIsolation, TaskUidLease, TaskUidPool};
 use crate::process::{EnvPolicy, run_captured};
 use crate::ssh::{SshConfig, SshLauncher};
 use crate::tracker::{FetchError, IssueFetcher, LiveIssueFetcher, TrackerClient};
 use crate::worker::{RunError, TaskSpec, WorkerContext, WorkerFactory, WorkerResult};
 use crate::workspace::{IssueContext, WorkspaceManager};
+
+/// Owns a task's uid lease for the lifetime of its run and, on `Drop`, kills the uid's leftover
+/// processes and seals its workspace to root *before* the uid is freed — on every exit path,
+/// including a panic or an abort-after-grace that would otherwise drop the lease unsealed. If the
+/// seal fails, the uid is quarantined (never reused) rather than released, so a reused uid can
+/// never reach an unsealed, uid-owned clone.
+struct UidWorkspaceSeal {
+    lease: Option<TaskUidLease>,
+    workspace: PathBuf,
+}
+
+impl UidWorkspaceSeal {
+    fn new(lease: TaskUidLease, workspace: PathBuf) -> Self {
+        Self {
+            lease: Some(lease),
+            workspace,
+        }
+    }
+}
+
+impl Drop for UidWorkspaceSeal {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let uid = lease.uid();
+        // Kill anything the task left as its uid (a `setsid` daemon, anything under `sandbox:
+        // none`) before the uid could be reused. Deny mode's jail PID namespace already reaped its
+        // agent; this covers allow mode.
+        let killed = isolation::kill_uid_processes(uid);
+        if killed > 0 {
+            tracing::info!("Killed {killed} leftover process(es) of task uid {uid}");
+        }
+        match isolation::seal_workspace(&self.workspace) {
+            // The uid is returned to the pool only now that its workspace is root-owned `0700`.
+            Ok(()) => drop(lease),
+            // Already gone (e.g. a final run's workspace was removed): nothing to seal, release.
+            // `symlink_metadata` so a dangling symlink still counts as present (don't follow it),
+            // and only a genuine `NotFound` releases — any other error quarantines.
+            Err(_)
+                if matches!(
+                    std::fs::symlink_metadata(&self.workspace),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                ) =>
+            {
+                drop(lease)
+            }
+            Err(err) => {
+                tracing::error!(
+                    "Quarantining task uid {uid}: could not seal {} before releasing it: {err}",
+                    self.workspace.display()
+                );
+                lease.quarantine();
+            }
+        }
+    }
+}
 
 /// Dynamic tools backed by a tracker [`ToolBinding`] (snapshot taken at session start).
 #[derive(Debug, Clone)]
@@ -188,6 +252,9 @@ pub struct RunnerOptions {
     pub strip_hook_secrets: bool,
     /// Override of `agent.max_turns` (tests).
     pub max_turns: Option<u32>,
+    /// The `symphony` executable agents use for its helper subcommands (`agent-tools`,
+    /// `egress-shim`); default: the running executable.
+    pub symphony_executable: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -197,6 +264,7 @@ impl Default for RunnerOptions {
             codex_stop_grace: symphony_codex::DEFAULT_STOP_GRACE,
             strip_hook_secrets: true,
             max_turns: None,
+            symphony_executable: std::env::current_exe().ok(),
         }
     }
 }
@@ -212,6 +280,11 @@ pub struct AgentRunner {
     ssh: SshConfig,
     fetcher: Arc<dyn IssueFetcher>,
     options: RunnerOptions,
+    /// One uid pool per `isolation.task_uids` range, shared across runs so leases do not
+    /// collide. Keyed by `(first, count)`, so a reloaded range gets its own pool.
+    /// Task uids leased by live runs, shared across every range so overlapping ranges (a
+    /// reloaded `count`) never hand out the same uid.
+    leased_uids: LeasedUids,
 }
 
 impl std::fmt::Debug for AgentRunner {
@@ -246,7 +319,13 @@ impl AgentRunner {
             ssh,
             fetcher,
             options: RunnerOptions::default(),
+            leased_uids: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// A uid pool for `uids`'s range sharing the runner's one leased-uid set.
+    fn uid_pool(&self, uids: symphony_core::config::TaskUids) -> Arc<TaskUidPool> {
+        TaskUidPool::new(uids, Arc::clone(&self.leased_uids))
     }
 
     /// Replaces the between-turns issue fetcher (`:issue_state_fetcher`).
@@ -311,6 +390,19 @@ impl AgentRunner {
         let context = issue_log(&ctx.issue);
         tracing::info!("Starting agent run for {context} worker_host={host_log}");
         tracing::info!("Starting worker attempt for {context} worker_host={host_log}");
+        // Isolation applies to task runs only, and a run that cannot be isolated never starts.
+        let isolation_settings = ctx.task.as_ref().and(settings.isolation.as_ref());
+        if let Some(isolation_settings) = isolation_settings {
+            let repo = ctx.task.as_ref().and_then(|task| task.repo.as_deref());
+            isolation::preflight(isolation_settings, worker_host, repo)?;
+        }
+        // Lease the task its own uid (no two live runs share one, no uid with a leftover process
+        // is reused); held until the run ends and the uid's processes are killed.
+        let uid_lease: Option<TaskUidLease> = match isolation_settings.and_then(|i| i.task_uids) {
+            Some(uids) => Some(self.uid_pool(uids).lease()?),
+            None => None,
+        };
+        let run_as = uid_lease.as_ref().map(|lease| (lease.uid(), lease.uid()));
 
         let workspaces = self.workspace_manager(&settings);
         let issue_context = IssueContext::from(&ctx.issue);
@@ -320,13 +412,43 @@ impl AgentRunner {
             created = workspaces.create_for_issue(&issue_context, worker_host) => created?,
         };
         ctx.reporter.runtime_info(worker_host, &workspace);
+        // Own the uid lease in a guard now that the workspace exists: its `Drop` kills the uid's
+        // leftover processes and seals the workspace to root before the uid is ever freed, on every
+        // exit — success, failure, cancellation, timeout, and even a panic or an abort-after-grace
+        // that would otherwise drop the lease unsealed. Nothing below releases the uid itself.
+        let _seal_guard =
+            uid_lease.map(|lease| UidWorkspaceSeal::new(lease, PathBuf::from(&workspace)));
 
         let body = async {
+            let isolation = match (&ctx.task, isolation_settings) {
+                (Some(task), Some(isolation_settings)) => Some(
+                    TaskIsolation::prepare(
+                        &settings,
+                        isolation_settings,
+                        task,
+                        std::path::Path::new(&workspace),
+                        run_as,
+                    )
+                    .await?,
+                ),
+                _ => None,
+            };
             if let Some(task) = &ctx.task {
-                prepare_task_workspace(&settings, &workspace, task).await?;
+                let cloned =
+                    prepare_task_workspace(&settings, &workspace, task, isolation.as_ref()).await?;
+                if let Some(isolation) = &isolation {
+                    isolation.finish_workspace(std::path::Path::new(&workspace), cloned)?;
+                }
             }
-            self.run_in_workspace(ctx, &snapshot.workflow, &settings, &workspaces, &workspace)
-                .await
+            self.run_in_workspace(
+                ctx,
+                &snapshot.workflow,
+                &settings,
+                &workspaces,
+                &workspace,
+                isolation.as_ref(),
+            )
+            .await
         };
         let limit = ctx
             .task
@@ -364,6 +486,9 @@ impl AgentRunner {
                 .run_after_run_hook(&workspace, &issue_context, worker_host)
                 .await;
         }
+        // `_seal_guard` drops here (and on any early return, panic or abort above): it kills the
+        // uid's leftover processes and seals the workspace before the uid is freed. See
+        // `UidWorkspaceSeal`.
         result
     }
 
@@ -374,6 +499,7 @@ impl AgentRunner {
         settings: &Arc<Settings>,
         workspaces: &WorkspaceManager,
         workspace: &str,
+        isolation: Option<&TaskIsolation>,
     ) -> WorkerResult {
         let worker_host = ctx.worker_host.as_deref();
         workspaces
@@ -387,11 +513,7 @@ impl AgentRunner {
         let backend_settings = settings
             .backend(Some(&name))
             .ok_or(RunError::UnknownBackend(name))?;
-        let backend = backend_for(&backend_settings);
-        let binding = self
-            .tracker
-            .bind_agent_tools(settings)
-            .map_err(RunError::ToolBinding)?;
+        let backend = backend_for(&backend_settings, self.options.symphony_executable.clone());
         // Rendered before the session starts: the reference sections decide the advertised tools. A
         // task sends its own prompt, so it has neither a workflow prompt nor reference sections.
         let (first_prompt, references) = if ctx.task.is_some() {
@@ -407,13 +529,26 @@ impl AgentRunner {
             );
             (Some(run_prompt.prompt), run_prompt.references)
         };
-        let tools = RunToolHandler::new(TrackerToolHandler::new(binding), references);
+        // The tracker tools act with the operator's credential from Symphony's own network: an
+        // isolated task (another tenant's work) gets none.
+        let tools: Arc<dyn DynamicToolHandler> = if isolation.is_some() {
+            Arc::new(symphony_codex::NoDynamicTools)
+        } else {
+            let binding = self
+                .tracker
+                .bind_agent_tools(settings)
+                .map_err(RunError::ToolBinding)?;
+            Arc::new(RunToolHandler::new(
+                TrackerToolHandler::new(binding),
+                references,
+            ))
+        };
         let mut options = StartOptions::new(
             workspace,
             Arc::clone(settings),
             self.workflow.workflow_file_path(),
         )
-        .with_tool_handler(Arc::new(tools))
+        .with_tool_handler(tools)
         .with_stop_grace(self.options.codex_stop_grace);
         if let Some(host) = worker_host {
             options = options.with_worker_host(
@@ -423,6 +558,9 @@ impl AgentRunner {
         }
         for (name, value) in &self.options.codex_env {
             options = options.with_env(name.clone(), value.clone());
+        }
+        if let Some(isolation) = isolation {
+            options = isolation.apply(options);
         }
 
         let mut session = backend.start(options).await?;
@@ -442,6 +580,7 @@ impl AgentRunner {
                 workspace,
                 &backend_settings,
                 first_prompt,
+                isolation,
             )
             .await;
         session.stop().await;
@@ -455,17 +594,35 @@ impl AgentRunner {
         workspace: &str,
         backend: &BackendSettings,
         first_prompt: Option<String>,
+        isolation: Option<&TaskIsolation>,
     ) -> WorkerResult {
         if let Some(task) = &ctx.task {
             let prompt = wrap_prompt(backend, task.prompt.clone(), &ctx.issue, ctx.attempt)?;
-            let outcome = session.run_turn(&prompt, &ctx.issue, &ctx.events).await?;
+            // The task's own token never leaves the run in an event or its result.
+            let events = match isolation {
+                Some(isolation) => isolation.redacted_events(&ctx.events),
+                None => ctx.events.clone(),
+            };
+            let outcome = match session.run_turn(&prompt, &ctx.issue, &events).await {
+                Ok(outcome) => outcome,
+                // The run's error becomes the task's `error`: redacted like its events.
+                Err(mut err) => {
+                    if let Some(redactor) = isolation.and_then(TaskIsolation::redactor) {
+                        redactor.redact_error(&mut err);
+                    }
+                    return Err(err.into());
+                }
+            };
             tracing::info!(
                 "Completed task run for {} session_id={} workspace={workspace}",
                 issue_log(&ctx.issue),
                 outcome.session_id
             );
-            ctx.reporter
-                .task_result(outcome.final_message.as_deref().unwrap_or_default());
+            let result = outcome.final_message.as_deref().unwrap_or_default();
+            match isolation.and_then(TaskIsolation::redactor) {
+                Some(redactor) => ctx.reporter.task_result(&redactor.redact_str(result)),
+                None => ctx.reporter.task_result(result),
+            }
             return Ok(());
         }
         let max_turns = self
@@ -525,14 +682,18 @@ fn wrap_prompt(
 }
 
 /// Clones the task's repository into its fresh workspace (nothing to do without a repository or
-/// when the workspace already holds files from an earlier run of the task).
+/// when the workspace already holds files from an earlier run of the task); `true` when it cloned.
+///
+/// Under isolation the clone runs as the task uid with `HOME=<workspace>/.home`, and a repository
+/// on the GitHub App's host is cloned over https with the task's token (from the environment).
 async fn prepare_task_workspace(
     settings: &Settings,
     workspace: &str,
     task: &TaskSpec,
-) -> Result<(), RunError> {
+    isolation: Option<&TaskIsolation>,
+) -> Result<bool, RunError> {
     let Some(repo) = &task.repo else {
-        return Ok(());
+        return Ok(false);
     };
     if !symphony_core::task::valid_repo_url(repo)
         || task
@@ -551,8 +712,10 @@ async fn prepare_task_workspace(
         .map_err(|err| RunError::TaskClone(err.to_string()))?
         .is_some()
     {
-        return Ok(());
+        return Ok(false);
     }
+    let credentials = isolation.and_then(TaskIsolation::credentials);
+    let url = credentials.map_or_else(|| repo.clone(), |c| c.clone_url());
     let mut command = tokio::process::Command::new("git");
     // Only network transports: `ext::`, `file://` and friends stay disabled.
     command
@@ -572,8 +735,11 @@ async fn prepare_task_workspace(
     if let Some(branch) = &task.branch {
         command.args(["--branch", branch]);
     }
-    command.args(["--", repo, "."]);
+    command.args(["--", url.as_str(), "."]);
     EnvPolicy::strip(settings.secret_environment_names()).apply(&mut command);
+    if let Some(isolation) = isolation {
+        isolation.apply_to_command(&mut command);
+    }
     let output = run_captured(command, TASK_CLONE_TIMEOUT)
         .await
         .map_err(|err| RunError::TaskClone(err.to_string()))?;
@@ -587,13 +753,16 @@ async fn prepare_task_workspace(
             .into_iter()
             .rev()
             .collect();
+        let tail = match isolation.and_then(TaskIsolation::redactor) {
+            Some(redactor) => redactor.redact_str(tail.trim()).into_owned(),
+            None => tail.trim().to_owned(),
+        };
         return Err(RunError::TaskClone(format!(
-            "git clone exited {}: {}",
-            output.status,
-            tail.trim()
+            "git clone exited {}: {tail}",
+            output.status
         )));
     }
-    Ok(())
+    Ok(true)
 }
 
 fn issue_log(issue: &Issue) -> String {
@@ -641,6 +810,33 @@ mod tests {
         assert_eq!(
             hook_env_policy(&settings, true).removed(),
             symphony_core::config::llm::LLM_SECRET_ENV_NAMES.map(str::to_owned)
+        );
+    }
+
+    /// Dropping a real `UidWorkspaceSeal` as a non-root process (its `chown` to root fails)
+    /// quarantines the uid rather than releasing it, so the single-uid pool can lease nothing more.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_seal_guard_quarantines_the_uid_when_it_cannot_seal() {
+        use std::os::unix::fs::MetadataExt;
+        let leased: LeasedUids = Arc::new(Mutex::new(HashSet::new()));
+        let uids = symphony_core::config::TaskUids {
+            first: 4_000_000_000,
+            count: 1,
+        };
+        let pool = TaskUidPool::new(uids, Arc::clone(&leased));
+        let lease = pool.lease().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir(&ws).unwrap();
+        if std::fs::metadata(&ws).unwrap().uid() == 0 {
+            // Running as root (not expected in CI): the seal would succeed, nothing to quarantine.
+            return;
+        }
+        drop(UidWorkspaceSeal::new(lease, ws));
+        assert!(
+            pool.lease().is_err(),
+            "the uid is quarantined after a failed seal, not re-leased"
         );
     }
 }

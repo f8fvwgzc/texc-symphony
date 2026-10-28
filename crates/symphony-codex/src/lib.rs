@@ -41,8 +41,12 @@ mod transport;
 
 pub use dynamic_tool::{DynamicToolHandler, NoDynamicTools};
 pub use error::{Blocker, CodexError, InvalidWorkspaceCwd};
-pub use event::{CodexEvent, CodexEventData, CodexEventKind, EventSink, StreamMessage};
+pub use event::{
+    CodexEvent, CodexEventData, CodexEventKind, EventFilter, EventSink, StreamMessage,
+};
 pub use launch::RemoteLauncher;
-pub use session::{AppServerSession, DEFAULT_STOP_GRACE, StartOptions, TurnOutcome, run};
+pub use session::{
+    AppServerSession, DEFAULT_STOP_GRACE, EgressRoute, StartOptions, TurnOutcome, run,
+};
 pub use tokens::{TokenAccumulator, TokenCounts, TokenUsage};
 pub use transport::{MAX_STREAM_LOG_CHARS, STDERR_TAIL_LINES};

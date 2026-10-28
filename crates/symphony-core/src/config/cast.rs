@@ -60,6 +60,30 @@ impl<'a> Section<'a> {
         Self { name, map }
     }
 
+    /// A map nested under `field`, reported as `path` (`"isolation.network"`); a present
+    /// non-map value records `"<path> is invalid"`.
+    pub(crate) fn nested(
+        &self,
+        field: &str,
+        path: &'static str,
+        errors: &mut Errors,
+    ) -> Section<'a> {
+        let map = match self.raw(field) {
+            None => None,
+            Some(Value::Object(map)) => Some(map),
+            Some(_) => {
+                errors.push(path, "is invalid");
+                None
+            }
+        };
+        Section { name: path, map }
+    }
+
+    /// `true` when the section is present (and a map).
+    pub(crate) fn is_present(&self) -> bool {
+        self.map.is_some()
+    }
+
     pub(crate) fn path(&self, field: &str) -> String {
         format!("{}.{field}", self.name)
     }

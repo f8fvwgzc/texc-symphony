@@ -100,6 +100,34 @@ pub fn main() -> ExitCode {
                 Err(err) => fail(&format!("symphony agent-tools: {err}")),
             }
         }
+        Ok(Command::EgressShim {
+            socket,
+            port,
+            command,
+        }) => egress_shim(&socket, port, &command),
+    }
+}
+
+/// `symphony egress-shim`: exits with the command's status.
+fn egress_shim(socket: &std::path::Path, port: u16, command: &[OsString]) -> ExitCode {
+    #[cfg(unix)]
+    let ran = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .and_then(|runtime| {
+            runtime.block_on(symphony_agents::egress::run_shim(socket, port, command))
+        });
+    #[cfg(not(unix))]
+    let ran: std::io::Result<i32> = {
+        let _ = (port, command);
+        Err(std::io::Error::other(format!(
+            "egress-shim needs Unix sockets; {} is unavailable",
+            socket.display()
+        )))
+    };
+    match ran {
+        Ok(code) => ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1)),
+        Err(err) => fail(&format!("symphony egress-shim: {err}")),
     }
 }
 
@@ -136,6 +164,10 @@ pub fn run(invocation: Invocation) -> ExitCode {
         Ok(format) => format,
         Err(message) => return fail(&message),
     };
+    // With task isolation, foreign uids run: keep Symphony's own files off-limits to them.
+    if workflow.settings().isolation.is_some() {
+        crate::hardening::restrict_new_files();
+    }
     let stdout_is_tty = std::io::stdout().is_terminal();
     let dashboard_enabled = workflow.settings().observability.dashboard_enabled && stdout_is_tty;
     let console = (!dashboard_enabled).then_some(console_format);
@@ -191,6 +223,7 @@ async fn open_store(choice: &DbChoice, cancel: &CancellationToken) -> Result<Sto
     match &config.location {
         StoreLocation::Disabled => tracing::info!("Run history disabled"),
         StoreLocation::Memory => tracing::info!("Run history kept in memory (lost on exit)"),
+        StoreLocation::Postgres(_) => tracing::info!("Run history in PostgreSQL {store:?}"),
         StoreLocation::File(path) => {
             tracing::info!("Run history database path={}", path.display());
         }

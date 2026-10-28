@@ -39,6 +39,8 @@ three ([configuration](docs/configuration.md#llm-connection-contract)); a Helm c
 **Task API.** Products assign work without a tracker: `POST /api/v1/tasks` with a prompt and,
 optionally, a repository, backend and limits; then cancel, unblock or watch it over SSE
 ([`docs/tasks.md`](docs/tasks.md)). The `symphony-tasks-client` crate wraps it for Rust products.
+An optional `isolation:` section gives every task its own uid, a repository-scoped GitHub App
+token and a default-deny network ([isolation](docs/configuration.md#isolation)).
 
 Symphony works best in codebases that have adopted
 [harness engineering](https://openai.com/index/harness-engineering/).

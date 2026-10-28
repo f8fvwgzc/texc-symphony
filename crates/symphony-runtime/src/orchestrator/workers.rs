@@ -141,6 +141,20 @@ impl Orchestrator<'_> {
         };
         self.record_session_completion_totals(&entry);
         let session_id = entry.session_id.clone().unwrap_or_else(|| "n/a".into());
+        // Abandon only a run the watchdog actually cancelled: the exit must be `Cancelled` *and*
+        // the lease fenced. A run that finished on its own (Ok/Blocked/Failed) while the actor was
+        // parked also trips the fence flag at deadline−backstop, but its token was never cancelled
+        // and it carries a real outcome — the lease is still ours (we fire before expiry), so
+        // record that outcome instead of dropping it and requeuing the task (which would re-run it).
+        if matches!(result, Err(RunError::Cancelled)) && self.lease_fenced(&issue_id) {
+            self.abandon_fenced_run(&issue_id, entry);
+            tracing::warn!(
+                "Agent task abandoned for issue_id={issue_id} session_id={session_id}: dispatch \
+                 lease fence (actor loop could not renew in time)"
+            );
+            self.notify();
+            return;
+        }
         let reason = match &result {
             Ok(()) => "normal".to_owned(),
             Err(err) => err.to_string(),
@@ -150,6 +164,22 @@ impl Orchestrator<'_> {
             "Agent task finished for issue_id={issue_id} session_id={session_id} reason={reason}"
         );
         self.notify();
+    }
+
+    /// Cleans up a run the watchdog fenced ([`crate::orchestrator::LeaseWatch::fenced`]): its
+    /// `Cancelled` exit is not a failure. The workspace is kept (the runner already sealed it to
+    /// root) and a task is left `running` for recovery; the lease and claim are dropped so a stale
+    /// renewal cannot revive the lease and another replica can take the issue over.
+    fn abandon_fenced_run(&mut self, issue_id: &str, mut entry: RunningEntry) {
+        self.codex_streams.remove(&entry.run_id);
+        entry.recorder.finish(
+            RunStatus::Cancelled,
+            Some("dispatch lease fence".to_owned()),
+        );
+        self.drop_lease(issue_id);
+        self.state.claimed.remove(issue_id);
+        self.state.blocked.remove(issue_id);
+        self.remove_retry_entry(issue_id);
     }
 
     pub(crate) fn handle_agent_down(
@@ -257,6 +287,9 @@ impl Orchestrator<'_> {
     ) {
         self.remove_retry_entry(issue_id);
         if let Some(task) = task_id(issue_id) {
+            // The runner already sealed this workspace to root before the worker exited (see
+            // `UidWorkspaceSeal`), so a re-leased uid cannot reach the blocked task's clone; an
+            // unblock re-chowns it.
             self.task_finish(task, TaskStatus::Blocked, None, Some(error.clone()));
         }
         self.state.claimed.insert(issue_id.to_owned());
@@ -310,6 +343,25 @@ impl Orchestrator<'_> {
         cleanup: bool,
         reason: &str,
     ) {
+        self.stop_running_issue(issue_id, cleanup, reason, true)
+            .await;
+    }
+
+    /// Stops a run whose dispatch lease is (or may soon be) another replica's: like
+    /// [`Self::terminate_running_issue`] without cleanup, but a task's record is left to the
+    /// replica that owns it now.
+    pub(crate) async fn abandon_running_issue(&mut self, issue_id: &str, reason: &str) {
+        self.stop_running_issue(issue_id, false, reason, false)
+            .await;
+    }
+
+    async fn stop_running_issue(
+        &mut self,
+        issue_id: &str,
+        cleanup: bool,
+        reason: &str,
+        release_task: bool,
+    ) {
         let Some(mut entry) = self.state.running.remove(issue_id) else {
             self.release_issue_claim(issue_id);
             return;
@@ -320,7 +372,7 @@ impl Orchestrator<'_> {
         entry
             .recorder
             .finish(RunStatus::Cancelled, Some(reason.to_owned()));
-        if let Some(task) = &entry.task {
+        if let Some(task) = entry.task.as_ref().filter(|_| release_task) {
             // Stopped from outside (kill switch, daily budget): queued again. A task that was
             // finished first (cancel, failure) is not running any more and stays as it is.
             self.task_release(task.id, reason);
@@ -333,6 +385,7 @@ impl Orchestrator<'_> {
             )
             .await;
         }
+        self.drop_lease(issue_id);
         self.state.claimed.remove(issue_id);
         self.state.blocked.remove(issue_id);
         self.remove_retry_entry(issue_id);
@@ -360,6 +413,11 @@ impl Orchestrator<'_> {
         futures::future::join_all(stops.into_iter().map(|w| self.stop_worker(Some(w)))).await;
         for mut recorder in recorders {
             recorder.finish(RunStatus::Cancelled, Some("shutdown".into()));
+        }
+        // Another replica may take the work over now instead of after the lease TTL.
+        let held: Vec<String> = self.state.leases.keys().cloned().collect();
+        for issue_id in held {
+            self.drop_lease(&issue_id);
         }
     }
 }

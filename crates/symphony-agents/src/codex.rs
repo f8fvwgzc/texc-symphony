@@ -3,7 +3,11 @@
 //! With the LLM contract, `codex.provider` points at the contract's endpoint (see
 //! `symphony_core::config::llm`); Codex reads its key from the environment, so the session's
 //! child gets the contract's credential as `SYMPHONY_LLM_API_KEY` (local runs only).
+//!
+//! A task with a default-deny network runs the app-server in the network jail
+//! ([`crate::egress::network_jail`]): its only route out is the task's egress proxy.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,6 +24,9 @@ use crate::{AgentBackend, AgentSession};
 pub struct CodexBackend {
     settings: BackendSettings,
     env: Arc<dyn EnvSource>,
+    /// The `symphony` executable whose `egress-shim` subcommand relays a jailed app-server's
+    /// traffic to a task's egress proxy.
+    egress_shim: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for CodexBackend {
@@ -36,12 +43,21 @@ impl CodexBackend {
         Self {
             settings,
             env: Arc::new(ProcessEnv),
+            egress_shim: std::env::current_exe().ok(),
         }
     }
 
     /// Reads the contract's `LLM_API_KEY` from `env` instead of the process environment.
     pub fn with_env(mut self, env: Arc<dyn EnvSource>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// The executable whose `egress-shim` subcommand relays a jailed app-server's traffic
+    /// (default: the running executable, `symphony` in production; `None` refuses tasks with a
+    /// default-deny network).
+    pub fn with_egress_shim(mut self, program: Option<PathBuf>) -> Self {
+        self.egress_shim = program;
         self
     }
 }
@@ -78,6 +94,18 @@ impl AgentBackend for CodexBackend {
             && let Some(key) = contract_key(&options.settings, self.env.as_ref())?
         {
             options = options.with_env(CODEX_LLM_KEY_ENV, key);
+        }
+        // A default-deny network confines the whole app-server (and the commands it runs) to the
+        // task's egress proxy; the shim inside sets the proxy variables.
+        if let Some(route) = options.egress.clone() {
+            let jail = crate::egress::network_jail(
+                &route,
+                self.egress_shim.as_deref(),
+                Path::new(&options.workspace),
+                &options.settings.host_secret_files(),
+            )
+            .map_err(CodexError::Unsupported)?;
+            options = options.with_launcher(jail);
         }
         let session = AppServerSession::start(options).await?;
         Ok(Box::new(CodexSession { session }))

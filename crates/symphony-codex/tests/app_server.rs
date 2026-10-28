@@ -1008,6 +1008,59 @@ async fn does_not_pass_tracker_credentials_to_the_local_codex_child() {
     assert!(!trace.contains("secret-that-must-not-reach-child"));
 }
 
+#[tokio::test]
+async fn task_variables_are_set_after_the_secrets_are_removed() {
+    let h = Harness::new();
+    let task_home = h.path("task-home");
+    fs::create_dir_all(&task_home).unwrap();
+    let ws = h.workspace("TASK-ENV");
+    let settings = settings(
+        &h.workspace_root(),
+        json!({"command": fixture_command("secret_env.sh")}),
+        json!({"api_key": "$SYMP_CUSTOM_LINEAR_API_KEY"}),
+    );
+    let options = h
+        .options(&ws, settings)
+        .with_env(
+            "LINEAR_API_KEY",
+            "operator-secret-that-must-not-reach-child",
+        )
+        .with_env(
+            "SYMP_CUSTOM_LINEAR_API_KEY",
+            "custom-secret-that-must-not-reach-child",
+        )
+        .with_task_env("HOME", task_home.to_string_lossy())
+        .with_task_env("LINEAR_API_KEY", "task-scoped-value");
+    run(options, "p", &issue("TASK-ENV"), &EventSink::none())
+        .await
+        .unwrap();
+    let trace = fs::read_to_string(h.trace()).unwrap();
+    assert!(
+        trace.contains("CANONICAL_SECRET:task-scoped-value\n"),
+        "{trace}"
+    );
+    assert!(trace.contains("CUSTOM_SECRET:\n"), "{trace}");
+    assert!(!trace.contains("must-not-reach-child"), "{trace}");
+}
+
+#[tokio::test]
+async fn a_task_uid_is_refused_for_remote_workers() {
+    let h = Harness::new();
+    let settings = settings(
+        &h.workspace_root(),
+        json!({"command": fixture_command("basic.sh")}),
+        json!({}),
+    );
+    let options = h
+        .options("/remote/ws", settings)
+        .with_worker_host(Some("worker-a".into()), None)
+        .with_run_as(Some((200_000, 200_000)));
+    let Err(err) = AppServerSession::start(options).await else {
+        panic!("a remote session with a task uid must not start");
+    };
+    assert!(matches!(err, CodexError::Unsupported(_)), "{err:?}");
+}
+
 /// The runtime's SSH launcher shape (`-T [-p PORT] DEST "bash -lc '<cmd>'"`), pointed at a fake `ssh`.
 struct FakeSsh;
 

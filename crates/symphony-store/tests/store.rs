@@ -1,4 +1,8 @@
 //! Integration tests for the public `Store` API.
+//!
+//! Tests that use [`memory`] run against SQLite by default and against PostgreSQL when
+//! `SYMPHONY_TEST_POSTGRES_URL` is set (each test gets its own schema), so every operation is
+//! checked on both databases. File-specific tests always use SQLite.
 
 use std::time::Duration;
 
@@ -10,7 +14,78 @@ use symphony_store::{
 };
 
 fn memory() -> Store {
-    Store::open_in_memory().expect("in-memory store")
+    match std::env::var("SYMPHONY_TEST_POSTGRES_URL") {
+        Ok(url) if !url.trim().is_empty() => postgres_store(&url),
+        _ => Store::open_in_memory().expect("in-memory store"),
+    }
+}
+
+/// A store in a fresh schema of the test database.
+fn postgres_store(url: &str) -> Store {
+    postgres_store_named(url).0
+}
+
+/// [`postgres_store`] and its schema, which is also its connections' `application_name`.
+fn postgres_store_named(url: &str) -> (Store, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let schema = format!(
+        "symphony_test_{}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        Utc::now().timestamp_micros()
+    );
+    let admin = url.to_owned();
+    let create = schema.clone();
+    // The synchronous client runs its own runtime: keep it off the test's runtime thread.
+    std::thread::spawn(move || {
+        let mut client = postgres::Client::connect(&admin, postgres::NoTls).unwrap();
+        client
+            .batch_execute(&format!("CREATE SCHEMA {create}"))
+            .unwrap();
+    })
+    .join()
+    .unwrap();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let store = Store::open_postgres(&format!(
+        "{url}{separator}options=-csearch_path%3D{schema}&application_name={schema}"
+    ))
+    .expect("postgres store");
+    (store, schema)
+}
+
+#[tokio::test]
+async fn a_lost_postgres_connection_is_reopened() {
+    let Some(url) = std::env::var("SYMPHONY_TEST_POSTGRES_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    else {
+        return;
+    };
+    let (store, schema) = postgres_store_named(&url);
+    store.start_run(new_run("MT-1")).await.unwrap();
+    // The database drops the connection (a restart, a failover, an idle timeout on the path).
+    std::thread::spawn(move || {
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        let ended = admin
+            .query(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+                &[&schema],
+            )
+            .unwrap();
+        assert_eq!(ended.len(), 1, "the store's one connection");
+    })
+    .join()
+    .unwrap();
+    // The first operation may meet the dead connection and fail, or the driver may notice the
+    // close first and the store reconnect before it runs. Only the former marks it degraded.
+    if store.list_runs(RunQuery::default()).await.is_err() {
+        assert!(store.is_degraded(), "a failed op marks the store degraded");
+    }
+    // Either way the store recovers and serves the same schema, no longer degraded.
+    let page = store.list_runs(RunQuery::default()).await.unwrap();
+    assert_eq!(page.runs.len(), 1, "the same schema after reconnecting");
+    assert!(!store.is_degraded(), "healthy again after reconnecting");
 }
 
 fn new_run(issue: &str) -> NewRun {
@@ -953,6 +1028,164 @@ async fn interrupted_tasks_are_queued_again_and_a_disabled_store_holds_none() {
         Store::disabled().create_task(task("x")).await,
         Err(StoreError::Unavailable)
     ));
+}
+
+#[tokio::test]
+async fn leases_are_exclusive_renewable_and_expire() {
+    let store = memory();
+    let ttl = Duration::from_secs(60);
+    assert!(
+        store
+            .acquire_lease("issue-1", "replica-a", ttl)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .acquire_lease("issue-1", "replica-b", ttl)
+            .await
+            .unwrap(),
+        "a live lease of another replica is refused"
+    );
+    assert!(
+        store
+            .acquire_lease("issue-1", "replica-a", ttl)
+            .await
+            .unwrap(),
+        "the holder may take it again"
+    );
+    assert_eq!(
+        store.lease_holder("issue-1").await.unwrap().as_deref(),
+        Some("replica-a")
+    );
+    assert_eq!(
+        store
+            .renew_leases("replica-a", vec!["issue-1".into(), "unheld".into()], ttl)
+            .await
+            .unwrap(),
+        vec!["issue-1".to_owned()],
+        "only the keys still held"
+    );
+    assert_eq!(
+        store
+            .renew_leases("replica-b", vec!["issue-1".into()], ttl)
+            .await
+            .unwrap(),
+        Vec::<String>::new(),
+        "renewing is for the holder only"
+    );
+    store.release_lease("issue-1", "replica-b").await.unwrap();
+    assert!(
+        store.lease_holder("issue-1").await.unwrap().is_some(),
+        "not b's to release"
+    );
+    store.release_lease("issue-1", "replica-a").await.unwrap();
+    assert!(
+        store
+            .acquire_lease("issue-1", "replica-b", ttl)
+            .await
+            .unwrap()
+    );
+
+    // An expired lease is free for anyone.
+    assert!(
+        store
+            .acquire_lease("issue-2", "replica-a", Duration::ZERO)
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(store.lease_holder("issue-2").await.unwrap(), None);
+    assert!(
+        store
+            .acquire_lease("issue-2", "replica-b", ttl)
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        store
+            .acquire_lease("issue-3", "replica-b", ttl)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.release_owner_leases("replica-b").await.unwrap(), 3);
+    assert_eq!(store.lease_holder("issue-3").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn recovery_leaves_work_with_a_live_lease_alone() {
+    use symphony_store::{NewTask, TaskStatus};
+    let store = memory();
+    let ttl = Duration::from_secs(60);
+    // Replica A is alive and runs issue 1 and task 1; replica B died while running issue 2.
+    let live = store
+        .start_run(NewRun::new("issue-1", "MT-1"))
+        .await
+        .unwrap();
+    store.acquire_lease("issue-1", "a", ttl).await.unwrap();
+    let dead = store
+        .start_run(NewRun::new("issue-2", "MT-2"))
+        .await
+        .unwrap();
+    store
+        .acquire_lease("issue-2", "b", Duration::ZERO)
+        .await
+        .unwrap();
+    let task = store
+        .create_task(NewTask {
+            prompt: "x".into(),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    store.start_task(task.id).await.unwrap();
+    store
+        .acquire_lease(format!("task:{}", task.id), "a", ttl)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    assert_eq!(store.mark_interrupted_runs().await.unwrap(), 1);
+    assert_eq!(
+        store.get_run(live).await.unwrap().unwrap().status,
+        RunStatus::Running
+    );
+    assert_eq!(
+        store.get_run(dead).await.unwrap().unwrap().status,
+        RunStatus::Cancelled
+    );
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 0);
+    store
+        .release_lease(format!("task:{}", task.id), "a")
+        .await
+        .unwrap();
+    assert_eq!(store.requeue_interrupted_tasks().await.unwrap(), 1);
+    assert_eq!(
+        store.get_task(task.id).await.unwrap().unwrap().status,
+        TaskStatus::Queued
+    );
+}
+
+#[tokio::test]
+async fn a_task_is_started_by_one_claimant_only() {
+    use symphony_store::NewTask;
+    let store = memory();
+    let task = store
+        .create_task(NewTask {
+            prompt: "x".into(),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(store.start_task(task.id), store.start_task(task.id));
+    assert_eq!(
+        [a.unwrap(), b.unwrap()]
+            .iter()
+            .filter(|t| t.is_some())
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
