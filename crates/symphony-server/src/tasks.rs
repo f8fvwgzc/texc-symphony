@@ -31,8 +31,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use symphony_core::task::{MAX_TASK_PROMPT_BYTES, valid_branch, valid_repo_url};
 use symphony_store::{
-    MAX_TASK_DEPENDENCIES, NewTask, RunQuery, RunStatus, TaskLimits, TaskPage, TaskQuery,
-    TaskRecord, TaskStatus,
+    MAX_TASK_ATTEMPTS, MAX_TASK_DEPENDENCIES, NewTask, RunQuery, RunStatus, TaskFailure,
+    TaskLimits, TaskPage, TaskQuery, TaskRecord, TaskRetry, TaskStatus,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -43,8 +43,8 @@ use crate::history::{enabled_store, invalid, limit_param, parse_query};
 
 // The API's prompt limit is the store's (operator replies may not grow a prompt past it either).
 const _: () = assert!(MAX_TASK_PROMPT_BYTES == symphony_store::MAX_TASK_PROMPT_BYTES);
-// The messages above name the limit.
-const _: () = assert!(MAX_TASK_DEPENDENCIES == 100);
+// The messages above name the limits.
+const _: () = assert!(MAX_TASK_DEPENDENCIES == 100 && MAX_TASK_ATTEMPTS == 20);
 
 /// Default and maximum page size of `GET /api/v1/tasks`.
 const TASKS_LIMIT: (u32, u32) = (50, 200);
@@ -69,6 +69,16 @@ pub(crate) struct CreateTask {
     metadata: Option<Value>,
     #[serde(default)]
     depends_on: Vec<i64>,
+    retry: Option<CreateRetry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateRetry {
+    max_attempts: Option<u32>,
+    backoff_ms: Option<u64>,
+    max_backoff_ms: Option<u64>,
+    on: Option<Vec<TaskFailure>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -158,6 +168,22 @@ fn validate(app: &AppState, request: CreateTask) -> Result<NewTask, ApiError> {
     if depends_on.len() > MAX_TASK_DEPENDENCIES {
         return Err(invalid("depends_on must list at most 100 tasks"));
     }
+    let retry = request.retry.unwrap_or_default();
+    let defaults = TaskRetry::default();
+    let retry = TaskRetry {
+        max_attempts: retry.max_attempts.unwrap_or(defaults.max_attempts),
+        backoff_ms: retry.backoff_ms.unwrap_or(defaults.backoff_ms),
+        max_backoff_ms: retry.max_backoff_ms.unwrap_or(defaults.max_backoff_ms),
+        on: retry.on.unwrap_or(defaults.on),
+    };
+    if !(1..=MAX_TASK_ATTEMPTS).contains(&retry.max_attempts) {
+        return Err(invalid("retry.max_attempts must be between 1 and 20"));
+    }
+    if retry.max_backoff_ms < retry.backoff_ms {
+        return Err(invalid(
+            "retry.max_backoff_ms must be at least retry.backoff_ms",
+        ));
+    }
     Ok(NewTask {
         title,
         prompt,
@@ -170,6 +196,7 @@ fn validate(app: &AppState, request: CreateTask) -> Result<NewTask, ApiError> {
         },
         metadata: request.metadata,
         depends_on,
+        retry,
     })
 }
 

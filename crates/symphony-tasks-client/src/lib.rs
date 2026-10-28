@@ -82,6 +82,46 @@ pub struct TaskLimits {
     pub timeout_ms: Option<u64>,
 }
 
+/// A kind of failed run a retry policy can retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskFailure {
+    /// The agent's run failed.
+    Error,
+    /// The run reached `timeout_ms` or stalled.
+    Timeout,
+    /// The replica running it stopped; another one takes the task over.
+    Interrupted,
+}
+
+/// A task's retry policy. A failed run of a kind in `on` runs again while fewer than
+/// `max_attempts` attempts have failed, after `backoff_ms * 2^(failed - 1)` (at most
+/// `max_backoff_ms`; at once after an interruption). Hand-offs (kill switch, daily budget,
+/// shutdown) do not count, and unblocking resets the count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRetry {
+    /// Attempts that may fail before the task does (1-20; default 3).
+    pub max_attempts: u32,
+    /// Delay before the first retry in ms (default 10 000), doubled per failed attempt.
+    pub backoff_ms: u64,
+    /// Longest delay in ms (default 300 000).
+    pub max_backoff_ms: u64,
+    /// Retried failures (default: `interrupted` only).
+    pub on: Vec<TaskFailure>,
+}
+
+impl Default for TaskRetry {
+    /// The server's default policy.
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            backoff_ms: 10_000,
+            max_backoff_ms: 300_000,
+            on: vec![TaskFailure::Interrupted],
+        }
+    }
+}
+
 /// A task to queue (`POST /api/v1/tasks`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NewTask {
@@ -109,6 +149,9 @@ pub struct NewTask {
     /// fails if one of them fails or is cancelled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<i64>,
+    /// Retry policy; `None` = the server's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<TaskRetry>,
 }
 
 /// A task as the server reports it.
@@ -143,6 +186,15 @@ pub struct Task {
     pub error: Option<String>,
     /// Runs started so far.
     pub attempts: u32,
+    /// Retry policy.
+    #[serde(default)]
+    pub retry: TaskRetry,
+    /// Failed attempts counted against `retry.max_attempts` (since creation or the last unblock).
+    #[serde(default)]
+    pub failed_attempts: u32,
+    /// When a retried task may run again (`None`: as soon as a slot is free).
+    #[serde(default)]
+    pub next_attempt_at: Option<DateTime<Utc>>,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Last change.

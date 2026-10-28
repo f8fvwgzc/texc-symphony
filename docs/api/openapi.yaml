@@ -1204,6 +1204,42 @@ components:
           maxItems: 100
           items: { type: integer, minimum: 1 }
           description: 'Existing tasks that must succeed before this one runs.'
+        retry:
+          type: [object, 'null']
+          additionalProperties: false
+          description: 'Retry policy; every field is optional (defaults below).'
+          properties:
+            max_attempts: { type: integer, minimum: 1, maximum: 20, default: 3 }
+            backoff_ms: { type: integer, minimum: 0, default: 10000 }
+            max_backoff_ms: { type: integer, minimum: 0, default: 300000 }
+            on:
+              type: array
+              items: { $ref: '#/components/schemas/TaskFailure' }
+              default: [interrupted]
+
+    TaskFailure:
+      type: string
+      description: |
+        A kind of failed run: `error` (the agent's run failed), `timeout` (`timeout_ms` reached or
+        the run stalled), `interrupted` (the replica running it stopped).
+      enum: [error, timeout, interrupted]
+
+    TaskRetry:
+      type: object
+      description: |
+        A failed run of a kind in `on` runs again while fewer than `max_attempts` attempts have
+        failed, after `backoff_ms * 2^(failed_attempts - 1)` (at most `max_backoff_ms`; at once
+        after an interruption). Runs handed off on purpose (kill switch, daily budget, shutdown)
+        do not count. Unblocking resets the count.
+      required: [max_attempts, backoff_ms, max_backoff_ms, on]
+      additionalProperties: false
+      properties:
+        max_attempts: { type: integer, minimum: 1, maximum: 20 }
+        backoff_ms: { type: integer, minimum: 0 }
+        max_backoff_ms: { type: integer, minimum: 0 }
+        on:
+          type: array
+          items: { $ref: '#/components/schemas/TaskFailure' }
 
     TaskUnblock:
       type: object
@@ -1213,7 +1249,7 @@ components:
 
     Task:
       type: object
-      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, depends_on, status, result, error, attempts, created_at, updated_at, started_at, finished_at]
+      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, depends_on, status, result, error, attempts, retry, failed_attempts, next_attempt_at, created_at, updated_at, started_at, finished_at]
       additionalProperties: false
       properties:
         id: { type: integer, minimum: 1 }
@@ -1232,7 +1268,10 @@ components:
         status: { $ref: '#/components/schemas/TaskStatus' }
         result: { type: [string, 'null'], description: 'Final agent message of a succeeded task.' }
         error: { type: [string, 'null'] }
-        attempts: { type: integer, minimum: 0 }
+        attempts: { type: integer, minimum: 0, description: 'Runs started so far.' }
+        retry: { $ref: '#/components/schemas/TaskRetry' }
+        failed_attempts: { type: integer, minimum: 0, description: 'Failed attempts counted against `retry.max_attempts` since creation or the last unblock.' }
+        next_attempt_at: { type: [string, 'null'], format: date-time, description: 'When a retried task may run again; `null`: as soon as a slot is free.' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }

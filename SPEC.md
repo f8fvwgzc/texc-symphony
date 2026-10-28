@@ -1711,8 +1711,14 @@ Task API (extension of 13.7):
   keys with dependencies on each other and on existing tasks, returns their dependency order and
   waves and, per task, whether it would be queued, waiting (and on what) or failed, without
   creating or running anything; cycles and unknown references are request errors.
-- A task runs one agent turn; its final agent message is its result. It never retries on its own.
-  A task blocked on operator input or approval stays blocked until a client re-queues it
+- A task runs one agent turn per attempt; its final agent message is its result. A task MAY carry
+  a retry policy: how many attempts may fail (`max_attempts`), the backoff between them, and
+  which failures are retried (the agent's run failed, the run timed out or stalled, the replica
+  running it stopped). A failed attempt of a retried kind with attempts left goes back to the
+  queue after its backoff (at once after an interruption); otherwise the task fails. Attempts
+  handed off on purpose (kill switch, budget, a graceful shutdown) do not count, and re-queueing
+  a task resets the count. Symphony's default policy is three attempts, retrying interruptions
+  only. A task blocked on operator input or approval stays blocked until a client re-queues it
   (`unblock`, optionally with a reply appended to its prompt). Clients can cancel and watch
   (Server-Sent Events) a task.
 - Task repositories MUST be restricted to network transports (no local paths, `file://` or git
@@ -1731,7 +1737,12 @@ Shared state and isolation (extensions):
 
 - Several orchestrator replicas MAY share one database. They then MUST NOT run the same issue or
   task at once (Symphony: a renewed dispatch lease per issue id), and MUST recover the work of a
-  replica that stopped (its runs closed, its tasks queued again) once its leases expire.
+  replica that stopped (its runs closed, its tasks queued again per their retry policy) once its
+  leases expire. Writes a replica makes for a task it ran MUST be fenced by its lease: once the
+  lease has expired or another replica holds it, a late finish or release is refused, so a task
+  taken over is recorded once, by its current holder. A replica that shuts down gracefully hands
+  its running tasks back to the queue and releases their leases, so a peer takes them over at
+  once.
 - For multi-tenant task runs an implementation MAY run each task as its own OS user, with
   short-lived credentials scoped to the task's repository instead of the operator's, and with
   network egress denied except the model gateway and that repository's host.

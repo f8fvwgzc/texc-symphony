@@ -50,13 +50,25 @@ waiting / queued / blocked / running ──▶ cancelled   (POST /cancel)
   refused (`409 task_conflict`), and so is unblocking a task before its failed dependency: unblock
   the dependency first, then the dependant, which waits again. Dependencies must exist when the
   task is created, so there are no cycles.
-- A task runs exactly one agent turn (the API loop's turn may make up to `max_steps` model calls).
-  It never retries by itself: a failure ends as `failed`, with `error`.
+- A task runs one agent turn per attempt (the API loop's turn may make up to `max_steps` model
+  calls). Its `retry` policy decides what happens when an attempt fails: a failure of a kind in
+  `on` (`error`: the agent's run failed, `timeout`: `timeout_ms` reached or the run stalled,
+  `interrupted`: the replica running it stopped) goes back to `queued` while fewer than
+  `max_attempts` attempts have failed, not before `backoff_ms * 2^(failed_attempts - 1)` (at most
+  `max_backoff_ms`; at once after an interruption; dispatched at the next poll after that,
+  `next_attempt_at`). Otherwise it ends `failed`, with `error`. The default policy is
+  `{"max_attempts": 3, "backoff_ms": 10000, "max_backoff_ms": 300000, "on": ["interrupted"]}`:
+  agent failures are not retried, and a task that keeps taking its replica down stops after
+  three tries. Token limits, budgets and refusals (an unknown backend) are never retried.
 - `blocked`: the agent needs operator input or approval, or the per-issue budget is used up.
   `unblock` re-queues it; a `message` is appended to the prompt as `Operator reply:`.
   `unblock` also re-queues a `failed` task.
-- The kill switch and an exhausted daily budget stop running tasks and put them back to `queued`;
-  so does a restart (tasks that were `running` are queued again).
+- The kill switch, an exhausted daily budget and a graceful shutdown stop running tasks and put
+  them back to `queued` without using up an attempt. A replica that stops without a shutdown
+  (a crash, a lost database connection) leaves its tasks to the others: once its dispatch
+  leases expire (60 s) a peer, or the replica itself on restart, recovers them as `interrupted`
+  attempts. Writes are fenced by the lease, so a replica that lost a task can no longer finish
+  or release it: a task taken over is recorded once, by its current holder.
 - A task's identifier is `task-<id>` (lowercase, so it cannot be a Linear or Jira key); its runs
   appear in the dashboard and in `GET /api/v1/runs?issue=task-<id>`. Its workspace is
   `<workspace.root>/.tasks/<id>`, a directory no tracker identifier maps to, and it is removed
@@ -102,7 +114,10 @@ Body fields: `prompt` (required, at most 256 KiB), `title` (at most 200 characte
 `branch` (needs `repo`), `backend` (a `backends` entry; default `agent.backend`), `limits`
 (`max_tokens`: input + output tokens across the task's runs, the run fails when it is reached;
 `timeout_ms`: wall-clock limit of one run), `metadata` (a JSON object up to 16 KiB, returned as
-is), `depends_on` (up to 100 existing task ids). Unknown fields are refused.
+is), `depends_on` (up to 100 existing task ids), `retry` (`max_attempts` 1-20, `backoff_ms`,
+`max_backoff_ms`, `on`; omitted fields take the defaults above). Unknown fields are refused.
+Tasks also report `attempts` (runs started), `failed_attempts` (counted against
+`retry.max_attempts` since creation or the last unblock, which resets it) and `next_attempt_at`.
 
 ### Planning
 

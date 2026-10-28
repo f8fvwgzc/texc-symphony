@@ -19,6 +19,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0005_leases.sql"),
     include_str!("migrations/0006_cached_tokens.sql"),
     include_str!("migrations/0007_task_dependencies.sql"),
+    include_str!("migrations/0008_task_retry.sql"),
 ];
 
 /// PostgreSQL migrations (their own numbering; v1 is the SQLite schema up to 0005, later ones
@@ -27,6 +28,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     include_str!("migrations/postgres/0001_init.sql"),
     include_str!("migrations/postgres/0002_cached_tokens.sql"),
     include_str!("migrations/postgres/0003_task_dependencies.sql"),
+    include_str!("migrations/postgres/0004_task_retry.sql"),
 ];
 
 /// Schema version a fresh PostgreSQL database is migrated to.

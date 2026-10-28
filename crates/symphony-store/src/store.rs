@@ -28,7 +28,7 @@ use crate::model::{
 };
 use crate::ops::{self, NewEvent};
 use crate::schema;
-use crate::tasks::{self, NewTask, TaskPage, TaskQuery, TaskRecord, TaskStatus};
+use crate::tasks::{self, NewTask, TaskFailure, TaskPage, TaskQuery, TaskRecord, TaskStatus};
 
 type Job = Box<dyn FnOnce(&mut dyn Db) + Send + 'static>;
 
@@ -433,10 +433,12 @@ impl Store {
         )
     }
 
-    /// Up to `limit` queued tasks whose dependencies have succeeded, oldest first.
+    /// Up to `limit` queued tasks whose dependencies have succeeded and whose retry delay is
+    /// over, oldest first.
     pub fn queued_tasks(&self, limit: u32) -> Pending<Vec<TaskRecord>> {
+        let now = Utc::now();
         self.submit("queued_tasks", Vec::new, move |conn| {
-            tasks::queued_tasks(conn, limit)
+            tasks::queued_tasks(conn, limit, now)
         })
     }
 
@@ -464,7 +466,47 @@ impl Store {
             "finish_task",
             || None,
             move |conn| {
-                tasks::finish_task(conn, id, status, result.as_deref(), error.as_deref(), now)
+                tasks::finish_task(
+                    conn,
+                    id,
+                    status,
+                    result.as_deref(),
+                    error.as_deref(),
+                    None,
+                    None,
+                    now,
+                )
+            },
+        )
+    }
+
+    /// The orchestrator's [`Store::finish_task`] for the run it dispatched: refused (`None`) when
+    /// `owner` no longer holds the task's dispatch lease, and a `failed` run of a `failure` kind
+    /// the task's retry policy retries, with attempts left, is queued again instead.
+    pub fn finish_task_run(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        result: Option<String>,
+        error: Option<String>,
+        failure: Option<TaskFailure>,
+        owner: String,
+    ) -> Pending<Option<TaskRecord>> {
+        let now = Utc::now();
+        self.submit(
+            "finish_task_run",
+            || None,
+            move |conn| {
+                tasks::finish_task(
+                    conn,
+                    id,
+                    status,
+                    result.as_deref(),
+                    error.as_deref(),
+                    failure,
+                    Some(&owner),
+                    now,
+                )
             },
         )
     }
@@ -492,14 +534,20 @@ impl Store {
         )
     }
 
-    /// A running task whose run was stopped for an outside reason goes back to `queued`.
-    pub fn release_task(&self, id: i64, reason: impl Into<String>) -> Pending<Option<TaskRecord>> {
+    /// A running task whose run was stopped for an outside reason goes back to `queued` (the
+    /// attempt does not count). With `owner`, only while it holds the task's dispatch lease.
+    pub fn release_task(
+        &self,
+        id: i64,
+        reason: impl Into<String>,
+        owner: Option<String>,
+    ) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
         let reason = reason.into();
         self.submit(
             "release_task",
             || None,
-            move |conn| tasks::release_task(conn, id, &reason, now),
+            move |conn| tasks::release_task(conn, id, &reason, owner.as_deref(), now),
         )
     }
 
@@ -567,8 +615,9 @@ impl Store {
         )
     }
 
-    /// Recovery: tasks left `running` by a process that is gone (no live lease) go back to
-    /// `queued`. Returns how many.
+    /// Recovery: tasks left `running` by a process that is gone (no live lease) were interrupted:
+    /// they go back to `queued` while their retry policy allows, and fail otherwise. Returns how
+    /// many.
     pub fn requeue_interrupted_tasks(&self) -> Pending<u64> {
         let now = Utc::now();
         self.submit(

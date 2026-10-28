@@ -1959,6 +1959,50 @@ async fn a_failed_dependency_fails_the_waiting_task() {
     assert_eq!(failed.attempts, 0, "it never ran");
 }
 
+/// A failed run of a kind the task's policy retries runs again (here at once), and the task
+/// succeeds on the next attempt.
+#[tokio::test(start_paused = true)]
+async fn a_failed_task_is_retried_by_its_policy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use symphony_store::{TaskFailure, TaskRetry, TaskStatus};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn first_fails() -> WorkerResult {
+        if RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(RunError::Other("flaky".into()))
+        } else {
+            Ok(())
+        }
+    }
+    let store = Store::open_in_memory().unwrap();
+    let id = store
+        .create_task(symphony_store::NewTask {
+            prompt: "flaky".into(),
+            retry: TaskRetry {
+                max_attempts: 2,
+                backoff_ms: 0,
+                max_backoff_ms: 0,
+                on: vec![TaskFailure::Error],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}, "polling": {"interval_ms": 600_000}}),
+        task_factory(Arc::clone(&seen), first_fails),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |_| seen.lock().unwrap().len() == 2).await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let task = task_status(&store, id, TaskStatus::Succeeded).await;
+    assert_eq!((task.attempts, task.failed_attempts), (2, 1));
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_tasks_and_unknown_backends_end_failed() {
     use symphony_store::TaskStatus;

@@ -10,7 +10,7 @@ use symphony_server::{Auth, ServerConfig, StateView, serve};
 use symphony_store::{NewRun, Store, TaskStatus as StoreStatus};
 use symphony_tasks_client::{
     ClientError, ListTasks, NewTask, PlanDependency, PlanTask, PlannedStatus, TaskEvent,
-    TaskLimits, TaskStatus, TasksClient,
+    TaskFailure, TaskLimits, TaskRetry, TaskStatus, TasksClient,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -243,6 +243,53 @@ async fn dependencies_and_plans_round_trip() {
             assert_eq!(message, "dependency cycle: a -> a");
         }
         other => panic!("expected a cycle error, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_retry_policy_round_trips() {
+    let (base, shutdown) = server(Store::open_in_memory().unwrap()).await;
+    let client = TasksClient::new(&base).unwrap().with_token(TOKEN);
+    let plain = client
+        .create(&NewTask {
+            prompt: "x".into(),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(plain.retry, TaskRetry::default());
+    assert_eq!((plain.failed_attempts, plain.next_attempt_at), (0, None));
+    let retry = TaskRetry {
+        max_attempts: 5,
+        backoff_ms: 1_000,
+        max_backoff_ms: 60_000,
+        on: vec![TaskFailure::Error, TaskFailure::Interrupted],
+    };
+    let task = client
+        .create(&NewTask {
+            prompt: "x".into(),
+            retry: Some(retry.clone()),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(task.retry, retry);
+    match client
+        .create(&NewTask {
+            prompt: "x".into(),
+            retry: Some(TaskRetry {
+                max_attempts: 21,
+                ..TaskRetry::default()
+            }),
+            ..NewTask::default()
+        })
+        .await
+    {
+        Err(ClientError::Api { status, code, .. }) => {
+            assert_eq!((status, code.as_str()), (400, "invalid_parameter"));
+        }
+        other => panic!("expected 400, got {other:?}"),
     }
     shutdown.cancel();
 }
