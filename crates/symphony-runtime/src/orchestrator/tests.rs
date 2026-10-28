@@ -1884,6 +1884,81 @@ async fn queued_tasks_run_once_and_record_their_result() {
     assert_eq!(runs[0].issue_identifier, format!("task-{id}"));
 }
 
+/// A dependant waits for its dependency and is dispatched as soon as it succeeded (not at the next
+/// poll); a failed dependency fails it instead.
+#[tokio::test(start_paused = true)]
+async fn dependants_run_once_their_dependency_succeeded() {
+    use symphony_store::TaskStatus;
+    let (store, first) = task_store().await;
+    let after = |prompt: &str, on: i64| symphony_store::NewTask {
+        prompt: prompt.into(),
+        depends_on: vec![on],
+        ..Default::default()
+    };
+    let second = store.create_task(after("second", first)).await.unwrap().id;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}, "polling": {"interval_ms": 600_000}}),
+        task_factory(Arc::clone(&seen), || Ok(())),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    assert_eq!(orch.state.running.len(), 1, "only the dependency runs");
+    assert!(orch.state.running.contains_key(&format!("task:{first}")));
+    let started = tokio::time::Instant::now();
+    run_until(&mut orch, |o| {
+        o.state.running.contains_key(&format!("task:{second}"))
+    })
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "dispatched after {:?}, not at the next poll",
+        started.elapsed()
+    );
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    task_status(&store, second, TaskStatus::Succeeded).await;
+    let prompts: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(spec, _)| spec.as_ref().unwrap().prompt.clone())
+        .collect();
+    assert_eq!(prompts, ["Write a haiku about Rust", "second"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_dependency_fails_the_waiting_task() {
+    use symphony_store::TaskStatus;
+    let (store, first) = task_store().await;
+    let second = store
+        .create_task(symphony_store::NewTask {
+            prompt: "second".into(),
+            depends_on: vec![first],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id;
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::default(), || Err(RunError::Other("boom".into()))),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    task_status(&store, first, TaskStatus::Failed).await;
+    let failed = task_status(&store, second, TaskStatus::Failed).await;
+    assert_eq!(
+        failed.error,
+        Some(format!("dependency task-{first} did not succeed"))
+    );
+    assert_eq!(failed.attempts, 0, "it never ran");
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_tasks_and_unknown_backends_end_failed() {
     use symphony_store::TaskStatus;

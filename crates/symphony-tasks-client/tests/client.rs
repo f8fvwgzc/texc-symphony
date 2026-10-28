@@ -9,7 +9,8 @@ use symphony_server::testing::StaticControlPlane;
 use symphony_server::{Auth, ServerConfig, StateView, serve};
 use symphony_store::{NewRun, Store, TaskStatus as StoreStatus};
 use symphony_tasks_client::{
-    ClientError, ListTasks, NewTask, TaskEvent, TaskLimits, TaskStatus, TasksClient,
+    ClientError, ListTasks, NewTask, PlanDependency, PlanTask, PlannedStatus, TaskEvent,
+    TaskLimits, TaskStatus, TasksClient,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -166,5 +167,82 @@ async fn errors_carry_the_api_code() {
         TasksClient::new("ftp://x"),
         Err(ClientError::InvalidUrl(_))
     ));
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn dependencies_and_plans_round_trip() {
+    let store = Store::open_in_memory().unwrap();
+    let (base, shutdown) = server(store.clone()).await;
+    let client = TasksClient::new(&base).unwrap().with_token(TOKEN);
+    let build = client
+        .create(&NewTask {
+            prompt: "build".into(),
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    let deploy = client
+        .create(&NewTask {
+            prompt: "deploy".into(),
+            depends_on: vec![build.id],
+            ..NewTask::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(deploy.status, TaskStatus::Waiting);
+    assert_eq!(deploy.depends_on, vec![build.id]);
+    let waiting = client
+        .list(&ListTasks {
+            status: Some(TaskStatus::Waiting),
+            ..ListTasks::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(waiting.tasks, vec![deploy.clone()]);
+
+    let plan = client
+        .plan(&[
+            PlanTask {
+                key: "notify".into(),
+                depends_on: vec![
+                    PlanDependency::Planned("check".into()),
+                    PlanDependency::Existing(deploy.id),
+                ],
+            },
+            PlanTask {
+                key: "check".into(),
+                depends_on: Vec::new(),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(plan.order, ["check", "notify"]);
+    assert_eq!(plan.tasks[0].status, PlannedStatus::Waiting);
+    assert_eq!(
+        plan.tasks[0].waiting_for,
+        [
+            PlanDependency::Planned("check".into()),
+            PlanDependency::Existing(deploy.id)
+        ]
+    );
+    assert_eq!(plan.tasks[1].status, PlannedStatus::Queued);
+    match client
+        .plan(&[PlanTask {
+            key: "a".into(),
+            depends_on: vec![PlanDependency::Planned("a".into())],
+        }])
+        .await
+    {
+        Err(ClientError::Api {
+            status,
+            code,
+            message,
+        }) => {
+            assert_eq!((status, code.as_str()), (400, "invalid_parameter"));
+            assert_eq!(message, "dependency cycle: a -> a");
+        }
+        other => panic!("expected a cycle error, got {other:?}"),
+    }
     shutdown.cancel();
 }

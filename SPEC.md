@@ -1701,6 +1701,16 @@ Task API (extension of 13.7):
   workspace (none: an empty workspace, for non-coding work), a backend name, limits (tokens,
   wall-clock time) and submitter metadata. Tasks are dispatched by the same orchestrator, count
   against the same concurrency and spend limits, and are recorded as runs.
+- A task MAY name existing tasks it depends on. It is then `waiting` and MUST NOT be dispatched
+  until every dependency has succeeded; once one of them has failed or was cancelled it fails
+  too, and so do its own dependants (transitively). Creating a task on a dependency that already
+  failed or was cancelled, or re-queueing one before its failed dependency, is refused. Because
+  dependencies must exist at creation, the graph has no cycles. A replica that races a
+  dependency's failure against a new dependant settles it on its next dispatch pass.
+- An implementation MAY offer a plan (dry-run) endpoint that, for a set of tasks named by client
+  keys with dependencies on each other and on existing tasks, returns their dependency order and
+  waves and, per task, whether it would be queued, waiting (and on what) or failed, without
+  creating or running anything; cycles and unknown references are request errors.
 - A task runs one agent turn; its final agent message is its result. It never retries on its own.
   A task blocked on operator input or approval stays blocked until a client re-queues it
   (`unblock`, optionally with a reply appended to its prompt). Clients can cancel and watch

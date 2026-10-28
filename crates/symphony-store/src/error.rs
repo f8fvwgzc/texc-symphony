@@ -62,6 +62,9 @@ pub enum StoreError {
     /// The caller passed an invalid argument.
     #[error("invalid_argument: {0}")]
     InvalidArgument(String),
+    /// The request conflicts with the current state (a dependency that already failed).
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// A stored row could not be decoded.
     #[error("store_corrupt_row: {0}")]
     CorruptRow(String),

@@ -358,6 +358,11 @@ paths:
         (empty, or a shallow clone of `repo`), on `backend` (default `agent.backend`), with the
         prompt sent as-is (wrapped by the backend's `prompt_template`). Its final agent message
         becomes `result`. Runs are recorded under the identifier `task-<id>`.
+
+        With `depends_on`, the task is `waiting` until every listed task has succeeded, then
+        `queued`. If one of them fails or is cancelled, the task fails too (`dependency task-<id>
+        did not succeed`), and so do its own dependants. A dependency that is already failed or
+        cancelled is refused (409).
       requestBody:
         required: true
         content:
@@ -379,6 +384,13 @@ paths:
         '400': { $ref: '#/components/responses/InvalidParameter' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: A task in `depends_on` already failed or was cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+              example:
+                error: { code: task_conflict, message: 'dependency task-3 is failed; unblock it first' }
         '503': { $ref: '#/components/responses/StoreDisabled' }
     get:
       tags: [tasks]
@@ -396,6 +408,49 @@ paths:
               schema: { $ref: '#/components/schemas/TaskPage' }
         '400': { $ref: '#/components/responses/InvalidParameter' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '503': { $ref: '#/components/responses/StoreDisabled' }
+
+  /api/v1/tasks/plan:
+    post:
+      tags: [tasks]
+      operationId: planTasks
+      summary: Plan a set of tasks without creating or running them
+      description: |
+        A dry run of creating a set of tasks with dependencies. Each planned task has a client
+        `key`; `depends_on` names other planned tasks (strings, their keys) and existing tasks
+        (integers, their ids). Nothing is created or run. `waves` groups the keys so that each
+        wave depends only on earlier ones (wave 0 on no planned task); `order` is the waves in
+        sequence. Each task's `status` is what creating it now would give: `queued`, `waiting` on
+        `waiting_for` (its planned dependencies and the existing ones that have not succeeded), or
+        `failed` because `failed_dependency` already failed or was cancelled (directly or through a
+        planned dependency; creating it would be refused). An unknown key or id, a duplicate key
+        or a dependency cycle is a 400 that names it. At most 1000 tasks.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskPlanRequest' }
+            example:
+              tasks:
+                - { key: build }
+                - { key: test, depends_on: [build] }
+                - { key: deploy, depends_on: [test, 41] }
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskPlan' }
+              example:
+                order: [build, test, deploy]
+                waves: [[build], [test], [deploy]]
+                tasks:
+                  - { key: build, wave: 0, status: queued, waiting_for: [], failed_dependency: null }
+                  - { key: test, wave: 1, status: waiting, waiting_for: [build], failed_dependency: null }
+                  - { key: deploy, wave: 2, status: waiting, waiting_for: [test, 41], failed_dependency: null }
+        '400': { $ref: '#/components/responses/InvalidParameter' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '503': { $ref: '#/components/responses/StoreDisabled' }
 
   /api/v1/tasks/{id}:
@@ -443,7 +498,7 @@ paths:
       tags: [tasks]
       operationId: unblockTask
       summary: Re-queue a blocked or failed task
-      description: The optional `message` (the operator's answer) is appended to the prompt as `Operator reply:`. Other statuses answer `409 task_conflict`.
+      description: The optional `message` (the operator's answer) is appended to the prompt as `Operator reply:`. Other statuses answer `409 task_conflict`, and so does a task with a failed or cancelled dependency (unblock that one first). A task whose dependencies have not all succeeded comes back `waiting`.
       parameters: [{ $ref: '#/components/parameters/TaskId' }]
       requestBody:
         required: false
@@ -1116,7 +1171,8 @@ components:
 
     TaskStatus:
       type: string
-      enum: [queued, running, succeeded, failed, cancelled, blocked]
+      description: '`waiting`: queued, but a task in `depends_on` has not succeeded yet.'
+      enum: [queued, waiting, running, succeeded, failed, cancelled, blocked]
 
     TaskLimits:
       type: object
@@ -1143,6 +1199,11 @@ components:
             max_tokens: { type: [integer, 'null'], minimum: 1 }
             timeout_ms: { type: [integer, 'null'], minimum: 1 }
         metadata: { type: [object, 'null'], description: 'Free-form JSON kept with the task (at most 16 KiB).' }
+        depends_on:
+          type: array
+          maxItems: 100
+          items: { type: integer, minimum: 1 }
+          description: 'Existing tasks that must succeed before this one runs.'
 
     TaskUnblock:
       type: object
@@ -1152,7 +1213,7 @@ components:
 
     Task:
       type: object
-      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, status, result, error, attempts, created_at, updated_at, started_at, finished_at]
+      required: [id, identifier, title, prompt, repo, branch, backend, limits, metadata, depends_on, status, result, error, attempts, created_at, updated_at, started_at, finished_at]
       additionalProperties: false
       properties:
         id: { type: integer, minimum: 1 }
@@ -1164,6 +1225,10 @@ components:
         backend: { type: [string, 'null'] }
         limits: { $ref: '#/components/schemas/TaskLimits' }
         metadata: { type: [object, 'null'] }
+        depends_on:
+          type: array
+          items: { type: integer, minimum: 1 }
+          description: 'Tasks that must succeed before this one runs (ascending ids).'
         status: { $ref: '#/components/schemas/TaskStatus' }
         result: { type: [string, 'null'], description: 'Final agent message of a succeeded task.' }
         error: { type: [string, 'null'] }
@@ -1172,6 +1237,59 @@ components:
         updated_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
         finished_at: { type: [string, 'null'], format: date-time }
+
+    TaskPlanDependency:
+      description: A planned task's key (string) or an existing task's id (integer).
+      oneOf:
+        - { type: string, minLength: 1, maxLength: 128 }
+        - { type: integer, minimum: 1 }
+
+    TaskPlanRequest:
+      type: object
+      required: [tasks]
+      additionalProperties: false
+      properties:
+        tasks:
+          type: array
+          maxItems: 1000
+          items:
+            type: object
+            required: [key]
+            additionalProperties: false
+            properties:
+              key: { type: string, minLength: 1, maxLength: 128 }
+              depends_on:
+                type: array
+                maxItems: 100
+                items: { $ref: '#/components/schemas/TaskPlanDependency' }
+
+    TaskPlan:
+      type: object
+      required: [order, waves, tasks]
+      additionalProperties: false
+      properties:
+        order: { type: array, items: { type: string } }
+        waves:
+          type: array
+          items: { type: array, items: { type: string } }
+        tasks:
+          type: array
+          description: The planned tasks, in request order.
+          items:
+            type: object
+            required: [key, wave, status, waiting_for, failed_dependency]
+            additionalProperties: false
+            properties:
+              key: { type: string }
+              wave: { type: integer, minimum: 0 }
+              status: { type: string, enum: [queued, waiting, failed] }
+              waiting_for:
+                type: array
+                items: { $ref: '#/components/schemas/TaskPlanDependency' }
+              failed_dependency:
+                oneOf:
+                  - { $ref: '#/components/schemas/TaskPlanDependency' }
+                  - { type: 'null' }
 
     TaskPage:
       type: object

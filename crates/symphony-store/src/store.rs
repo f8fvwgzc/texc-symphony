@@ -415,7 +415,25 @@ impl Store {
         })
     }
 
-    /// Up to `limit` queued tasks, oldest first.
+    /// The reported status of each of `ids` that exists (`waiting` included).
+    pub fn task_states(&self, ids: Vec<i64>) -> Pending<Vec<(i64, TaskStatus)>> {
+        self.submit("task_states", Vec::new, move |conn| {
+            tasks::task_states(conn, &ids)
+        })
+    }
+
+    /// Fails every queued task whose dependency failed or was cancelled, transitively (the
+    /// dispatch pass runs it for writes that raced); returns how many.
+    pub fn settle_task_dependencies(&self) -> Pending<u64> {
+        let now = Utc::now();
+        self.submit(
+            "settle_task_dependencies",
+            || 0,
+            move |conn| tasks::settle_dependants(conn, now),
+        )
+    }
+
+    /// Up to `limit` queued tasks whose dependencies have succeeded, oldest first.
     pub fn queued_tasks(&self, limit: u32) -> Pending<Vec<TaskRecord>> {
         self.submit("queued_tasks", Vec::new, move |conn| {
             tasks::queued_tasks(conn, limit)
@@ -451,7 +469,8 @@ impl Store {
         )
     }
 
-    /// Cancels a queued or blocked task (others are returned unchanged); `None` for an unknown id.
+    /// Cancels a queued (or waiting) or blocked task, failing its waiting dependants (others are
+    /// returned unchanged); `None` for an unknown id.
     pub fn cancel_task(&self, id: i64, reason: impl Into<String>) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
         let reason = reason.into();
@@ -462,7 +481,8 @@ impl Store {
         )
     }
 
-    /// Re-queues a blocked or failed task with an optional operator reply appended to its prompt.
+    /// Re-queues a blocked or failed task with an optional operator reply appended to its prompt
+    /// ([`StoreError::Conflict`] while one of its dependencies is failed or cancelled).
     pub fn requeue_task(&self, id: i64, message: Option<String>) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
         self.submit(

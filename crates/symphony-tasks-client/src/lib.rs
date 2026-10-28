@@ -20,6 +20,10 @@
 //! # }
 //! ```
 //!
+//! A task can wait for others ([`NewTask::depends_on`]: it runs once they have succeeded and fails
+//! if one fails), and [`TasksClient::plan`] shows the order and the waiting set of a set of tasks
+//! without creating any.
+//!
 //! Install it as a git dependency pinned to a release tag:
 //!
 //! ```toml
@@ -48,6 +52,8 @@ use url::Url;
 pub enum TaskStatus {
     /// Waiting for a free agent slot.
     Queued,
+    /// Queued, but a task in `depends_on` has not succeeded yet.
+    Waiting,
     /// An agent is working on it.
     Running,
     /// Done; `result` holds the agent's final message.
@@ -99,6 +105,10 @@ pub struct NewTask {
     /// Free-form JSON object kept with the task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Existing tasks that must succeed first (at most 100). The task is `waiting` until then, and
+    /// fails if one of them fails or is cancelled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<i64>,
 }
 
 /// A task as the server reports it.
@@ -122,6 +132,9 @@ pub struct Task {
     pub limits: TaskLimits,
     /// Submitter metadata.
     pub metadata: Option<Value>,
+    /// Tasks that must succeed before this one runs (ascending ids).
+    #[serde(default)]
+    pub depends_on: Vec<i64>,
     /// Status.
     pub status: TaskStatus,
     /// Final agent message of a succeeded task.
@@ -158,6 +171,64 @@ pub struct ListTasks {
     pub before_id: Option<i64>,
     /// Only tasks with this status.
     pub status: Option<TaskStatus>,
+}
+
+/// A dependency in a plan: another planned task's key, or an existing task's id.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PlanDependency {
+    /// A planned task, by its key.
+    Planned(String),
+    /// An existing task, by its id.
+    Existing(i64),
+}
+
+/// One task of a plan request ([`TasksClient::plan`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTask {
+    /// The client's name for it (1-128 characters, unique in the plan).
+    pub key: String,
+    /// What it waits for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<PlanDependency>,
+}
+
+/// What creating a planned task now would give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlannedStatus {
+    /// Dispatched as soon as a slot is free.
+    Queued,
+    /// Waits for `waiting_for`.
+    Waiting,
+    /// `failed_dependency` already failed or was cancelled; creating it would be refused.
+    Failed,
+}
+
+/// One task of a [`Plan`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedTask {
+    /// Its key.
+    pub key: String,
+    /// Its wave (0: depends on no planned task).
+    pub wave: usize,
+    /// Its status if created now.
+    pub status: PlannedStatus,
+    /// Planned dependencies and existing ones that have not succeeded.
+    pub waiting_for: Vec<PlanDependency>,
+    /// The dependency that makes it fail.
+    pub failed_dependency: Option<PlanDependency>,
+}
+
+/// A plan (`POST /api/v1/tasks/plan`): nothing was created or run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Plan {
+    /// Keys in dependency order (wave by wave, request order within a wave).
+    pub order: Vec<String>,
+    /// Keys by wave; each wave depends only on earlier ones.
+    pub waves: Vec<Vec<String>>,
+    /// The planned tasks, in request order.
+    pub tasks: Vec<PlannedTask>,
 }
 
 /// One event recorded by a task's run.
@@ -361,6 +432,17 @@ impl TasksClient {
                 Method::POST,
                 self.url(&format!("api/v1/tasks/{id}/cancel"))?,
             )
+            .send()
+            .await?;
+        Self::decode(response).await
+    }
+
+    /// Plans `tasks` without creating or running anything: their order, waves and waiting set.
+    /// An unknown key or id, a duplicate key or a cycle is an `invalid_parameter` error.
+    pub async fn plan(&self, tasks: &[PlanTask]) -> Result<Plan, ClientError> {
+        let response = self
+            .request(Method::POST, self.url("api/v1/tasks/plan")?)
+            .json(&serde_json::json!({ "tasks": tasks }))
             .send()
             .await?;
         Self::decode(response).await

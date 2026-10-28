@@ -35,7 +35,7 @@ use crate::error::{ApiError, method_not_allowed};
 use crate::security::{HostPolicy, TicketBook};
 use crate::sse::SseHub;
 use crate::view::{StatePayload, StateView};
-use crate::{api, assets, history, presenter, security, sse, tasks};
+use crate::{api, assets, history, plan, presenter, security, sse, tasks};
 
 /// Path of the SSE endpoint (excluded from the request timeout and from compression).
 pub(crate) const EVENTS_PATH: &str = "/api/v1/events";
@@ -169,6 +169,10 @@ pub fn router(
             get(tasks::list)
                 .post(tasks::create)
                 .fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/tasks/plan",
+            post(plan::create).fallback(method_not_allowed),
         )
         .route(
             "/api/v1/tasks/{id}",

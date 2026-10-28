@@ -39,7 +39,8 @@ export SYMPHONY=http://127.0.0.1:4000
 | POST | `/api/v1/events/tickets` | 201 single-use SSE ticket | 401, 405 |
 | POST | `/api/v1/pause` / `/api/v1/resume` | 200 kill switch state | 401, 403, 405, 503 |
 | GET | `/api/v1/metrics` | 200 Prometheus text | 401, 405 |
-| POST / GET | `/api/v1/tasks` | 201 task / 200 page | 400, 401, 403, 503 `store_disabled` |
+| POST / GET | `/api/v1/tasks` | 201 task / 200 page | 400, 401, 403, 409 `task_conflict` (failed dependency), 503 `store_disabled` |
+| POST | `/api/v1/tasks/plan` | 200 plan (nothing created) | 400 (unknown key or id, cycle), 401, 403, 503 |
 | GET | `/api/v1/tasks/{id}` | 200 | 400, 404 `task_not_found`, 503 |
 | POST | `/api/v1/tasks/{id}/cancel` | 200 | 400, 404, 503 |
 | POST | `/api/v1/tasks/{id}/unblock` | 200 | 400, 404, 409 `task_conflict`, 503 |
