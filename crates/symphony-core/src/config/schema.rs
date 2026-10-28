@@ -257,6 +257,9 @@ pub struct WorkerSettings {
     pub max_concurrent_agents_per_host: Option<u32>,
 }
 
+/// Default `agent.max_retry_attempts`: with the default backoff, about half an hour of retries.
+pub const DEFAULT_MAX_RETRY_ATTEMPTS: u32 = 10;
+
 /// `agent:` section.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSettings {
@@ -266,6 +269,9 @@ pub struct AgentSettings {
     pub max_turns: u32,
     /// Retry backoff cap in ms (`> 0`, default 300 000).
     pub max_retry_backoff_ms: u64,
+    /// Failed runs in a row that are retried before the issue is blocked (`> 0`, default
+    /// [`DEFAULT_MAX_RETRY_ATTEMPTS`]).
+    pub max_retry_attempts: u32,
     /// Delay in ms before re-checking an issue whose run ended normally (`> 0`, default 1 000).
     pub continuation_delay_ms: u64,
     /// Per-state concurrency caps keyed by normalized (trim + lowercase) state name.
@@ -281,6 +287,7 @@ impl Default for AgentSettings {
             max_concurrent_agents: 10,
             max_turns: 20,
             max_retry_backoff_ms: 300_000,
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             continuation_delay_ms: 1_000,
             max_concurrent_agents_by_state: BTreeMap::new(),
             backend: super::backend::CODEX_BACKEND.into(),
@@ -746,6 +753,11 @@ fn cast_agent(s: &Section<'_>, errors: &mut Errors) -> AgentSettings {
     let v = s.positive("max_retry_backoff_ms", v, errors);
     if let Some(v) = s.fit("max_retry_backoff_ms", v, errors) {
         out.max_retry_backoff_ms = v;
+    }
+    let v = s.integer("max_retry_attempts", errors);
+    let v = s.positive("max_retry_attempts", v, errors);
+    if let Some(v) = s.fit("max_retry_attempts", v, errors) {
+        out.max_retry_attempts = v;
     }
 
     let v = s.integer("continuation_delay_ms", errors);

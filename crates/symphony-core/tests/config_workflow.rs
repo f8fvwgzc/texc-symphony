@@ -1198,11 +1198,16 @@ fn ecto_cast_rules_for_scalars() {
             "server": {"port": "8080", "host": ""},
             "observability": {"dashboard_enabled": "0"},
             "unknown_section": {"x": 1},
-            "agent": {"unknown_key": true, "max_turns": "7"}
+            "agent": {"unknown_key": true, "max_turns": "7", "max_retry_attempts": "3"}
         }),
         &env,
     )
     .unwrap();
+    assert_eq!(settings.agent.max_retry_attempts, 3);
+    assert_eq!(
+        parse(json!({}), &env).unwrap().agent.max_retry_attempts,
+        symphony_core::config::DEFAULT_MAX_RETRY_ATTEMPTS
+    );
     assert_eq!(settings.polling.interval_ms, 5);
     assert_eq!(settings.server.port, Some(8080));
     assert_eq!(settings.server.host, "");
@@ -1214,6 +1219,10 @@ fn ecto_cast_rules_for_scalars() {
         other => panic!("expected invalid config, got {other:?}"),
     };
     assert_eq!(invalid(json!({"tracker": "x"})), "tracker is invalid");
+    assert_eq!(
+        invalid(json!({"agent": {"max_retry_attempts": 0}})),
+        "agent.max_retry_attempts must be greater than 0"
+    );
     assert_eq!(
         invalid(json!({"codex": {"command": 12}})),
         "codex.command is invalid"

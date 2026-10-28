@@ -461,6 +461,10 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `max_retry_attempts` (positive integer, OPTIONAL extension)
+  - Default: implementation-defined and finite (Symphony: `10`).
+  - Failed runs in a row that are retried; the next failure blocks the issue (Section 8.4).
+  - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -636,6 +640,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_retry_attempts`: positive integer, default `10` (Symphony extension)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -721,7 +726,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `Worker Exit (abnormal)`
   - Remove running entry.
   - Update aggregate runtime totals.
-  - Schedule exponential-backoff retry.
+  - Schedule exponential-backoff retry, or block the issue once the retry limit is reached
+    (Section 8.4).
 
 - `Codex Update Event`
   - Update live session fields, token counters, and rate limits.
@@ -812,6 +818,17 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+
+Retry limit (OPTIONAL extension, finite by default in Symphony):
+
+- A run that fails (abnormal worker exit or stall) whose retry would be attempt
+  `agent.max_retry_attempts + 1` is not retried. The issue becomes blocked, like one waiting for an
+  operator (it stays claimed), with an error naming the limit and the last failure.
+- A run that ends normally restarts the count: its continuation retry is attempt `1`.
+- A blocked issue is released when it leaves the active states, becomes unroutable, or disappears;
+  it is dispatched again once it is an active candidate.
+- Failures that are not the agent's (a failed tracker refresh before a retry) never block the
+  issue; they still advance the attempt used for the backoff.
 
 Retry handling behavior:
 
