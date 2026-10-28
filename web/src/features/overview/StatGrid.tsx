@@ -61,7 +61,7 @@ export function StatGrid({
       <Stat
         label="Total tokens"
         value={formatInt(codex.total_tokens)}
-        detail={`In ${formatInt(codex.input_tokens)} / Out ${formatInt(codex.output_tokens)}`}
+        detail={`In ${formatInt(codex.input_tokens)} / Cached ${formatInt(codex.cached_input_tokens)} / Out ${formatInt(codex.output_tokens)}`}
       />
       <Stat
         label="Runtime"

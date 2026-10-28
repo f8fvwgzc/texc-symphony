@@ -1,6 +1,8 @@
 //! Anthropic Messages API wire format (`POST /v1/messages`, `anthropic-version: 2023-06-01`).
 //!
-//! Input usage counts `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
+//! Input usage counts `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`, of which
+//! `cache_read_input_tokens` are reported as cached input (Codex's convention: cached input is part
+//! of input, and token accounting meters it apart).
 //!
 //! Prompt caching ([`Request::prompt_cache`]): an agent loop re-sends its whole conversation on
 //! every model call, so each request marks three cache breakpoints (of the four allowed). The last
@@ -166,6 +168,7 @@ pub(super) fn parse(body: &Value) -> Result<Reply, String> {
     if let Some(usage) = body.get("usage") {
         reply.usage = Usage {
             input_tokens: input_tokens(usage),
+            cached_input_tokens: count(usage, "cache_read_input_tokens"),
             output_tokens: count(usage, "output_tokens"),
         };
     }
@@ -209,6 +212,7 @@ impl Stream {
             Some("message_start") => {
                 if let Some(usage) = data.pointer("/message/usage") {
                     self.usage.input_tokens = input_tokens(usage);
+                    self.usage.cached_input_tokens = count(usage, "cache_read_input_tokens");
                     self.usage.output_tokens = count(usage, "output_tokens");
                 }
             }
@@ -273,6 +277,7 @@ impl Stream {
                     let input = input_tokens(usage);
                     if input > 0 {
                         self.usage.input_tokens = input;
+                        self.usage.cached_input_tokens = count(usage, "cache_read_input_tokens");
                     }
                 }
             }
@@ -481,6 +486,7 @@ mod tests {
         assert_eq!(reply.text, "Hello");
         assert_eq!(reply.tool_calls[0].arguments, Ok(json!({"command": "ls"})));
         assert_eq!(reply.usage.input_tokens, 15);
+        assert_eq!(reply.usage.cached_input_tokens, 5);
         assert_eq!(reply.usage.output_tokens, 42);
         assert_eq!(reply.stop_reason.as_deref(), Some("tool_use"));
     }

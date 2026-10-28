@@ -77,7 +77,7 @@ it from every agent child environment and redacts its value in recorded events.
 | `model` | `codex.model` / CLI default | Required for `api`. |
 | `prompt_template` | none | Liquid template around the first turn's prompt: `{{ prompt }}` (the workflow prompt, or a task's prompt), `{{ issue }}`, `{{ attempt }}`. |
 | `system_prompt` | built-in | `api`: the system message; `claude_code`: `--append-system-prompt`. |
-| `pricing` | `budget` prices | `{input_usd_per_million_tokens, output_usd_per_million_tokens}` for this backend's runs ([budget](configuration.md#budget)). |
+| `pricing` | `budget` prices | `{input_usd_per_million_tokens, cached_input_usd_per_million_tokens, output_usd_per_million_tokens}` for this backend's runs ([budget](configuration.md#budget)); cache reads cost the input price unless set. |
 | `turn_timeout_ms` | `3600000` | `claude_code`: silence timeout; `api`: limit of one whole turn. |
 
 ## `api`: the built-in agent loop
@@ -141,7 +141,8 @@ Tools:
 Events use the Codex vocabulary, so the dashboard, run history and budgets work unchanged:
 `session_started`, `item/agentMessage/delta`, `agentMessage` / `commandExecution` / `fileChange`
 items, `tool_call_completed` / `tool_call_failed`, cumulative `thread/tokenUsage/updated`
-(Anthropic input counts cache reads and writes), `turn_completed` or `turn_ended_with_error`.
+(input includes cache writes and reads, and cache reads are also reported as `cachedInputTokens`,
+which token accounting meters apart), `turn_completed` or `turn_ended_with_error`.
 
 ## `claude_code`: the Claude Code CLI
 

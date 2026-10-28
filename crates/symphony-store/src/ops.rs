@@ -21,10 +21,13 @@ pub const INTERRUPTED_EVENT_KIND: &str = "run_interrupted";
 
 const RUN_COLUMNS: &str = "runs.id, issue_id, issue_identifier, issue_title, attempt, worker_host, \
      workspace_path, status, error, turns, started_at, finished_at, duration_ms, \
-     input_tokens, output_tokens, total_tokens, COALESCE(run_costs.cost_micro_usd, 0)";
+     input_tokens, output_tokens, total_tokens, COALESCE(run_costs.cost_micro_usd, 0), \
+     COALESCE(run_cached_tokens.cached_input_tokens, 0)";
 
-/// `runs` with their cost (kept in `run_costs`, see migration 0003).
-const RUNS_WITH_COST: &str = "runs LEFT JOIN run_costs ON run_costs.run_id = runs.id";
+/// `runs` with their cost (kept in `run_costs`, see migration 0003) and prompt-cache reads (kept in
+/// `run_cached_tokens`, migration 0006).
+const RUNS_WITH_COST: &str = "runs LEFT JOIN run_costs ON run_costs.run_id = runs.id \
+     LEFT JOIN run_cached_tokens ON run_cached_tokens.run_id = runs.id";
 
 /// `x - started_at`, never negative (no `MAX(a, b)`/`GREATEST` that works on both databases).
 const DURATION: &str = "CASE WHEN ?2 - started_at > 0 THEN ?2 - started_at ELSE 0 END";
@@ -117,6 +120,11 @@ pub(crate) fn update_tokens(db: &mut dyn Db, run_id: RunId, tokens: TokenUsage) 
     if changed == 0 {
         return Err(StoreError::RunNotFound(run_id));
     }
+    db.execute(
+        "INSERT INTO run_cached_tokens (run_id, cached_input_tokens) VALUES (?1, ?2) \
+         ON CONFLICT (run_id) DO UPDATE SET cached_input_tokens = excluded.cached_input_tokens",
+        &vals![run_id.0, to_sql_u64(tokens.cached)],
+    )?;
     Ok(())
 }
 
@@ -139,12 +147,14 @@ pub(crate) fn update_usage(
 const USAGE_COLUMNS: &str = "CAST(COALESCE(SUM(input_tokens), 0) AS BIGINT), \
      CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
      CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT), \
-     CAST(COALESCE(SUM(run_costs.cost_micro_usd), 0) AS BIGINT)";
+     CAST(COALESCE(SUM(run_costs.cost_micro_usd), 0) AS BIGINT), \
+     CAST(COALESCE(SUM(run_cached_tokens.cached_input_tokens), 0) AS BIGINT)";
 
 fn usage_from_row(row: &Row) -> Result<UsageTotals> {
     Ok(UsageTotals {
         tokens: TokenUsage {
             input: clamp_u64(row.int(0)?),
+            cached: clamp_u64(row.int(4)?),
             output: clamp_u64(row.int(1)?),
             total: clamp_u64(row.int(2)?),
         },
@@ -327,8 +337,10 @@ pub(crate) fn totals(db: &mut dyn Db) -> Result<TotalsRecord> {
          CAST(COALESCE(SUM(output_tokens), 0) AS BIGINT), \
          CAST(COALESCE(SUM(total_tokens), 0) AS BIGINT), \
          CAST(COALESCE(SUM(CASE WHEN duration_ms > 0 THEN duration_ms ELSE 0 END), 0) AS BIGINT), \
-         CAST(COALESCE(SUM(run_costs.cost_micro_usd), 0) AS BIGINT) \
-         FROM runs LEFT JOIN run_costs ON run_costs.run_id = runs.id",
+         CAST(COALESCE(SUM(run_costs.cost_micro_usd), 0) AS BIGINT), \
+         CAST(COALESCE(SUM(run_cached_tokens.cached_input_tokens), 0) AS BIGINT) \
+         FROM runs LEFT JOIN run_costs ON run_costs.run_id = runs.id \
+         LEFT JOIN run_cached_tokens ON run_cached_tokens.run_id = runs.id",
         &[],
     )?;
     Ok(TotalsRecord {
@@ -337,6 +349,7 @@ pub(crate) fn totals(db: &mut dyn Db) -> Result<TotalsRecord> {
         runs_failed: clamp_u64(row.int(2)?),
         tokens: TokenUsage {
             input: clamp_u64(row.int(3)?),
+            cached: clamp_u64(row.int(8)?),
             output: clamp_u64(row.int(4)?),
             total: clamp_u64(row.int(5)?),
         },
@@ -397,6 +410,10 @@ pub(crate) fn prune(
             &format!("DELETE FROM run_costs WHERE run_id IN ({DOOMED})"),
             &args,
         )?;
+        db.execute(
+            &format!("DELETE FROM run_cached_tokens WHERE run_id IN ({DOOMED})"),
+            &args,
+        )?;
         let runs_deleted =
             db.execute(&format!("DELETE FROM runs WHERE id IN ({DOOMED})"), &args)?;
         Ok(PruneStats {
@@ -424,6 +441,7 @@ fn run_from_row(row: &Row) -> Result<RunRecord> {
         duration_ms: row.opt_int(12)?,
         tokens: TokenUsage {
             input: clamp_u64(row.int(13)?),
+            cached: clamp_u64(row.int(17)?),
             output: clamp_u64(row.int(14)?),
             total: clamp_u64(row.int(15)?),
         },

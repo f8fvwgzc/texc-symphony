@@ -12,6 +12,9 @@ use symphony_codex::{CodexError, CodexEvent, CodexEventData, EventSink, StreamMe
 pub struct Usage {
     /// Input tokens, including cached and cache-creation input.
     pub input_tokens: u64,
+    /// Input tokens read from the prompt cache (part of `input_tokens`, Codex's convention; token
+    /// accounting meters them apart).
+    pub cached_input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
 }
@@ -20,6 +23,9 @@ impl Usage {
     /// Adds another response's usage.
     pub fn add(&mut self, other: Usage) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
     }
 
@@ -135,6 +141,7 @@ impl<'a> Emitter<'a> {
             "thread/tokenUsage/updated",
             json!({"threadId": thread_id, "turnId": turn_id, "tokenUsage": {"total": {
                 "inputTokens": usage.input_tokens,
+                "cachedInputTokens": usage.cached_input_tokens,
                 "outputTokens": usage.output_tokens,
                 "totalTokens": usage.total(),
             }}}),
@@ -173,12 +180,14 @@ mod tests {
             "u",
             Usage {
                 input_tokens: 10,
+                cached_input_tokens: 4,
                 output_tokens: 5,
             },
         );
         emitter.tool_call("1", "github_api", &json!({"method": "GET"}), false);
         let usage = rx.try_recv().unwrap();
         let tokens = usage.token_usage.unwrap();
+        assert_eq!(tokens.cached_input_tokens, Some(4));
         assert_eq!(
             (
                 tokens.input_tokens,

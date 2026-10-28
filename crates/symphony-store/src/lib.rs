@@ -21,7 +21,7 @@
 //! store.mark_interrupted_runs().await?;
 //! let run = store.start_run(NewRun::new("issue-1", "MT-1")).await?;
 //! store.append_event(run, "session_started", None, None).detach();
-//! store.update_tokens(run, TokenUsage { input: 4, output: 8, total: 12 }).detach();
+//! store.update_tokens(run, TokenUsage { input: 4, cached: 0, output: 8, total: 12 }).detach();
 //! store.finish_run(run, RunStatus::Succeeded, None).await?;
 //! # Ok(())
 //! # }

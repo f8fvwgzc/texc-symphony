@@ -177,6 +177,7 @@ fn snapshot_fixture_super_busy_dashboard() {
         retrying: vec![],
         totals: Totals {
             input_tokens: 250_000,
+            cached_input_tokens: 0,
             output_tokens: 18_500,
             total_tokens: 268_500,
             seconds_running: 4_321,
@@ -220,6 +221,7 @@ fn snapshot_fixture_backoff_queue_pressure() {
         ],
         totals: Totals {
             input_tokens: 18_000,
+            cached_input_tokens: 0,
             output_tokens: 2_200,
             total_tokens: 20_200,
             seconds_running: 2_700,
@@ -268,6 +270,7 @@ fn snapshot_fixture_unlimited_credits_variant() {
         retrying: vec![],
         totals: Totals {
             input_tokens: 90,
+            cached_input_tokens: 0,
             output_tokens: 12,
             total_tokens: 102,
             seconds_running: 75,

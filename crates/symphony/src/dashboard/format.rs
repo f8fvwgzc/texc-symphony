@@ -86,8 +86,10 @@ pub struct RetryRow {
 /// Aggregate token and runtime counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Totals {
-    /// Input tokens.
+    /// Input tokens (prompt-cache reads excluded).
     pub input_tokens: u64,
+    /// Prompt-cache reads (shown only when there are any).
+    pub cached_input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
     /// Total tokens.
@@ -173,9 +175,21 @@ pub fn format_snapshot_content(data: Option<&FrameData>, tps: f64, ctx: &FrameCo
             )
         ),
         format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             colorize("│ Tokens: ", BOLD),
             colorize(&format!("in {}", count(data.totals.input_tokens)), YELLOW),
+            if data.totals.cached_input_tokens > 0 {
+                format!(
+                    "{}{}",
+                    colorize(" | ", GRAY),
+                    colorize(
+                        &format!("cached {}", count(data.totals.cached_input_tokens)),
+                        YELLOW
+                    )
+                )
+            } else {
+                String::new()
+            },
             colorize(" | ", GRAY),
             colorize(&format!("out {}", count(data.totals.output_tokens)), YELLOW),
             colorize(" | ", GRAY),

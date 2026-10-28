@@ -79,8 +79,11 @@ pub struct PauseState {
 /// Token counters of one session (`tokens` of running rows).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCounts {
-    /// Input (prompt) tokens.
+    /// Input (prompt) tokens, prompt-cache reads excluded.
     pub input_tokens: u64,
+    /// Prompt-cache reads.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// Output (completion) tokens.
     pub output_tokens: u64,
     /// Total tokens as reported by Codex.
@@ -91,8 +94,11 @@ pub struct TokenCounts {
 /// clients add `now - started_at` of each running row for a live total).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct CodexTotals {
-    /// Input tokens over all sessions.
+    /// Input tokens over all sessions, prompt-cache reads excluded.
     pub input_tokens: u64,
+    /// Prompt-cache reads over all sessions.
+    #[serde(default)]
+    pub cached_input_tokens: u64,
     /// Output tokens over all sessions.
     pub output_tokens: u64,
     /// Total tokens over all sessions.

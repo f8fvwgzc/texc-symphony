@@ -25,7 +25,7 @@ describe('OverviewPage', () => {
     render(<OverviewPage state={makeSnapshot()} totals={TOTALS} now={NOW} />);
     const summary = screen.getByRole('region', { name: 'Summary' });
     expect(within(summary).getByText('Total tokens').nextElementSibling).toHaveTextContent('12');
-    expect(within(summary).getByText('In 4 / Out 8')).toBeInTheDocument();
+    expect(within(summary).getByText('In 4 / Cached 0 / Out 8')).toBeInTheDocument();
     // 42 s ended + 318 s live elapsed.
     expect(within(summary).getByText('6m 0s')).toBeInTheDocument();
     expect(within(summary).getByText('All-time runs').nextElementSibling).toHaveTextContent('128');

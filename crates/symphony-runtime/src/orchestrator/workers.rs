@@ -65,12 +65,9 @@ impl Orchestrator<'_> {
                 .recorder
                 .usage(entry.tokens.totals, entry.cost_micro_usd);
             let issue_id = entry.issue.id.clone().unwrap_or_default();
-            self.state.spend.record(
-                &issue_id,
-                delta.input_tokens.saturating_add(delta.output_tokens),
-                cost_delta,
-                Utc::now(),
-            );
+            self.state
+                .spend
+                .record(&issue_id, delta.processed(), cost_delta, Utc::now());
         }
         self.state.codex_totals.add_tokens(delta);
         self.state.codex_totals.cost_micro_usd = self

@@ -40,8 +40,8 @@ function RunSummary({ run }: { run: RunRecord }) {
       <Field label="Duration">{formatDurationMs(run.duration_ms)}</Field>
       <Field label="Tokens">
         <span class="tabular-nums">
-          {formatInt(run.tokens.total)} (in {formatInt(run.tokens.input)} / out{' '}
-          {formatInt(run.tokens.output)})
+          {formatInt(run.tokens.total)} (in {formatInt(run.tokens.input)} / cached{' '}
+          {formatInt(run.tokens.cached)} / out {formatInt(run.tokens.output)})
         </span>
       </Field>
       <Field label="Worker host">{run.worker_host ?? 'local'}</Field>

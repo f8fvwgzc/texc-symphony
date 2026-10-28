@@ -73,6 +73,7 @@ export function IssueBody({ detail, now }: { detail: IssueDetail; now: number })
             <Field label="Turns">{running.turn_count}</Field>
             <Field label="Tokens">
               {formatInt(running.tokens.total_tokens)} (in {formatInt(running.tokens.input_tokens)}
+              {' / '}cached {formatInt(running.tokens.cached_input_tokens)}
               {' / '}out {formatInt(running.tokens.output_tokens)})
             </Field>
             <Field label="Last event">

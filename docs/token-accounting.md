@@ -242,6 +242,23 @@ Do not treat generic `params.usage` as equivalent to a cumulative thread total u
 - Ignore the event for accounting.
 - Keep the last accepted absolute high-water mark unchanged.
 
+#### Prompt-cache reads
+
+Codex's `inputTokens` / `input_tokens` include the input read from the prompt cache, reported as
+`cachedInputTokens` / `cached_input_tokens` (Symphony's `claude_code` and `api` backends report
+`cache_read_input_tokens` and OpenAI's `prompt_tokens_details.cached_tokens` the same way). Cache
+reads cost about a tenth of the input price, so Symphony meters them apart:
+
+- `input_tokens` (API, store `input`) is the reported input **less** its cache reads, kept as a
+  high-water mark like the other counters; an update without a cache count keeps the last one.
+- `cached_input_tokens` (store `cached`) is the cache reads.
+- `total_tokens` is unchanged, so `total = input + cached + output`.
+- Budgets count all three; costs price cache reads at `cached_input_usd_per_million_tokens` (the
+  input price when unset).
+
+Runs recorded before this split (store schema 6) have `cached: 0` and count their cache reads in
+`input`.
+
 ### Why this matters
 
 If you misclassify a per-turn `usage` payload as an absolute thread total, later turns can appear to stall because a smaller per-turn number is compared against a larger cumulative baseline.

@@ -471,8 +471,8 @@ header).
 
 ### `budget`
 
-Spend controls. Every limit is optional; tokens count input + output across the issue's (or the
-day's) runs, and a day is a UTC calendar day. Costs come from the prices below, fixed per run when
+Spend controls. Every limit is optional; tokens count input, prompt-cache reads and output across
+the issue's (or the day's) runs, and a day is a UTC calendar day. Costs come from the prices below, fixed per run when
 it starts, so cost limits only apply once prices are set.
 
 | Key | Type | Default | Validation and notes | Reload |
@@ -482,6 +482,7 @@ it starts, so cost limits only apply once prices are set.
 | `budget.max_cost_usd_per_issue` | number | unlimited | `> 0`, USD. Same as the token limit, by cost. | live |
 | `budget.max_cost_usd_per_day` | number | unlimited | `> 0`, USD. Same as the daily token limit, by cost. | live |
 | `budget.input_usd_per_million_tokens` | number | `0` | `>= 0`. Price of one million input tokens. | new runs |
+| `budget.cached_input_usd_per_million_tokens` | number | input price | `>= 0`. Price of one million input tokens read from the prompt cache (for example a tenth of the input price on Anthropic). | new runs |
 | `budget.output_usd_per_million_tokens` | number | `0` | `>= 0`. Price of one million output tokens. | new runs |
 
 The **kill switch** is `POST /api/v1/pause` (optionally `?reason=...`): it stops every running agent

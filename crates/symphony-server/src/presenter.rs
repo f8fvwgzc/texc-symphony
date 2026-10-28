@@ -121,6 +121,11 @@ pub fn prometheus(view: &StateView) -> String {
         totals.input_tokens.to_string(),
     );
     gauge(
+        "symphony_cached_input_tokens",
+        "Input tokens read from the prompt cache by this process.",
+        totals.cached_input_tokens.to_string(),
+    );
+    gauge(
         "symphony_output_tokens",
         "Output tokens used by this process.",
         totals.output_tokens.to_string(),
@@ -403,7 +408,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&totals).unwrap(),
-            r#"{"input_tokens":0,"output_tokens":0,"total_tokens":0,"seconds_running":42}"#
+            r#"{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0,"seconds_running":42}"#
         );
         totals.seconds_running = 42.5;
         assert_eq!(

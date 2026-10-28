@@ -60,6 +60,7 @@ fn running_entry(row: &RunningSnapshot, redactor: &Redactor) -> RunningEntry {
         last_event_at: row.last_codex_timestamp,
         tokens: TokenCounts {
             input_tokens: row.codex_input_tokens,
+            cached_input_tokens: row.codex_cached_input_tokens,
             output_tokens: row.codex_output_tokens,
             total_tokens: row.codex_total_tokens,
         },
@@ -127,6 +128,7 @@ pub fn state_view_redacted(
             .collect(),
         codex_totals: CodexTotals {
             input_tokens: snapshot.codex_totals.input_tokens,
+            cached_input_tokens: snapshot.codex_totals.cached_input_tokens,
             output_tokens: snapshot.codex_totals.output_tokens,
             total_tokens: snapshot.codex_totals.total_tokens,
             // Exact for any realistic runtime (< 2^53 s).
@@ -242,6 +244,7 @@ mod tests {
                 session_id: Some("thread-http".into()),
                 codex_app_server_pid: Some("4242".into()),
                 codex_input_tokens: 4,
+                codex_cached_input_tokens: 0,
                 codex_output_tokens: 8,
                 codex_total_tokens: 12,
                 turn_count: 7,
@@ -289,6 +292,7 @@ mod tests {
             }],
             codex_totals: RtTotals {
                 input_tokens: 4,
+                cached_input_tokens: 0,
                 output_tokens: 8,
                 total_tokens: 12,
                 seconds_running: 42,

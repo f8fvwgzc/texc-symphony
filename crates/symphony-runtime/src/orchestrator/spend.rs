@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, NaiveDate, Utc};
+use symphony_codex::tokens::TokenCounts;
 use symphony_core::config::BudgetSettings;
 
 /// Store `control` key holding the kill switch reason (absent = dispatching).
@@ -23,6 +24,7 @@ pub const PAUSED_CONTROL_KEY: &str = "dispatch_paused";
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Pricing {
     pub input_usd_per_million_tokens: f64,
+    pub cached_input_usd_per_million_tokens: Option<f64>,
     pub output_usd_per_million_tokens: f64,
 }
 
@@ -30,6 +32,7 @@ impl Pricing {
     pub(crate) fn from_budget(budget: &BudgetSettings) -> Self {
         Self {
             input_usd_per_million_tokens: budget.input_usd_per_million_tokens,
+            cached_input_usd_per_million_tokens: budget.cached_input_usd_per_million_tokens,
             output_usd_per_million_tokens: budget.output_usd_per_million_tokens,
         }
     }
@@ -42,20 +45,26 @@ impl Pricing {
         match backend.and_then(|b| b.pricing.as_ref()) {
             Some(pricing) => Self {
                 input_usd_per_million_tokens: pricing.input_usd_per_million_tokens,
+                cached_input_usd_per_million_tokens: pricing.cached_input_usd_per_million_tokens,
                 output_usd_per_million_tokens: pricing.output_usd_per_million_tokens,
             },
             None => Self::from_budget(budget),
         }
     }
 
-    /// Cost in micro-USD of cumulative `input` / `output` token counts.
-    pub(crate) fn cost_micro_usd(&self, input: u64, output: u64) -> u64 {
+    /// Cost in micro-USD of cumulative token counts.
+    pub(crate) fn cost_micro_usd(&self, tokens: &TokenCounts) -> u64 {
         BudgetSettings {
             input_usd_per_million_tokens: self.input_usd_per_million_tokens,
+            cached_input_usd_per_million_tokens: self.cached_input_usd_per_million_tokens,
             output_usd_per_million_tokens: self.output_usd_per_million_tokens,
             ..BudgetSettings::default()
         }
-        .cost_micro_usd(input, output)
+        .cost_micro_usd(
+            tokens.input_tokens,
+            tokens.cached_input_tokens,
+            tokens.output_tokens,
+        )
     }
 }
 
@@ -268,16 +277,33 @@ mod tests {
             max_cost_usd_per_issue: Some(1.0),
             max_cost_usd_per_day: Some(3.0),
             input_usd_per_million_tokens: 1_000.0,
+            cached_input_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 2_000.0,
         }
     }
 
     #[test]
     fn pricing_turns_tokens_into_micro_usd() {
+        let tokens = |input, cached, output| TokenCounts {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            output_tokens: output,
+            total_tokens: input + cached + output,
+        };
         let pricing = Pricing::from_budget(&budget());
         // 100 input * $1000/M = $0.10, 50 output * $2000/M = $0.10.
-        assert_eq!(pricing.cost_micro_usd(100, 50), 200_000);
-        assert_eq!(Pricing::default().cost_micro_usd(1_000, 1_000), 0);
+        assert_eq!(pricing.cost_micro_usd(&tokens(100, 0, 50)), 200_000);
+        assert_eq!(
+            Pricing::default().cost_micro_usd(&tokens(1_000, 0, 1_000)),
+            0
+        );
+        // Cache reads cost the input price unless they have their own.
+        assert_eq!(pricing.cost_micro_usd(&tokens(0, 100, 0)), 100_000);
+        let cached = Pricing {
+            cached_input_usd_per_million_tokens: Some(100.0),
+            ..pricing
+        };
+        assert_eq!(cached.cost_micro_usd(&tokens(100, 100, 50)), 210_000);
     }
 
     #[test]

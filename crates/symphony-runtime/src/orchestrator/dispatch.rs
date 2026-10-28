@@ -80,7 +80,7 @@ impl Orchestrator<'_> {
         if per_issue && !self.state.spend.knows_issue(issue_id) {
             let usage = match self.ctx.store.issue_usage(issue_id).await {
                 Ok(usage) => Usage {
-                    tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                    tokens: usage.tokens.processed(),
                     cost_micro_usd: usage.cost_micro_usd,
                 },
                 Err(err) => {
@@ -279,7 +279,7 @@ impl Orchestrator<'_> {
             self.state.spend.seed_issue(
                 issue_id,
                 Usage {
-                    tokens: usage.tokens.input.saturating_add(usage.tokens.output),
+                    tokens: usage.tokens.processed(),
                     cost_micro_usd: usage.cost_micro_usd,
                 },
             );

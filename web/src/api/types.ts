@@ -29,8 +29,10 @@ export type ErrorCode =
   | 'store_disabled'
   | 'request_failed';
 
+/** `input_tokens` excludes prompt-cache reads, which are `cached_input_tokens`. */
 export interface TokenUsage {
   input_tokens: number | null;
+  cached_input_tokens: number | null;
   output_tokens: number | null;
   total_tokens: number | null;
 }
@@ -80,6 +82,7 @@ export interface BlockedEntry {
 /** `seconds_running` counts ended sessions only; add live elapsed time of running rows. */
 export interface CodexTotals {
   input_tokens: number;
+  cached_input_tokens: number;
   output_tokens: number;
   total_tokens: number;
   seconds_running: number;
@@ -212,8 +215,10 @@ export function isRunStatus(value: string | null | undefined): value is RunStatu
   return RUN_STATUSES.some((status) => status === value);
 }
 
+/** `input` excludes prompt-cache reads (`cached`; 0 for runs recorded before they were metered apart). */
 export interface RunTokens {
   input: number;
+  cached: number;
   output: number;
   total: number;
 }

@@ -67,10 +67,10 @@ curl -s $SYMPHONY/api/v1/state | jq
   "running": [{ "issue_id": "issue-http", "issue_identifier": "MT-HTTP", "state": "In Progress",
                 "session_id": "thread-http", "turn_count": 7, "last_event": "notification",
                 "last_message": "rendered", "started_at": "2026-02-24T20:10:12Z",
-                "tokens": { "input_tokens": 4, "output_tokens": 8, "total_tokens": 12 }, "...": "..." }],
+                "tokens": { "input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 8, "total_tokens": 12 }, "...": "..." }],
   "retrying": [{ "issue_identifier": "MT-RETRY", "attempt": 2, "due_at": "2026-02-24T20:15:32Z", "error": "boom", "...": "..." }],
   "blocked":  [{ "issue_identifier": "MT-BLOCKED", "error": "codex turn requires operator input", "...": "..." }],
-  "codex_totals": { "input_tokens": 4, "output_tokens": 8, "total_tokens": 12, "seconds_running": 42 },
+  "codex_totals": { "input_tokens": 4, "cached_input_tokens": 0, "output_tokens": 8, "total_tokens": 12, "seconds_running": 42 },
   "rate_limits": { "primary": { "remaining": 11 } }
 }
 ```
