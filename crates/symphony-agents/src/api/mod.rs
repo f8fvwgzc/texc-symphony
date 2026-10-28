@@ -14,9 +14,11 @@
 //!
 //! Requests are retried on HTTP 429 and 5xx and on connection failures, up to three times with
 //! 1 s / 2 s / 4 s backoff (`retry-after` seconds win, capped at 30 s). Wire formats:
-//! [`anthropic`] and [`openai`].
+//! [`anthropic`] and [`openai`]. Before each model call, a conversation estimated above
+//! `compact_after_tokens` has its older tool results cut ([`compact`]).
 
 pub mod anthropic;
+pub mod compact;
 pub mod openai;
 pub mod sandbox;
 pub mod sse;
@@ -367,6 +369,28 @@ impl ApiSession {
         state.finish().map_err(|e| self.backend_error(e))
     }
 
+    /// Cuts older tool results once the conversation passes `compact_after_tokens`.
+    fn compact_history(&mut self) {
+        let limit = self.api.compact_after_tokens;
+        if limit == 0 {
+            return;
+        }
+        let tokens = compact::estimate_tokens(&self.system, &self.tools, &self.messages);
+        if tokens <= limit {
+            return;
+        }
+        let done = compact::compact(&mut self.messages);
+        if done.results > 0 {
+            tracing::info!(
+                "Compacted the API agent history thread_id={} estimated_tokens={tokens} \
+                 results={} chars_removed={}",
+                self.thread_id,
+                done.results,
+                done.chars
+            );
+        }
+    }
+
     async fn turn_loop(
         &mut self,
         issue: &Issue,
@@ -375,6 +399,7 @@ impl ApiSession {
     ) -> Result<Option<String>, CodexError> {
         let mut final_message = None;
         for _ in 0..self.api.max_steps {
+            self.compact_history();
             let reply = self.call_model(emitter).await?;
             self.usage.add(reply.usage);
             emitter.usage(&self.thread_id, turn_id, self.usage);

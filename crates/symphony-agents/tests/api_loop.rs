@@ -81,6 +81,7 @@ fn api(provider: ApiProvider, base_url: &str, stream: bool) -> ApiBackendSetting
         temperature: None,
         stream,
         prompt_cache: true,
+        compact_after_tokens: 100_000,
         request_timeout_ms: 10_000,
         sandbox: SandboxMode::None,
         network: false,
@@ -1295,4 +1296,57 @@ async fn a_default_deny_network_that_cannot_be_enforced_refuses_an_unconfined_sh
         !env.workspace.join("ran.txt").exists(),
         "the command did not run"
     );
+}
+
+/// Past `compact_after_tokens`, older tool results are sent as stubs; the four newest stay whole.
+#[tokio::test]
+async fn older_tool_results_are_compacted_past_the_threshold() {
+    let server = MockServer::start().await;
+    let reads = 6;
+    let mut steps: Vec<ResponseTemplate> = (0..reads)
+        .map(|_| anthropic_tool_use(false, "read_file", json!({"path": "big.txt"})))
+        .collect();
+    steps.push(anthropic_text(false, "done"));
+    mount_sequence(&server, ApiProvider::Anthropic, steps).await;
+    let env = Env::new();
+    let big = format!("first line of big.txt\n{}\n", "y".repeat(6000));
+    std::fs::write(env.workspace.join("big.txt"), &big).unwrap();
+    let mut settings = api(ApiProvider::Anthropic, &server.uri(), false);
+    // Five results of about 6,000 characters pass it; four do not leave anything to cut.
+    settings.compact_after_tokens = 5_000;
+    settings.max_steps = 10;
+    let backend = backend(backend_settings(settings));
+    let mut session = backend
+        .start(env.options(env.settings(None)))
+        .await
+        .unwrap();
+    let (events, _rx) = sink();
+    let outcome = session
+        .run_turn("read it", &issue(), &events)
+        .await
+        .unwrap();
+    assert_eq!(outcome.final_message.as_deref(), Some("done"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), reads + 1);
+    let results = |index: usize| -> Vec<String> {
+        request_json(&requests[index])["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["content"][0]["type"] == "tool_result")
+            .map(|m| m["content"][0]["content"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let whole = |text: &str| text.contains(&"y".repeat(6000));
+    // The 5th call carries four results: all of them are the newest four.
+    assert!(results(4).iter().all(|r| whole(r)));
+    // The 7th carries six: the two oldest are stubs, the four newest are whole.
+    let last = results(reads);
+    assert_eq!(last.len(), reads);
+    for stub in &last[..2] {
+        assert!(stub.starts_with("[Tool result removed"), "{stub}");
+        assert!(!whole(stub));
+    }
+    assert!(last[2..].iter().all(|r| whole(r)));
 }

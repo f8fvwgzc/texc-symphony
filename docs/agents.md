@@ -99,6 +99,7 @@ were made (`agent_limit_exceeded`). The conversation persists across the turns o
 | `temperature` | provider default | `0..2`. |
 | `stream` | `true` | `false` for servers with broken streaming. |
 | `prompt_cache` | `true` | `anthropic`: prompt-cache breakpoints on the tools, the system prompt and the newest message, so each model call reads the conversation so far from the provider's cache (about a tenth of the input price). `false` for Anthropic-compatible servers that reject `cache_control`. OpenAI-compatible providers cache without markers. |
+| `compact_after_tokens` | `100000` | Once the conversation is estimated (four characters a token) above this, tool results longer than 1,024 characters, except those of the four newest tool-result messages, are replaced by a stub with their first line; the agent runs the tool again if it needs one. Each cut invalidates the prompt cache from the first changed result, so it cuts everything older at once. Lower it for models with small context windows; `0` never cuts. |
 | `request_timeout_ms` | `600000` | One model request. |
 | `sandbox` | `auto` | `shell` confinement: `auto` (= `bubblewrap`), `bubblewrap`, `seatbelt` (macOS development only), `none` (needs `unconfined`). |
 | `network` | `false` | Network access for `shell` commands (bubblewrap and seatbelt; a task's `isolation.network.mode: deny` wins). `false` cannot be set with `sandbox: none`, which cannot enforce it. |

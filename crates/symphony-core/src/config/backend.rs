@@ -39,6 +39,8 @@ pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 /// Retries of one model request of an `api` backend unless `max_retries` / `LLM_MAX_RETRIES`.
 pub const DEFAULT_API_RETRIES: u32 = 3;
+/// Default `compact_after_tokens` of an api backend.
+pub const DEFAULT_COMPACT_AFTER_TOKENS: u64 = 100_000;
 /// Tools the API agent loop can offer.
 pub const API_TOOLS: [&str; 6] = [
     "read_file",
@@ -156,6 +158,9 @@ pub struct ApiBackendSettings {
     /// Anthropic wire: mark prompt-cache breakpoints (`cache_control`) on the tools, the system
     /// prompt and the newest message (default `true`); `false` for servers that reject the field.
     pub prompt_cache: bool,
+    /// Estimated conversation size (tokens, about four characters each) above which older tool
+    /// results are cut from the history (default 100 000; `0` never cuts).
+    pub compact_after_tokens: u64,
     /// Bound on one model request in ms (`> 0`, default 600 000).
     pub request_timeout_ms: u64,
     /// `shell` confinement.
@@ -287,6 +292,21 @@ impl Entry<'_> {
             Some(n) if n > 0 => Some(n as u64),
             Some(_) => {
                 errors.push(&self.key(key), "must be greater than 0");
+                None
+            }
+            None => {
+                errors.push(&self.key(key), "is invalid");
+                None
+            }
+        }
+    }
+
+    fn non_negative(&self, key: &str, errors: &mut Errors) -> Option<u64> {
+        let value = self.get(key)?;
+        match cast_integer(value) {
+            Some(n) if n >= 0 => Some(n as u64),
+            Some(_) => {
+                errors.push(&self.key(key), "must be greater than or equal to 0");
                 None
             }
             None => {
@@ -434,6 +454,7 @@ fn api_from_contract(llm: &LlmConnection) -> ApiBackendSettings {
         temperature: None,
         stream: true,
         prompt_cache: true,
+        compact_after_tokens: DEFAULT_COMPACT_AFTER_TOKENS,
         request_timeout_ms: llm.timeout_secs.map_or(600_000, |s| s.saturating_mul(1000)),
         sandbox: SandboxMode::Auto,
         network: false,
@@ -604,6 +625,9 @@ fn cast_api(
         temperature,
         stream: entry.boolean("stream", errors).unwrap_or(true),
         prompt_cache: entry.boolean("prompt_cache", errors).unwrap_or(true),
+        compact_after_tokens: entry
+            .non_negative("compact_after_tokens", errors)
+            .unwrap_or(DEFAULT_COMPACT_AFTER_TOKENS),
         request_timeout_ms: entry
             .positive("request_timeout_ms", errors)
             .unwrap_or_else(|| {
