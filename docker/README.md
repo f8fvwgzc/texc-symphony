@@ -134,7 +134,7 @@ automatically; nothing to configure. Building locally is also native:
 
 ```sh
 # from the repository root
-docker buildx build -f docker/Dockerfile -t symphony:dev --load .
+docker buildx build -f docker/Dockerfile --ssh default -t symphony:dev --load .
 ```
 
 The Rust code is cross-compiled with [`tonistiigi/xx`](https://github.com/tonistiigi/xx) on the
@@ -231,21 +231,24 @@ All builds run from the **repository root** (the build context), with
 
 ```sh
 # Native architecture, loaded into the local image store
-docker buildx build -f docker/Dockerfile -t symphony:dev --load .
+docker buildx build -f docker/Dockerfile --ssh default -t symphony:dev --load .
 
 # Another single architecture (cross-compiled, still fast)
-docker buildx build -f docker/Dockerfile --platform linux/amd64 -t symphony:dev-amd64 --load .
+docker buildx build -f docker/Dockerfile --ssh default --platform linux/amd64 -t symphony:dev-amd64 --load .
 
 # Multi-arch, pushed to a registry (multi-platform images cannot be --load-ed into the classic
 # image store; push them, or enable Docker Desktop's containerd image store)
 docker buildx create --name symphony-builder --driver docker-container --use   # once
-docker buildx build -f docker/Dockerfile \
+docker buildx build -f docker/Dockerfile --ssh default \
   --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" \
   -t ghcr.io/<owner>/<repo>:dev --push .
 ```
 
-`make docker` and `make docker-multiarch` wrap the first and last commands.
+`make docker` and `make docker-multiarch` wrap the first and last commands. `--ssh default`
+passes your SSH agent to the build, which fetches the private `tutela-sdk` git dependency with it
+(a key that can read `f8fvwgzc/tutela` must be loaded: `ssh-add -l`). CI loads a read-only
+deploy key from the `TUTELA_READ_KEY` secret (`.github/actions/tutela-ssh`).
 
 `docker/test.sh symphony:dev` tests a built image as it ships (CI runs it before every push). It
 starts the image with a marker API token and, as the image's user outside any sandbox, checks

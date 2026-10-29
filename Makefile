@@ -99,11 +99,11 @@ pr-body-check:
 DOCKER_LABEL_ARGS = --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION)
 
 docker:
-	$(DOCKER) buildx build -f docker/Dockerfile $(DOCKER_LABEL_ARGS) $(DOCKER_BUILD_ARGS) \
-		-t $(IMAGE):$(TAG) --load .
+	$(DOCKER) buildx build -f docker/Dockerfile --ssh default $(DOCKER_LABEL_ARGS) \
+		$(DOCKER_BUILD_ARGS) -t $(IMAGE):$(TAG) --load .
 
 docker-multiarch:
-	$(DOCKER) buildx build -f docker/Dockerfile --platform $(PLATFORMS) \
+	$(DOCKER) buildx build -f docker/Dockerfile --ssh default --platform $(PLATFORMS) \
 		$(DOCKER_LABEL_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE):$(TAG) \
 		$(if $(PUSH),--push,--output type=cacheonly) .
 

@@ -16,7 +16,7 @@ import { createTokenStore, type TokenStore } from './token';
 
 /** Path of the SSE stream (see `streamEvents` in the OpenAPI document). */
 export const EVENTS_PATH = '/api/v1/events';
-/** Issues single-use SSE tickets (see `createStreamTicket`). */
+/** Issues single-use SSE tickets as a cookie (see `createStreamTicket`). */
 export const TICKETS_PATH = '/api/v1/events/tickets';
 
 /** A non-2xx response (with the server's `{error: {code, message}}` envelope when present). */
@@ -67,10 +67,13 @@ export interface ApiClient {
     options?: RequestOptions,
   ): Promise<RunEventList>;
   getTotals(options?: RequestOptions): Promise<Totals>;
-  /** `POST /api/v1/events/tickets`: a single-use ticket for opening the SSE stream. */
+  /**
+   * `POST /api/v1/events/tickets`: sets a single-use ticket cookie that the next `EventSource`
+   * on this origin sends (no credential ever goes into a URL).
+   */
   createStreamTicket(options?: RequestOptions): Promise<SseTicket>;
-  /** Absolute or same-origin URL for an `EventSource`, with `?ticket=` when given. */
-  eventsUrl(ticket?: string): string;
+  /** Absolute or same-origin URL for an `EventSource`. */
+  eventsUrl(): string;
   /** The API token sent with every request (a 401 marks it rejected). */
   auth: TokenStore;
 }
@@ -183,7 +186,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       ),
     getTotals: (opts) => request<Totals>('GET', '/api/v1/totals', opts),
     createStreamTicket: (opts) => request<SseTicket>('POST', TICKETS_PATH, opts),
-    eventsUrl: (ticket) => `${baseUrl}${EVENTS_PATH}${buildQuery({ ticket })}`,
+    eventsUrl: () => `${baseUrl}${EVENTS_PATH}`,
     auth,
   };
 }

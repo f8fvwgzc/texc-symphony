@@ -1544,6 +1544,24 @@ Enablement (extension):
   SHOULD refuse requests whose `Host` names neither loopback nor a configured name (DNS rebinding),
   and SHOULD refuse cross-origin browser writes. The API exposes agent output, so it MUST NOT be
   readable by arbitrary web pages.
+- Credentials MUST NOT be accepted in URLs (query strings end up in logs and browser history). A
+  browser event stream, which cannot send headers, authenticates with a short-lived single-use
+  ticket in a same-site, script-proof cookie, or with a fetch-based stream.
+
+Authentication (Symphony):
+
+- API callers are Tutela-verified (Tutela `docs/INTEGRATION.md` §2): a bearer access token for
+  exactly one audience, `symphony`, from a configured issuer (Keycloak in Tutela's Phases A and
+  B), for a tenant that issuer may speak for, checked offline by `tutela-sdk`'s axum layer. A
+  refused token is `401` and says nothing about why.
+- Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B turns on delegation;
+  Symphony must then never forward such a token, and obtains a new token per downstream
+  audience.
+- With no credentials configured the API is open, the local single-user mode, allowed only on a
+  loopback address; any other listen address requires tokens.
+- The legacy static API token stays accepted next to Tutela tokens for one release window behind
+  a flag (on in the release that adds Tutela, off by default in the next, removed in the one
+  after), with a deprecation warning.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 

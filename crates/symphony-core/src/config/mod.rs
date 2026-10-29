@@ -28,8 +28,8 @@ pub use llm::{LlmConnection, LlmGateway, LlmProvider, SecretSource};
 pub use schema::{
     AgentSettings, BudgetSettings, CodexProvider, CodexSettings, DEFAULT_MAX_RETRY_ATTEMPTS,
     HooksSettings, ObservabilitySettings, PollingSettings, ServerSettings, Settings, StringOrMap,
-    TrackerSettings, WorkerSettings, WorkspaceSettings, default_approval_policy,
-    normalize_state_limits, parse, validate_state_limits,
+    TUTELA_ALGS, TrackerSettings, TutelaIssuer, TutelaSettings, WorkerSettings, WorkspaceSettings,
+    default_approval_policy, normalize_state_limits, parse, validate_state_limits,
 };
 pub use tracker::{
     AsanaSettings, GitHubSettings, GitLabSettings, JiraSettings, LinearSettings,

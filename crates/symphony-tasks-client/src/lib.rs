@@ -6,7 +6,8 @@
 //! # async fn demo() -> Result<(), symphony_tasks_client::ClientError> {
 //! use symphony_tasks_client::{NewTask, TasksClient};
 //!
-//! let client = TasksClient::new("http://127.0.0.1:4000")?.with_token("<SYMPHONY_API_TOKEN>");
+//! // A Tutela access token for aud=symphony (a service-account key or client_credentials token).
+//! let client = TasksClient::new("https://symphony.example.com")?.with_token("<access token>");
 //! let task = client
 //!     .create(&NewTask {
 //!         prompt: "Read README.md and write a five-line summary.".into(),
@@ -31,6 +32,11 @@
 //! ```
 //!
 //! The wire contract is `docs/api/openapi.yaml` (`/api/openapi.json` on a running server).
+//!
+//! Every request carries `Authorization: Bearer <token>`: a Tutela access token issued for
+//! `aud=symphony` (during the transition, a server may still accept its legacy API token). Only
+//! a server in local single-user mode, on loopback, needs none. The event stream is a plain
+//! authenticated `GET`: the token is never put in a URL.
 
 #![warn(missing_docs)]
 
@@ -347,11 +353,6 @@ struct EnvelopeBody {
     message: String,
 }
 
-#[derive(Deserialize)]
-struct Ticket {
-    ticket: String,
-}
-
 /// A stream of task events.
 pub type TaskEvents = Pin<Box<dyn Stream<Item = Result<TaskEvent, ClientError>> + Send>>;
 
@@ -392,7 +393,8 @@ impl TasksClient {
         })
     }
 
-    /// Sends `Authorization: Bearer <token>` (the server's `SYMPHONY_API_TOKEN`).
+    /// Sends `Authorization: Bearer <token>` with every request: a Tutela access token for
+    /// `aud=symphony` (or, while the server still accepts it, its legacy API token).
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
@@ -514,19 +516,11 @@ impl TasksClient {
     }
 
     /// Streams the task's record changes and run events until it is final (one SSE
-    /// connection, authenticated with a single-use ticket).
+    /// connection, authenticated by the bearer token like every other request).
     pub async fn watch(&self, id: i64) -> Result<TaskEvents, ClientError> {
-        let ticket: Ticket = Self::decode(
-            self.request(Method::POST, self.url("api/v1/events/tickets")?)
-                .send()
-                .await?,
-        )
-        .await?;
-        let mut url = self.url(&format!("api/v1/tasks/{id}/events"))?;
-        url.query_pairs_mut().append_pair("ticket", &ticket.ticket);
+        let url = self.url(&format!("api/v1/tasks/{id}/events"))?;
         let response = self
-            .http
-            .get(url)
+            .request(Method::GET, url)
             .header("accept", "text/event-stream")
             .send()
             .await?;

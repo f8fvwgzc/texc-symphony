@@ -6,8 +6,9 @@ it as a plain binary, in Docker, and under systemd, plus reverse proxies, backup
 
 > [!WARNING]
 > Symphony runs coding agents unattended. Run it in a trusted environment and give agents only the
-> credentials they need. The HTTP API needs a bearer token (`server.api_token` or
-> `SYMPHONY_API_TOKEN`) on any non-loopback bind; Symphony refuses to start without one. Do not put
+> credentials they need. The HTTP API needs bearer tokens on any non-loopback bind: Tutela access
+> tokens for `aud=symphony` (`server.tutela`), or during the transition the deprecated
+> `server.api_token` / `SYMPHONY_API_TOKEN`; Symphony refuses to start without either. Do not put
 > an HTTP basic-auth proxy in front: it uses the same `Authorization` header as the token.
 
 ## Command line and environment
@@ -48,9 +49,12 @@ the orchestrator and needs no token. The `Host` allow-list still applies to it: 
 outside the container must use a loopback name or one listed in `server.allowed_hosts` (a
 `0.0.0.0` bind host is not added to the list).
 
-**Exposure.** Symphony refuses to bind a non-loopback address unless an API token is configured
-(`server.api_token` or `SYMPHONY_API_TOKEN`). With a token, every other `/api/*` call needs
-`Authorization: Bearer <token>`; the dashboard asks for it. Requests whose `Host` is not loopback,
+**Exposure.** Symphony refuses to bind a non-loopback address unless callers must authenticate:
+Tutela tokens for `aud=symphony` ([`server.tutela`](configuration.md#tutela-authentication)), or
+during the transition the deprecated `server.api_token` / `SYMPHONY_API_TOKEN` (while
+`server.legacy_api_token` is on, the default in this release only). Every other `/api/*` call
+then needs `Authorization: Bearer <token>`; the dashboard asks for it. Without either, the API is
+open on loopback only (the local single-user mode). Requests whose `Host` is not loopback,
 the bind address or a `server.allowed_hosts` entry are refused, and browser writes from other
 origins are refused. Use `budget:` in `WORKFLOW.md` and the kill switch (`POST /api/v1/pause`) to
 cap spending.
@@ -320,7 +324,9 @@ hooks. Logs rotate at 10 MiB × 5 files under `<SYMPHONY_LOGS_ROOT>/log/`.
 
 | Change | What to do |
 |---|---|
-| A non-loopback `server.host`/`SYMPHONY_HOST` (the Docker image: `0.0.0.0`) refuses to start without an API token. | Set `SYMPHONY_API_TOKEN` (or `server.api_token`); clients send `Authorization: Bearer`, the dashboard asks once. |
+| A non-loopback `server.host`/`SYMPHONY_HOST` (the Docker image: `0.0.0.0`) refuses to start without authentication. | Configure `server.tutela` (callers send Tutela tokens for `aud=symphony`); during the transition `SYMPHONY_API_TOKEN` still works while `server.legacy_api_token` is on. |
+| The legacy API token is deprecated. | Give every caller a Tutela key or token for `aud=symphony`, then set `server.legacy_api_token: false` (the default from the next release). |
+| Stream tickets moved from `?ticket=` to a cookie. | Browsers: call `POST /api/v1/events/tickets` and open the `EventSource` on the same origin. Other clients: send the bearer token on the stream. |
 | Requests with another `Host` get `403 host_not_allowed`; cross-origin browser writes are refused. | List proxy names in `server.allowed_hosts`, other origins in `server.allowed_origins`. Remove HTTP basic auth in front (it uses the same header). |
 | The image no longer passes `--i-understand-that-this-will-be-running-without-the-usual-guardrails`. | Review the sandbox settings, then pass the flag (Compose override, `docker run` args, Helm `acknowledgeGuardrails: true`). |
 | Shipped `WORKFLOW.md` examples use Codex's safe defaults (no network in the turn sandbox, escalations rejected). | Re-enable `turn_sandbox_policy.networkAccess` deliberately if agents need to push or install. |

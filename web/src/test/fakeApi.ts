@@ -6,7 +6,6 @@ import { makeSnapshot, TOTALS } from './fixtures';
 
 /** An `ApiClient` whose methods are `vi.fn()` with sensible defaults. */
 export function makeFakeApi(overrides: Partial<ApiClient> = {}) {
-  let tickets = 0;
   const api = {
     getState: vi.fn<ApiClient['getState']>(() => Promise.resolve(makeSnapshot())),
     requestRefresh: vi.fn<ApiClient['requestRefresh']>(() =>
@@ -33,17 +32,10 @@ export function makeFakeApi(overrides: Partial<ApiClient> = {}) {
     getRun: vi.fn<ApiClient['getRun']>(() => Promise.reject(new Error('not stubbed'))),
     listRunEvents: vi.fn<ApiClient['listRunEvents']>(() => Promise.resolve({ events: [] })),
     getTotals: vi.fn<ApiClient['getTotals']>(() => Promise.resolve(TOTALS)),
-    createStreamTicket: vi.fn<ApiClient['createStreamTicket']>(() => {
-      tickets += 1;
-      return Promise.resolve({
-        ticket: `ticket-${tickets}`,
-        expires_at: '2026-02-24T20:16:30Z',
-        expires_in_ms: 60_000,
-      });
-    }),
-    eventsUrl: vi.fn<ApiClient['eventsUrl']>((ticket) =>
-      ticket === undefined ? '/api/v1/events' : `/api/v1/events?ticket=${ticket}`,
+    createStreamTicket: vi.fn<ApiClient['createStreamTicket']>(() =>
+      Promise.resolve({ expires_at: '2026-02-24T20:16:30Z', expires_in_ms: 60_000 }),
     ),
+    eventsUrl: vi.fn<ApiClient['eventsUrl']>(() => '/api/v1/events'),
     auth: createTokenStore(memoryStorage(), memoryStorage()),
     ...overrides,
   };

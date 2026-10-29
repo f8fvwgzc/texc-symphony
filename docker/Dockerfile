@@ -69,6 +69,12 @@ WORKDIR /src
 # Only what the build needs; the toolchain is pinned by the base image tag (RUST_VERSION), so
 # rust-toolchain.toml is not copied (it would make rustup fetch extra components).
 COPY Cargo.toml Cargo.lock ./
+# tutela-sdk is a git dependency of a private repository: cargo fetches it with the git CLI over
+# the SSH agent of `docker buildx build --ssh default` (GitHub's published host key, no TOFU).
+COPY .cargo ./.cargo
+RUN mkdir -p -m 0700 /root/.ssh && \
+    echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" \
+      > /root/.ssh/known_hosts
 COPY crates ./crates
 COPY xtask ./xtask
 # symphony-server's build script turns the API contract into /api/openapi.json ...
@@ -87,7 +93,8 @@ ENV CARGO_TERM_COLOR=never \
 # Every cache is per target platform and locked: the amd64 and arm64 builds run in parallel on the
 # build host, and two cargo processes unpacking into one shared registry race ("failed to unpack
 # package ... .cargo-ok: File exists").
-RUN --mount=type=cache,id=symphony-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry,sharing=locked \
+RUN --mount=type=ssh \
+    --mount=type=cache,id=symphony-cargo-registry-${TARGETPLATFORM},target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=symphony-cargo-git-${TARGETPLATFORM},target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=symphony-target-${TARGETPLATFORM},target=/src/target,sharing=locked \
     xx-cargo build --release --locked ${CARGO_BUILD_ARGS} && \

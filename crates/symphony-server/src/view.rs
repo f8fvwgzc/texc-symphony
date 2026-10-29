@@ -442,9 +442,7 @@ pub struct Health {
 /// Body of `POST /api/v1/events/tickets` (201).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SseTicket {
-    /// Pass as `?ticket=` when opening an SSE stream; valid once.
-    pub ticket: String,
-    /// When the ticket stops being accepted.
+    /// When the ticket (set as the `symphony_stream` cookie) stops being accepted.
     pub expires_at: DateTime<Utc>,
     /// Lifetime in milliseconds.
     pub expires_in_ms: u64,

@@ -193,10 +193,11 @@ export interface Health {
   auth_required: boolean;
 }
 
-/** Body of `POST /api/v1/events/tickets` (201). */
+/**
+ * Body of `POST /api/v1/events/tickets` (201). The ticket itself is the `symphony_stream` cookie
+ * (same-site, `HttpOnly`), which the next `EventSource` on the same origin sends; valid once.
+ */
 export interface SseTicket {
-  /** Pass as `?ticket=` when opening the SSE stream; valid once. */
-  ticket: string;
   expires_at: Timestamp;
   expires_in_ms: number;
 }

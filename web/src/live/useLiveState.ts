@@ -34,7 +34,8 @@ export function defaultEventSourceFactory(): EventSourceFactory | null {
 /**
  * Live orchestrator state: SSE on `/api/v1/events`, falling back to polling `/api/v1/state`.
  * Every SSE connection first asks for a single-use ticket (`POST /api/v1/events/tickets`, sent
- * with the API token) and connects with `?ticket=`, so the token never appears in a URL.
+ * with the API token), which arrives as a same-site `HttpOnly` cookie the `EventSource` sends: no
+ * credential ever appears in a URL.
  * The connection is created on mount and torn down on unmount.
  */
 export function useLiveState(client: ApiClient, options: UseLiveStateOptions = {}): LiveState {
@@ -43,7 +44,10 @@ export function useLiveState(client: ApiClient, options: UseLiveStateOptions = {
       createLiveSource({
         ...options,
         url: client.eventsUrl(),
-        connectUrl: async () => client.eventsUrl((await client.createStreamTicket()).ticket),
+        connectUrl: async () => {
+          await client.createStreamTicket();
+          return client.eventsUrl();
+        },
         isUnauthorized,
         fetchState: () => client.getState(),
         createEventSource:

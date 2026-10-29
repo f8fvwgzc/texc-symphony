@@ -43,8 +43,52 @@ const STORE_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for the tokio runtime to wind down blocking work after `main` finished.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The HTTP API's authentication (Tutela's `docs/INTEGRATION.md` §2): Tutela tokens for
+/// `aud=symphony` from `server.tutela`, and during the transition the legacy `server.api_token`
+/// while `server.legacy_api_token` is on (with a deprecation warning). Neither leaves the API
+/// open, which the server allows only on loopback (the local single-user mode). A token that the
+/// flag turns off while nothing else protects the API is refused rather than ignored.
+fn server_auth(server: &symphony_core::config::ServerSettings) -> Result<Auth, String> {
+    let mut auth = match &server.tutela {
+        Some(tutela) => Auth::tutela(symphony_server::tutela::verifier(tutela)?),
+        None => Auth::disabled(),
+    };
+    if let Some(token) = server.api_token.as_deref() {
+        if server.legacy_api_token {
+            tracing::warn!(
+                "server.api_token (SYMPHONY_API_TOKEN) is deprecated: it is accepted next to \
+                 Tutela tokens until server.legacy_api_token is turned off (the default from the \
+                 next release); move callers to Tutela tokens for aud=symphony"
+            );
+            auth = auth.with_legacy_token(token);
+        } else if !auth.is_enabled() {
+            return Err(
+                "server.api_token is set but server.legacy_api_token is false and server.tutela \
+                 is not configured, which would leave the API open; configure server.tutela or \
+                 remove the token"
+                    .into(),
+            );
+        } else {
+            tracing::info!("server.api_token is ignored: server.legacy_api_token is false");
+        }
+    }
+    Ok(auth)
+}
+
 /// The `symphony` binary: evaluates the command line and runs the requested command.
 pub fn main() -> ExitCode {
+    // The one rustls crypto provider (aws-lc-rs), before anything opens a TLS connection: Tutela's
+    // JWKS client and reqwest both use it.
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "a rustls crypto provider was already installed"
+        );
+        return ExitCode::FAILURE;
+    }
     let args: Vec<OsString> = std::env::args_os().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let env = |name: &str| std::env::var(name).ok();
@@ -412,13 +456,20 @@ async fn serve_until_stopped(
     let configured_port = invocation.port.or(settings.server.port);
     let mut bound_port = None;
     if let Some(port) = configured_port {
+        let auth = match server_auth(&settings.server) {
+            Ok(auth) => auth,
+            Err(reason) => {
+                let message =
+                    format!("Failed to start Symphony with workflow {workflow_path}: {reason}");
+                tracing::error!("{message}");
+                let _ = writeln!(std::io::stderr().lock(), "{message}");
+                stop(&mut services, &mut signals, false).await;
+                return 1;
+            }
+        };
         let config = ServerConfig {
             version: version().to_owned(),
-            auth: settings
-                .server
-                .api_token
-                .as_deref()
-                .map_or_else(Auth::disabled, Auth::token),
+            auth,
             allowed_hosts: settings.server.allowed_hosts.clone(),
             cors_allowed_origins: settings.server.allowed_origins.clone(),
             ..ServerConfig::new(host.clone(), port)
@@ -602,5 +653,25 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("--no-db"));
+    }
+
+    #[test]
+    fn the_api_token_stays_accepted_only_inside_its_window() {
+        use symphony_core::config::ServerSettings;
+        let token = |legacy| ServerSettings {
+            api_token: Some("t".into()),
+            legacy_api_token: legacy,
+            ..ServerSettings::default()
+        };
+        let window = server_auth(&token(true)).unwrap();
+        assert!(window.accepts_legacy() && !window.accepts_tutela());
+        // Closing the window without Tutela would leave the API open: refused.
+        let err = server_auth(&token(false)).unwrap_err();
+        assert!(err.contains("legacy_api_token is false"), "{err}");
+        assert!(
+            !server_auth(&ServerSettings::default())
+                .unwrap()
+                .is_enabled()
+        );
     }
 }

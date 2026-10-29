@@ -233,7 +233,7 @@ async fn cross_origin_writes_are_refused() {
 }
 
 #[tokio::test]
-async fn sse_streams_open_with_a_single_use_ticket() {
+async fn sse_streams_open_with_a_single_use_cookie_ticket() {
     let harness = secured();
     let (status, _, _) =
         status_and_json(&harness, request(Method::GET, "/api/v1/events", &[])).await;
@@ -245,21 +245,44 @@ async fn sse_streams_open_with_a_single_use_ticket() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "tickets need the token");
 
-    let (status, _, ticket) = status_and_json(
+    let (status, headers, body) = status_and_json(
         &harness,
         request(
             Method::POST,
             "/api/v1/events/tickets",
-            &[("authorization", &bearer())],
+            &[("authorization", &bearer()), ("host", "127.0.0.1:4000")],
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(ticket["expires_in_ms"], 60_000);
-    let ticket = ticket["ticket"].as_str().unwrap().to_owned();
-    let uri = format!("/api/v1/events?ticket={ticket}");
+    assert_eq!(body["expires_in_ms"], 60_000);
+    assert!(
+        body.get("ticket").is_none(),
+        "the ticket never sits in a body"
+    );
+    let set_cookie = headers["set-cookie"].to_str().unwrap().to_owned();
+    assert!(set_cookie.starts_with("symphony_stream="), "{set_cookie}");
+    for attribute in ["HttpOnly", "SameSite=Strict", "Path=/api/v1", "Max-Age=60"] {
+        assert!(set_cookie.contains(attribute), "{set_cookie}");
+    }
+    let cookie = set_cookie.split(';').next().unwrap().to_owned();
+    let ticket = cookie.trim_start_matches("symphony_stream=").to_owned();
 
-    let response = harness.request(request(Method::GET, &uri, &[])).await;
+    // A ticket in the URL is not a credential.
+    let (status, _, _) = status_and_json(
+        &harness,
+        request(Method::GET, &format!("/api/v1/events?ticket={ticket}"), &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let response = harness
+        .request(request(
+            Method::GET,
+            "/api/v1/events",
+            &[("cookie", &cookie)],
+        ))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut reader = SseReader::new(response);
     let first = reader.next().await.unwrap();
@@ -268,12 +291,16 @@ async fn sse_streams_open_with_a_single_use_ticket() {
     assert_eq!(snapshot.event.as_deref(), Some("snapshot"));
     drop(reader);
 
-    let (status, _, _) = status_and_json(&harness, request(Method::GET, &uri, &[])).await;
+    let (status, _, _) = status_and_json(
+        &harness,
+        request(Method::GET, "/api/v1/events", &[("cookie", &cookie)]),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "a ticket works once");
     // A ticket is no key to the rest of the API.
     let (status, _, _) = status_and_json(
         &harness,
-        request(Method::GET, &format!("/api/v1/state?ticket={ticket}"), &[]),
+        request(Method::GET, "/api/v1/state", &[("cookie", &cookie)]),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

@@ -28,6 +28,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
 
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
+
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
         with:
@@ -50,6 +55,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
+
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
@@ -77,6 +87,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
+
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
@@ -120,6 +135,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
+
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
@@ -199,6 +219,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
 
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
+
       # Rust is cross-compiled on the runner (tonistiigi/xx); QEMU only runs the runtime stage's
       # apt-get for the non-native architecture.
       - name: Set up QEMU
@@ -236,6 +261,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64
+          ssh: default
           load: true
           tags: symphony:test
           cache-from: type=gha,scope=symphony-image
@@ -249,6 +275,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
+          ssh: default
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -270,6 +297,11 @@ jobs:
         uses: actions/checkout@v7 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Tutela read access
+        uses: ./.github/actions/tutela-ssh
+        with:
+          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
