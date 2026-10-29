@@ -27,7 +27,7 @@ describe('useLiveState', () => {
     );
     expect(screen.getByText('connecting:0:-')).toBeInTheDocument();
     const es = await FakeEventSource.opened();
-    expect(es.url).toBe('/api/v1/events?ticket=ticket-1');
+    expect(es.url).toBe('/api/v1/events');
     await act(() => es.snapshot(makeSnapshot(), 9));
     expect(screen.getByText('live:1:9')).toBeInTheDocument();
     // Preact 11 runs passive-effect cleanups after paint; act() flushes them.

@@ -1219,6 +1219,44 @@ fn ecto_cast_rules_for_scalars() {
         other => panic!("expected invalid config, got {other:?}"),
     };
     assert_eq!(invalid(json!({"tracker": "x"})), "tracker is invalid");
+    let tutela = parse(
+        json!({"server": {"legacy_api_token": false, "tutela": {"issuers": [
+            {"iss": "https://kc.example.com/realms/acme",
+             "jwks_uri": "https://kc.example.com/realms/acme/protocol/openid-connect/certs",
+             "tenants": ["ten_0193a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2c"], "algs": ["RS256"],
+             "external": true}
+        ]}}}),
+        &env,
+    )
+    .unwrap();
+    assert!(!tutela.server.legacy_api_token);
+    let issuer = &tutela.server.tutela.as_ref().unwrap().issuers[0];
+    assert_eq!(issuer.algs, ["RS256"]);
+    assert!(
+        issuer.external && issuer.allow_typ_jwt,
+        "external issuers accept typ JWT"
+    );
+    let defaults = parse(json!({}), &env).unwrap().server;
+    assert!(
+        defaults.legacy_api_token,
+        "the old token's window is open in this release"
+    );
+    assert_eq!(defaults.tutela, None);
+    let message = invalid(json!({"server": {"tutela": {"issuers": [
+        {"iss": "http://kc.example.com", "jwks_uri": "https://kc.example.com/certs",
+         "tenants": ["a", "b"], "external": true, "algs": ["HS256"]}
+    ]}}}));
+    for fragment in [
+        "server.tutela.issuers[0].iss must be an https:// URL",
+        "server.tutela.issuers[0].tenants of an external issuer must name exactly one tenant",
+        "server.tutela.issuers[0].algs must list ES256, RS256 or EdDSA",
+    ] {
+        assert!(message.contains(fragment), "{fragment}: {message}");
+    }
+    assert_eq!(
+        invalid(json!({"server": {"tutela": {"issuers": []}}})),
+        "server.tutela.issuers must be a non-empty list"
+    );
     assert_eq!(
         invalid(json!({"agent": {"max_retry_attempts": 0}})),
         "agent.max_retry_attempts must be greater than 0"

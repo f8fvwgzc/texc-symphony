@@ -131,13 +131,20 @@ pub(crate) async fn health(State(app): State<AppState>) -> Json<Health> {
 /// `?ticket=...` (the request itself is authenticated like any other API call).
 pub(crate) async fn issue_ticket(
     State(app): State<AppState>,
-) -> Result<(StatusCode, Json<SseTicket>), ApiError> {
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
     let (ticket, ttl) = app.tickets.issue()?;
     let expires_at = chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default();
+    // The ticket travels only in a cookie, never in a URL or a body a script could read.
+    let cookie = crate::security::ticket_set_cookie(
+        &ticket,
+        ttl,
+        crate::security::authority_of(&headers).as_deref(),
+    );
     Ok((
         StatusCode::CREATED,
+        [(axum::http::header::SET_COOKIE, cookie)],
         Json(SseTicket {
-            ticket,
             expires_at,
             expires_in_ms: u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX),
         }),

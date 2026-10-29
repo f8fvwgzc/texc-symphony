@@ -166,8 +166,10 @@ How the crates fit together: [`docs/architecture.md`](docs/architecture.md).
 
 The API is documented in [`docs/api/README.md`](docs/api/README.md), with the OpenAPI 3.1 contract
 in [`docs/api/openapi.yaml`](docs/api/openapi.yaml); a running server also serves it at
-`GET /api/openapi.json`. With `server.api_token` (or `SYMPHONY_API_TOKEN`) set, every API call
-needs `Authorization: Bearer <token>`; without one Symphony serves the API on loopback only. It
+`GET /api/openapi.json`. Off loopback every API call needs `Authorization: Bearer <token>`: a
+Tutela access token for `aud=symphony` ([`server.tutela`](docs/configuration.md#tutela-authentication)),
+or during the transition the deprecated `SYMPHONY_API_TOKEN`; without credentials Symphony
+serves the API on loopback only (the local single-user mode). It
 also refuses foreign `Host` headers and cross-origin writes, redacts credentials in recorded
 events, and enforces the `budget:` limits and the `POST /api/v1/pause` kill switch.
 

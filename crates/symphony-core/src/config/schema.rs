@@ -416,7 +416,41 @@ pub struct ServerSettings {
     pub allowed_hosts: Vec<String>,
     /// Extra origins allowed for browser writes and CORS (`scheme://host[:port]`, `*` for any).
     pub allowed_origins: Vec<String>,
+    /// Tutela-verified callers (`server.tutela`): bearer tokens for `aud=symphony`.
+    pub tutela: Option<TutelaSettings>,
+    /// Accept `api_token` as well (`server.legacy_api_token`, default `true` in this release,
+    /// `false` in the next): the window in which the old credential keeps working next to
+    /// Tutela tokens.
+    pub legacy_api_token: bool,
 }
+
+/// `server.tutela`: who may call the HTTP API (Tutela's `docs/INTEGRATION.md` §2). The audience
+/// is always `symphony`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TutelaSettings {
+    /// Trusted issuers (Keycloak in Tutela's Phases A and B) and the tenants each may speak for.
+    pub issuers: Vec<TutelaIssuer>,
+}
+
+/// One trusted token issuer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TutelaIssuer {
+    /// The exact `iss` (an `https://` URL).
+    pub iss: String,
+    /// Its JWKS document (`https://`).
+    pub jwks_uri: String,
+    /// Tenant ids (`ten_...`) it may speak for; an external issuer has exactly one.
+    pub tenants: Vec<String>,
+    /// Signature algorithms it may use (`ES256`, `RS256`, `EdDSA`; default all three).
+    pub algs: Vec<String>,
+    /// An issuer outside Tutela (Keycloak): plain OIDC access tokens, `tid` from `tenants`.
+    pub external: bool,
+    /// Accept `typ: JWT` as well as `at+jwt` (default: `external`).
+    pub allow_typ_jwt: bool,
+}
+
+/// Algorithms `server.tutela.issuers[].algs` accepts.
+pub const TUTELA_ALGS: [&str; 3] = ["ES256", "RS256", "EdDSA"];
 
 impl Default for ServerSettings {
     fn default() -> Self {
@@ -427,6 +461,8 @@ impl Default for ServerSettings {
             secret_environment_names: Vec::new(),
             allowed_hosts: Vec::new(),
             allowed_origins: Vec::new(),
+            tutela: None,
+            legacy_api_token: true,
         }
     }
 }
@@ -440,6 +476,8 @@ impl fmt::Debug for ServerSettings {
             .field("secret_environment_names", &self.secret_environment_names)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_origins", &self.allowed_origins)
+            .field("tutela", &self.tutela)
+            .field("legacy_api_token", &self.legacy_api_token)
             .finish()
     }
 }
@@ -968,7 +1006,97 @@ fn cast_server(s: &Section<'_>, errors: &mut Errors) -> ServerSettings {
             errors.push(&s.path("allowed_origins"), "is invalid");
         }
     }
+    if let Some(legacy) = s.boolean("legacy_api_token", errors) {
+        out.legacy_api_token = legacy;
+    }
+    let tutela = s.nested("tutela", "server.tutela", errors);
+    if tutela.is_present() {
+        out.tutela = cast_tutela(&tutela, errors);
+    }
     out
+}
+
+fn cast_tutela(s: &Section<'_>, errors: &mut Errors) -> Option<TutelaSettings> {
+    use super::cast::{cast_boolean, cast_string_list};
+    let path = s.path("issuers");
+    let entries = match s.raw("issuers") {
+        Some(Value::Array(entries)) if !entries.is_empty() => entries,
+        _ => {
+            errors.push(&path, "must be a non-empty list");
+            return None;
+        }
+    };
+    let mut issuers = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let at = format!("{path}[{i}]");
+        let Value::Object(map) = entry else {
+            errors.push(&at, "is invalid");
+            continue;
+        };
+        let url = |field: &str, errors: &mut Errors| -> Option<String> {
+            match map.get(field).and_then(Value::as_str).map(str::trim) {
+                Some(v) if v.starts_with("https://") => Some(v.to_owned()),
+                _ => {
+                    errors.push(&format!("{at}.{field}"), "must be an https:// URL");
+                    None
+                }
+            }
+        };
+        let flag = |field: &str, errors: &mut Errors| -> Option<bool> {
+            let cast = cast_boolean(map.get(field)?);
+            if cast.is_none() {
+                errors.push(&format!("{at}.{field}"), "is invalid");
+            }
+            cast
+        };
+        let (iss, jwks_uri) = (url("iss", errors), url("jwks_uri", errors));
+        let external = flag("external", errors).unwrap_or(false);
+        let allow_typ_jwt = flag("allow_typ_jwt", errors).unwrap_or(external);
+        let tenants: Vec<String> = map
+            .get("tenants")
+            .and_then(cast_string_list)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.trim().to_owned())
+            .collect();
+        if tenants.is_empty() || tenants.iter().any(String::is_empty) {
+            errors.push(
+                &format!("{at}.tenants"),
+                "must list the tenant ids it may speak for",
+            );
+        } else if external && tenants.len() != 1 {
+            errors.push(
+                &format!("{at}.tenants"),
+                "of an external issuer must name exactly one tenant",
+            );
+        }
+        let algs = match map.get("algs") {
+            None => TUTELA_ALGS.iter().map(|a| (*a).to_owned()).collect(),
+            Some(raw) => match cast_string_list(raw) {
+                Some(algs)
+                    if !algs.is_empty()
+                        && algs.iter().all(|a| TUTELA_ALGS.contains(&a.as_str())) =>
+                {
+                    algs
+                }
+                _ => {
+                    errors.push(&format!("{at}.algs"), "must list ES256, RS256 or EdDSA");
+                    Vec::new()
+                }
+            },
+        };
+        if let (Some(iss), Some(jwks_uri)) = (iss, jwks_uri) {
+            issuers.push(TutelaIssuer {
+                iss,
+                jwks_uri,
+                tenants,
+                algs,
+                external,
+                allow_typ_jwt,
+            });
+        }
+    }
+    Some(TutelaSettings { issuers })
 }
 
 fn cast_budget(s: &Section<'_>, errors: &mut Errors) -> BudgetSettings {

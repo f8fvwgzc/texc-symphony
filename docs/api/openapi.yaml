@@ -32,15 +32,22 @@ info:
 
     **Security.**
 
-    * **Authentication.** When an API token is configured (`server.api_token` in WORKFLOW.md, or
-      `SYMPHONY_API_TOKEN`), every `/api/*` request except `GET /api/v1/health` and
-      `GET /api/openapi.json` needs `Authorization: Bearer <token>`; otherwise it answers `401`
-      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. Without a token the API is
-      open, and Symphony refuses to bind anything but a loopback address (`auth_required` at
-      startup). The dashboard shell and its assets are public; the dashboard asks for the token.
-    * **SSE tickets.** A browser `EventSource` cannot send headers, so clients first call
-      `POST /api/v1/events/tickets` (authenticated) and open the stream with `?ticket=<ticket>`.
-      A ticket is valid once, for 60 s, and only on stream endpoints.
+    * **Authentication.** Every `/api/*` request except `GET /api/v1/health` and
+      `GET /api/openapi.json` needs `Authorization: Bearer <token>`, or answers `401`
+      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. The token is a Tutela
+      access token issued for exactly one audience, `symphony`, by an issuer of `server.tutela`
+      for a tenant it may speak for (a service-account key or `client_credentials` token).
+      Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B. During the
+      transition the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) is accepted too
+      while `server.legacy_api_token` is on (deprecated; off by default from the next release).
+      Without either the API is open, the local single-user mode, and Symphony refuses to bind
+      anything but a loopback address (`auth_required` at startup). The dashboard shell and its
+      assets are public; the dashboard asks for a token.
+    * **Stream tickets.** A browser `EventSource` cannot send headers, and no credential is ever
+      accepted in a URL. Browsers first call `POST /api/v1/events/tickets` (authenticated), which
+      sets the `symphony_stream` cookie (`HttpOnly`, `SameSite=Strict`, `Path=/api/v1`, `Secure`
+      off loopback); the next same-origin `EventSource` sends it. A ticket is valid once, for
+      60 s, and only on stream endpoints. Other clients send their bearer token on the stream.
     * **Host allow-list.** Requests whose `Host` is not loopback (`localhost`, `*.localhost`,
       `127.0.0.1`, `[::1]`), the bind address or a `server.allowed_hosts` entry answer `403`
       `host_not_allowed` (protection against DNS rebinding).
@@ -278,10 +285,10 @@ paths:
 
         ```
       parameters:
-        - name: ticket
-          in: query
+        - name: symphony_stream
+          in: cookie
           required: false
-          description: Single-use ticket from `POST /api/v1/events/tickets`, for clients that cannot send `Authorization` (browser `EventSource`).
+          description: Single-use ticket cookie set by `POST /api/v1/events/tickets`, for clients that cannot send `Authorization` (browser `EventSource`).
           schema:
             type: string
         - name: Last-Event-ID
@@ -326,19 +333,25 @@ paths:
     post:
       tags: [live]
       operationId: createStreamTicket
-      summary: Single-use ticket for opening an SSE stream
+      summary: Single-use ticket cookie for opening an SSE stream
       description: |
-        Returns a ticket to pass as `?ticket=` when opening a stream endpoint with a client that
-        cannot send headers. Valid once, for 60 s. Works (and is harmless) without auth too.
+        Sets the `symphony_stream` cookie (`HttpOnly`, `SameSite=Strict`, `Path=/api/v1`, and
+        `Secure` unless the request came to a loopback host) holding a ticket that opens one stream
+        endpoint for a client that cannot send headers (a browser `EventSource` on the same
+        origin). Valid once, for 60 s. The ticket never appears in the body or a URL. Works (and is
+        harmless) without auth too.
       responses:
         '201':
-          description: Ticket issued.
+          description: Ticket issued (in the `Set-Cookie` header).
+          headers:
+            Set-Cookie:
+              description: '`symphony_stream=<ticket>; Path=/api/v1; Max-Age=60; HttpOnly; SameSite=Strict` (`; Secure` off loopback).'
+              schema: { type: string }
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SseTicket'
               example:
-                ticket: 6f1c0d3e9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d
                 expires_at: '2026-02-24T20:16:30.123456Z'
                 expires_in_ms: 60000
         '401':
@@ -534,11 +547,11 @@ paths:
         changes and `event: run_event` (data: `RunEvent`, `id: <run_id>-<seq>`) for every event
         its runs record. Comment keep-alives every 15 s. The stream ends once the task is
         `succeeded`, `failed` or `cancelled` and every event was sent. Browsers authenticate with
-        `?ticket=` (see `POST /api/v1/events/tickets`).
+        the ticket cookie of `POST /api/v1/events/tickets`; other clients with their bearer token.
       parameters:
         - { $ref: '#/components/parameters/TaskId' }
-        - name: ticket
-          in: query
+        - name: symphony_stream
+          in: cookie
           required: false
           schema: { type: string }
       responses:
@@ -770,7 +783,8 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: The API token (`server.api_token` / `SYMPHONY_API_TOKEN`). Not required when the server runs without one (loopback only).
+      bearerFormat: JWT
+      description: A Tutela access token for exactly `aud=symphony` from an issuer and tenant of `server.tutela`; during the transition also the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) while `server.legacy_api_token` is on. Not required in the local single-user mode (no credentials configured, loopback only).
 
   parameters:
     TaskId:
@@ -1342,10 +1356,10 @@ components:
 
     SseTicket:
       type: object
-      required: [ticket, expires_at, expires_in_ms]
+      description: The ticket itself is the `symphony_stream` cookie; valid once.
+      required: [expires_at, expires_in_ms]
       additionalProperties: false
       properties:
-        ticket: { type: string, description: 'Pass as `?ticket=` to a stream endpoint; valid once.' }
         expires_at: { type: string, format: date-time }
         expires_in_ms: { type: integer, minimum: 0 }
 

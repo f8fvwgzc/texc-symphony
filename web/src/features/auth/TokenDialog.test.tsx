@@ -9,7 +9,7 @@ import { FakeEventSource } from '../../test/fakeEventSource';
 import { makeSnapshot } from '../../test/fixtures';
 import { renderWithApi } from '../../test/render';
 
-const TICKET = { ticket: 'ticket-1', expires_at: '2026-02-24T20:16:30Z', expires_in_ms: 60_000 };
+const TICKET = { expires_at: '2026-02-24T20:16:30Z', expires_in_ms: 60_000 };
 
 /** `createStreamTicket` refusing the first `refusals` calls with 401. */
 function ticketsRefused(refusals: number) {
@@ -60,7 +60,7 @@ describe('API token dialog', () => {
 
     const es = await FakeEventSource.opened();
     expect(createStreamTicket).toHaveBeenCalledTimes(2);
-    expect(es.url).toBe('/api/v1/events?ticket=ticket-1');
+    expect(es.url).toBe('/api/v1/events');
     await act(() => es.snapshot(makeSnapshot(), 2));
     expect(screen.getAllByRole('status')[0]).toHaveTextContent('Live');
     for (const instance of FakeEventSource.instances) {

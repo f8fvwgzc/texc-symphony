@@ -7,8 +7,9 @@ the agent's final message as the result. Coding is optional: without a repositor
 starts empty.
 
 The task API needs the run-history store (it is on by default; `503 store_disabled` with
-`--no-db`). It is part of the HTTP API, so it needs `server.port` and, off loopback, the API
-token. The contract is in [`api/openapi.yaml`](api/openapi.yaml) (tag `tasks`).
+`--no-db`). It is part of the HTTP API, so it needs `server.port` and, off loopback, a Tutela
+access token for `aud=symphony` ([configuration](configuration.md#tutela-authentication); during
+the transition the legacy API token works too). The contract is in [`api/openapi.yaml`](api/openapi.yaml) (tag `tasks`).
 
 A workflow that only serves tasks sets `tracker.kind: none`:
 
@@ -139,8 +140,9 @@ would be refused). An unknown key or id, a duplicate key or a cycle is
 `400 invalid_parameter` naming it (`dependency cycle: a -> b -> a`). Create the tasks wave by
 wave, mapping keys to the ids the server returns.
 
-Browsers open the stream with a ticket: `POST /api/v1/events/tickets`, then
-`GET /api/v1/tasks/{id}/events?ticket=<ticket>`.
+Browsers open the stream with a ticket cookie: `POST /api/v1/events/tickets` sets it, and the
+next same-origin `GET /api/v1/tasks/{id}/events` sends it. Other clients send their bearer token
+on the stream; no credential is accepted in a URL.
 
 ## Rust client
 

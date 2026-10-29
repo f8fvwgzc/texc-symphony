@@ -459,16 +459,59 @@ The HTTP server serves the web dashboard, the JSON API and the event stream
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
 | `server.port` | integer | none: no HTTP server | `0..65535` (`must be greater than or equal to 0`, `must be less than or equal to 65535`). `0` binds a free port. `--port` and `SYMPHONY_PORT` override it. | restart |
-| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. A non-loopback address needs `server.api_token`: without one Symphony refuses to start (`auth_required`). | restart |
-| `server.api_token` | string | `$SYMPHONY_API_TOKEN` | Bearer token every `/api/*` request needs (except `GET /api/v1/health` and `GET /api/openapi.json`). Write `$NAME`; the value is compared in constant time, never logged, and removed from agent environments together with `SYMPHONY_API_TOKEN`. Unset: the API is open, which is allowed on loopback only. | restart |
+| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. A non-loopback address needs authentication (`server.tutela`, or during the transition `server.api_token`): without it Symphony refuses to start (`auth_required`). | restart |
+| `server.tutela` | map | none | Tutela-verified callers ([below](#tutela-authentication)): every `/api/*` request (except `GET /api/v1/health` and `GET /api/openapi.json`) needs a Tutela access token for exactly `aud=symphony`. | restart |
+| `server.api_token` | string | `$SYMPHONY_API_TOKEN` | **Deprecated** legacy bearer token, accepted while `server.legacy_api_token` is on. Write `$NAME`; the value is compared in constant time, never logged, and removed from agent environments together with `SYMPHONY_API_TOKEN`. | restart |
+| `server.legacy_api_token` | boolean | `true` (`false` from the next release) | Keeps `server.api_token` working next to Tutela tokens during the transition; each process logs a deprecation warning. `false` with a token set and no `server.tutela` is refused at startup (the API would be open). | restart |
 | `server.allowed_hosts` | list of strings | `[]` | Extra `Host` names the server answers besides `localhost`, `*.localhost`, `127.0.0.1`, `[::1]` and `server.host`. Other hosts get `403 host_not_allowed`, which stops DNS-rebinding pages from reading the API. `*` turns the check off. Names are lowercased. | restart |
 | `server.allowed_origins` | list of strings | `[]` | Origins (`https://dash.example.com`, `*`) allowed for CORS and for browser writes from another origin. Browser `POST`s from any other origin get `403 origin_not_allowed`. `is invalid` unless every entry is `*` or an `http(s)://` URL. | restart |
 
-Browsers cannot send headers on `EventSource`, so the dashboard first asks
-`POST /api/v1/events/tickets` for a single-use ticket (60 s) and opens the stream with
-`?ticket=`. Behind a reverse proxy, forward the `Host` header and list the public name in
-`server.allowed_hosts`; do not add HTTP basic auth in front (it uses the same `Authorization`
-header).
+Without `server.tutela` and `server.api_token` the API is open: the **local single-user mode**,
+allowed only when the server listens on loopback (`127.0.0.1`, `::1`, `localhost`).
+
+Browsers cannot send headers on `EventSource`, and no credential is ever accepted in a URL: the
+dashboard first asks `POST /api/v1/events/tickets`, which sets a single-use ticket cookie
+(`symphony_stream`, 60 s, `HttpOnly`, `SameSite=Strict`, `Secure` off loopback) that the stream
+request sends. Behind a reverse proxy, forward the `Host` header, serve HTTPS, and list the public
+name in `server.allowed_hosts`; do not add HTTP basic auth in front (it uses the same
+`Authorization` header).
+
+#### Tutela authentication
+
+Tutela (identity and permissions) issues the API's bearer tokens; symphony checks them offline
+with `tutela-sdk` (Tutela `docs/INTEGRATION.md` §2): the signature against the issuer's cached
+JWKS, exactly one audience `symphony`, the time rules, and the `(issuer, tenant)` pair against
+the trust list below. Callers are services with a Tutela service-account key or a
+`client_credentials` token for `aud=symphony`. Delegated agent tokens (`typ: agent+jwt`) are
+refused until Tutela Phase B.
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 4000
+  legacy_api_token: false        # once every caller has a Tutela token
+  tutela:
+    issuers:
+      - iss: https://keycloak.example.com/realms/acme      # exact `iss`
+        jwks_uri: https://keycloak.example.com/realms/acme/protocol/openid-connect/certs
+        tenants: [ten_0193a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b] # the tenants it may speak for
+        algs: [RS256]                                      # default: ES256, RS256, EdDSA
+        external: true                                     # Keycloak, not a Tutela issuer
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `server.tutela.issuers[].iss` | required | The exact `iss` claim, an `https://` URL. |
+| `server.tutela.issuers[].jwks_uri` | required | `https://`; fetched through `tutela-safenet` (public addresses only, no redirects) and cached. |
+| `server.tutela.issuers[].tenants` | required | Tenant ids (`ten_...`) the issuer may speak for. An external issuer names exactly one: its tokens carry no `tid`. |
+| `server.tutela.issuers[].algs` | `[ES256, RS256, EdDSA]` | The signature algorithms it may use. |
+| `server.tutela.issuers[].external` | `false` | `true` for an issuer outside Tutela (Keycloak in Phases A and B): plain OIDC access tokens. |
+| `server.tutela.issuers[].allow_typ_jwt` | the value of `external` | Accept `typ: JWT` as well as `at+jwt`. |
+
+The old credential goes through a window: in this release `server.api_token` keeps working next
+to Tutela tokens (`server.legacy_api_token: true`, with a deprecation warning); in the next
+release `legacy_api_token` defaults to `false`; the release after removes it. Old tokens cannot
+be turned into Tutela keys: give each caller a Tutela key, then turn the flag off.
 
 ### `budget`
 

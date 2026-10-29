@@ -203,15 +203,15 @@ describe('createApiClient', () => {
     expect(auth.rejected()).toBe(true);
   });
 
-  it('POSTs for an SSE ticket and appends it to the events URL', async () => {
-    const ticket = { ticket: 'a b/c', expires_at: 't', expires_in_ms: 60_000 };
+  it('POSTs for an SSE ticket cookie and keeps it out of the events URL', async () => {
+    const ticket = { expires_at: 't', expires_in_ms: 60_000 };
     const { client, fetchMock, auth } = clientWith(jsonResponse(201, ticket));
     auth.save('tok', false);
     await expect(client.createStreamTicket()).resolves.toEqual(ticket);
     expect(calledUrl(fetchMock)).toBe('http://host:4000/api/v1/events/tickets');
     expect(fetchMock.mock.calls[0]?.[1]?.method).toBe('POST');
     expect(headerOf(fetchMock, 0, 'authorization')).toBe('Bearer tok');
-    expect(client.eventsUrl('a b/c')).toBe('http://host:4000/api/v1/events?ticket=a+b%2Fc');
+    expect(client.eventsUrl()).toBe('http://host:4000/api/v1/events');
   });
 
   it('describes arbitrary errors', () => {

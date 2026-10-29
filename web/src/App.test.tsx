@@ -31,7 +31,7 @@ describe('App', () => {
   it('connects over SSE and renders live snapshots', async () => {
     const { api } = renderApp();
     expect(screen.getAllByRole('status')[0]).toHaveTextContent('Connecting');
-    expect((await FakeEventSource.opened()).url).toBe('/api/v1/events?ticket=ticket-1');
+    expect((await FakeEventSource.opened()).url).toBe('/api/v1/events');
     expect(api.createStreamTicket).toHaveBeenCalledTimes(1);
 
     await act(() => FakeEventSource.latest().snapshot(makeSnapshot(), 3));

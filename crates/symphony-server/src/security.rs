@@ -1,14 +1,22 @@
-//! Request security: API-token authentication, the `Host` allow-list (DNS rebinding), the
-//! `Origin` check for writes (CSRF), and single-use tickets for `EventSource` streams.
+//! Request security: authentication (Tutela tokens, and the legacy API token during its
+//! window), the `Host` allow-list (DNS rebinding), the `Origin` check for writes (CSRF), and
+//! single-use stream tickets for `EventSource` streams.
 //!
 //! * **Authentication** applies to `/api/*` except `GET /api/v1/health` and
-//!   `GET /api/openapi.json`. Clients send `Authorization: Bearer <token>`; the built-in
-//!   [`StaticToken`] compares SHA-256 digests in constant time. Other schemes (OIDC/JWT) plug in
-//!   through [`Authenticator`]. Without an authenticator the API is open, which [`crate::serve`]
-//!   only allows on a loopback address.
-//! * **Tickets**: a browser `EventSource` cannot send headers, so an authenticated client first
-//!   asks `POST /api/v1/events/tickets` for a ticket and opens the stream with `?ticket=...`.
-//!   A ticket is valid once, for [`TICKET_TTL`].
+//!   `GET /api/openapi.json`. Clients send `Authorization: Bearer <token>`:
+//!   - a Tutela access token for `aud=symphony` ([`Auth::tutela`]), checked by `tutela-sdk`'s
+//!     axum layer ([`tutela_sdk::http::AuthLayer`], which also puts the caller's
+//!     [`tutela_sdk::Identity`] in the request extensions);
+//!   - during the transition, the legacy `server.api_token` ([`StaticToken`], SHA-256 digests
+//!     compared in constant time) while `server.legacy_api_token` is on; each process logs one
+//!     deprecation warning when it is first used.
+//!
+//!   Without either the API is open: the local single-user mode, which [`crate::serve`] only
+//!   allows on a loopback address.
+//! * **Stream tickets**: a browser `EventSource` cannot send headers, and no credential may sit
+//!   in a URL. An authenticated client asks `POST /api/v1/events/tickets`, which sets a
+//!   same-site, `HttpOnly` cookie ([`TICKET_COOKIE`], `Secure` off loopback) that opens one
+//!   stream within [`TICKET_TTL`]. Other clients send their bearer token on the stream request.
 //! * **Host**: requests whose `Host` names something other than loopback, the bind address or a
 //!   configured name are refused, so a page on another site that rebinds its DNS name to this
 //!   address cannot read the API. Requests without any `Host` (not a browser) pass.
@@ -21,12 +29,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Request, State};
-use axum::http::header::{AUTHORIZATION, HOST, ORIGIN, WWW_AUTHENTICATE};
-use axum::http::{HeaderMap, HeaderValue, Method};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, WWW_AUTHENTICATE};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
+use tower::{Layer, ServiceExt};
+use tutela_sdk::Verifier;
+use tutela_sdk::http::{AuthLayer, Protocol};
 
 use crate::app::{AppState, is_stream_path};
 use crate::error::ApiError;
@@ -87,57 +100,90 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// The authenticator of a server, or none (open API).
+/// How a server authenticates API requests: Tutela tokens, a legacy credential, both, or
+/// neither (open API).
 #[derive(Clone, Default)]
-pub struct Auth(Option<Arc<dyn Authenticator>>);
+pub struct Auth {
+    tutela: Option<Arc<Verifier>>,
+    legacy: Option<Arc<dyn Authenticator>>,
+}
 
 impl Auth {
-    /// No authentication (allowed only on loopback binds).
+    /// No authentication: the local single-user mode (allowed only on loopback binds).
     pub fn disabled() -> Self {
-        Self(None)
+        Self::default()
     }
 
-    /// A fixed bearer token.
+    /// Tutela access tokens for `aud=symphony`, checked by `verifier`
+    /// ([`crate::tutela::verifier`]).
+    pub fn tutela(verifier: Arc<Verifier>) -> Self {
+        Self {
+            tutela: Some(verifier),
+            legacy: None,
+        }
+    }
+
+    /// The legacy fixed bearer token only.
     pub fn token(token: &str) -> Self {
-        Self(Some(Arc::new(StaticToken::new(token))))
+        Self::disabled().with_legacy_token(token)
     }
 
-    /// Any other [`Authenticator`].
+    /// Also accepts the legacy fixed bearer token (`server.api_token` while
+    /// `server.legacy_api_token` is on).
+    pub fn with_legacy_token(self, token: &str) -> Self {
+        self.with_legacy(Arc::new(StaticToken::new(token)))
+    }
+
+    /// Also accepts credentials `authenticator` verifies (a legacy scheme).
+    pub fn with_legacy(mut self, authenticator: Arc<dyn Authenticator>) -> Self {
+        self.legacy = Some(authenticator);
+        self
+    }
+
+    /// Any [`Authenticator`] alone.
     pub fn custom(authenticator: Arc<dyn Authenticator>) -> Self {
-        Self(Some(authenticator))
+        Self::disabled().with_legacy(authenticator)
     }
 
     /// `true` when requests must authenticate.
     pub fn is_enabled(&self) -> bool {
-        self.0.is_some()
+        self.tutela.is_some() || self.legacy.is_some()
     }
 
-    async fn verify(&self, bearer: Option<&str>) -> bool {
-        match (&self.0, bearer) {
-            (None, _) => true,
-            (Some(auth), Some(bearer)) => auth.verify(bearer).await,
-            (Some(_), None) => false,
-        }
+    /// `true` when Tutela tokens are accepted.
+    pub fn accepts_tutela(&self) -> bool {
+        self.tutela.is_some()
+    }
+
+    /// `true` when a legacy credential is accepted.
+    pub fn accepts_legacy(&self) -> bool {
+        self.legacy.is_some()
     }
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(if self.is_enabled() {
-            "Auth(enabled)"
-        } else {
-            "Auth(disabled)"
-        })
+        f.debug_struct("Auth")
+            .field("tutela", &self.tutela.is_some())
+            .field("legacy", &self.legacy.is_some())
+            .finish()
     }
 }
 
 impl PartialEq for Auth {
     fn eq(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
+        let same =
+            |a: Option<&Arc<dyn Authenticator>>, b: Option<&Arc<dyn Authenticator>>| match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+        let same_tutela = match (&self.tutela, &other.tutela) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
-        }
+        };
+        same_tutela && same(self.legacy.as_ref(), other.legacy.as_ref())
     }
 }
 
@@ -274,11 +320,67 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|t| !t.is_empty())
 }
 
-fn ticket_param(request: &Request) -> Option<String> {
-    let query = request.uri().query()?;
-    form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == "ticket")
-        .map(|(_, value)| value.into_owned())
+/// Name of the stream-ticket cookie.
+pub const TICKET_COOKIE: &str = "symphony_stream";
+
+/// The stream ticket of the request's `Cookie` headers.
+fn ticket_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(name, _)| *name == TICKET_COOKIE)
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The `Set-Cookie` value carrying `ticket`: same-site, script-proof, scoped to the API, valid
+/// for `ttl`, and `Secure` unless the request came to a loopback host (where browsers allow
+/// `Secure` cookies over plain HTTP anyway, but a non-TLS dev setup should keep working).
+pub(crate) fn ticket_set_cookie(ticket: &str, ttl: Duration, authority: Option<&str>) -> String {
+    let loopback = authority.map(host_of).is_none_or(|host| {
+        matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") || host.ends_with(".localhost")
+    });
+    let secure = if loopback { "" } else { "; Secure" };
+    format!(
+        "{TICKET_COOKIE}={ticket}; Path=/api/v1; Max-Age={}; HttpOnly; SameSite=Strict{secure}",
+        ttl.as_secs()
+    )
+}
+
+/// The request's authority (`Host`), for [`ticket_set_cookie`].
+pub(crate) fn authority_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Logs, once per process, that the legacy API token was used.
+fn warn_legacy_use() {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "A request authenticated with the legacy API token (server.api_token). It is \
+             deprecated: move callers to Tutela tokens for aud=symphony (server.tutela); \
+             server.legacy_api_token defaults to false in the next release"
+        );
+    }
+}
+
+/// Runs `tutela-sdk`'s axum layer around the rest of the stack: a refusal is symphony's 401.
+async fn tutela_layer(verifier: &Arc<Verifier>, request: Request, next: Next) -> Response {
+    let service = AuthLayer::new(Arc::clone(verifier), Protocol::Http).layer(next);
+    let response = match service.oneshot(request).await {
+        Ok(response) => response,
+        Err(never) => match never {},
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return unauthorized();
+    }
+    response
 }
 
 fn unauthorized() -> Response {
@@ -312,20 +414,27 @@ pub(crate) async fn guard(State(app): State<AppState>, request: Request, next: N
         return ApiError::OriginNotAllowed.into_response();
     }
     let path = request.uri().path();
-    if !app.config.auth.is_enabled() || is_public(path) || request.method() == Method::OPTIONS {
+    let auth = &app.config.auth;
+    if !auth.is_enabled() || is_public(path) || request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
+    // A browser stream: the cookie from `POST /api/v1/events/tickets`, valid once. A spent or
+    // unknown one falls through to the bearer token, if any.
     if request.method() == Method::GET
         && is_stream_path(path)
-        && let Some(ticket) = ticket_param(&request)
+        && let Some(ticket) = ticket_cookie(request.headers())
+        && app.tickets.redeem(&ticket)
     {
-        if app.tickets.redeem(&ticket) {
-            return next.run(request).await;
-        }
-        return unauthorized();
+        return next.run(request).await;
     }
-    if app.config.auth.verify(bearer(request.headers())).await {
-        next.run(request).await
+    if let (Some(legacy), Some(token)) = (&auth.legacy, bearer(request.headers()))
+        && legacy.verify(token).await
+    {
+        warn_legacy_use();
+        return next.run(request).await;
+    }
+    if let Some(verifier) = &auth.tutela {
+        tutela_layer(verifier, request, next).await
     } else {
         unauthorized()
     }
@@ -457,8 +566,28 @@ mod tests {
         assert!(!token.verify("").await);
         assert!(!format!("{token:?}").contains("horse"));
         assert!(Auth::token("x").is_enabled());
-        assert!(Auth::disabled().verify(None).await);
-        assert!(!Auth::token("x").verify(None).await);
+        assert!(Auth::token("x").accepts_legacy());
+        assert!(!Auth::token("x").accepts_tutela());
+        assert!(!Auth::disabled().is_enabled());
+    }
+
+    #[test]
+    fn stream_tickets_travel_in_a_same_site_cookie() {
+        assert_eq!(
+            ticket_cookie(&headers(&[("cookie", "a=1; symphony_stream=t-1; b=2")])),
+            Some("t-1".to_owned())
+        );
+        assert_eq!(
+            ticket_cookie(&headers(&[("cookie", "symphony_stream=")])),
+            None
+        );
+        assert_eq!(ticket_cookie(&headers(&[])), None);
+        let ttl = Duration::from_secs(60);
+        assert_eq!(
+            ticket_set_cookie("t-1", ttl, Some("127.0.0.1:4000")),
+            "symphony_stream=t-1; Path=/api/v1; Max-Age=60; HttpOnly; SameSite=Strict"
+        );
+        assert!(ticket_set_cookie("t-1", ttl, Some("symphony.example.com")).ends_with("; Secure"));
     }
 
     #[test]

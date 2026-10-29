@@ -30,6 +30,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+rustls = { workspace = true }
 thiserror = { workspace = true }
 # io-std: `symphony agent-tools` serves MCP on stdin/stdout.
 tokio = { workspace = true, features = ["io-std"] }

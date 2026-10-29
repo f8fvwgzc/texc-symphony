@@ -59,6 +59,7 @@ mod server;
 mod sse;
 mod tasks;
 pub mod testing;
+pub mod tutela;
 pub mod view;
 
 pub use api::OPENAPI_JSON;
@@ -71,7 +72,7 @@ pub use config::{
 };
 pub use control::{ControlPlane, StateError, Unavailable};
 pub use error::ServerError;
-pub use security::{Auth, Authenticator, MAX_TICKETS, StaticToken, TICKET_TTL};
+pub use security::{Auth, Authenticator, MAX_TICKETS, StaticToken, TICKET_COOKIE, TICKET_TTL};
 pub use server::{BoundServer, resolve_host, serve};
 pub use view::{
     BlockedEntry, CodexTotals, IssueView, PauseState, RefreshAccepted, RetryEntry, RunningEntry,

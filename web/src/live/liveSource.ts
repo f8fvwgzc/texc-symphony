@@ -12,8 +12,8 @@
  *     source switches back to live as soon as a probe delivers a snapshot.
  *
  * Each SSE connection may first resolve its URL through `connectUrl` (the dashboard fetches a
- * single-use ticket there, because `EventSource` cannot send an `Authorization` header). The
- * browser's own reconnect would reuse a spent ticket, so every reconnect goes through
+ * single-use ticket cookie there, because `EventSource` cannot send an `Authorization` header).
+ * The browser's own reconnect would reuse a spent ticket, so every reconnect goes through
  * `connectUrl` again. When the ticket request or a poll is refused as unauthorized
  * (`isUnauthorized`), the source stops retrying (`unauthorized`) until `restart()`.
  *

@@ -7,10 +7,12 @@ it as JSON at `GET /api/openapi.json`. This page is the human guide.
   only when `server.port` is set in `WORKFLOW.md`, `--port` is passed or `SYMPHONY_PORT` is
   set. `0` binds an ephemeral port; the binary prints the real URL on stdout
   (`Symphony listening on http://127.0.0.1:<port>/`).
-- **Auth:** when an API token is configured (`server.api_token` in `WORKFLOW.md`, or
-  `SYMPHONY_API_TOKEN`), every `/api/*` call except `GET /api/v1/health` and
-  `GET /api/openapi.json` needs `Authorization: Bearer <token>` (else `401 unauthorized`).
-  Without a token the server only binds loopback. Requests for another `Host` (DNS rebinding)
+- **Auth:** every `/api/*` call except `GET /api/v1/health` and `GET /api/openapi.json` needs
+  `Authorization: Bearer <token>` (else `401 unauthorized`): a Tutela access token for exactly
+  `aud=symphony` from an issuer of `server.tutela` ([configuration](../configuration.md#tutela-authentication)),
+  or during the transition the deprecated legacy token (`server.api_token` / `SYMPHONY_API_TOKEN`,
+  while `server.legacy_api_token` is on). With neither configured the API is open (the local
+  single-user mode) and the server only binds loopback. No credential is accepted in a URL. Requests for another `Host` (DNS rebinding)
   answer `403 host_not_allowed`; cross-origin browser writes answer `403 origin_not_allowed`.
   The bundled dashboard asks for the token and keeps it in `sessionStorage` (or `localStorage`
   when "Remember on this device" is ticked); "Forget token" in the header clears it.
@@ -156,22 +158,24 @@ data: {"at":"2026-02-24T20:15:45Z","generation":42}
 **curl** (`-N` disables buffering):
 
 ```sh
-# With a token configured, add -H "Authorization: Bearer $SYMPHONY_API_TOKEN" to every call.
+# Off the local single-user mode, add -H "Authorization: Bearer $TOKEN" to every call (a Tutela
+# access token for aud=symphony, or during the transition the legacy SYMPHONY_API_TOKEN).
 curl -N -H 'Accept: text/event-stream' $SYMPHONY/api/v1/events
 # Only the counts, one line per snapshot:
 curl -sN $SYMPHONY/api/v1/events | sed -n 's/^data: //p' | jq -c '.counts? // empty'
 ```
 
-**Browser / JavaScript:** `EventSource` cannot send an `Authorization` header, so get a
-single-use ticket first (valid once, for 60 s) and pass it in the URL. The token itself never goes
-into a URL.
+**Browser / JavaScript:** `EventSource` cannot send an `Authorization` header, so ask for a
+single-use ticket first (valid once, for 60 s). It arrives as the `symphony_stream` cookie
+(`HttpOnly`, `SameSite=Strict`), which the next same-origin `EventSource` sends: no credential
+ever goes into a URL.
 
 ```js
-const { ticket } = await fetch('/api/v1/events/tickets', {
+await fetch('/api/v1/events/tickets', {
   method: 'POST',
-  headers: { Authorization: `Bearer ${token}` }, // omit when the server has no token
-}).then((response) => response.json());
-const source = new EventSource(`/api/v1/events?ticket=${encodeURIComponent(ticket)}`);
+  headers: { Authorization: `Bearer ${token}` }, // omit in the local single-user mode
+});
+const source = new EventSource('/api/v1/events');
 
 source.addEventListener('snapshot', (event) => {
   const state = JSON.parse(event.data);
