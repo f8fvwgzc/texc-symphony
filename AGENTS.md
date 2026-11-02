@@ -11,6 +11,8 @@ dashboard and JSON API.
 - SSH read access to the private `f8fvwgzc/tutela` repository: cargo fetches the `tutela-sdk` git
   dependency over SSH with the git CLI (`.cargo/config.toml`).
 - Main quality gate: `make all` (Rust fmt check, clippy `-D warnings`, tests, web typecheck/lint/test/build).
+- Rust guidance for coding agents comes from Symposium: `cargo install symposium --locked`, then
+  `cargo agents init --add-agent claude`.
 
 ## Layout
 
