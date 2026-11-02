@@ -24,7 +24,8 @@ impl Orchestrator<'_> {
         let settings = self.settings();
         match self.ctx.tracker.fetch_issues_by_ids(&settings, &ids).await {
             Err(err) => tracing::debug!(
-                "Failed to refresh running issue states: {err}; keeping active workers"
+                "Failed to refresh running issue states: {}; keeping active workers",
+                error_chain(&err)
             ),
             Ok(issues) => {
                 let visible: HashSet<String> = issues.iter().filter_map(|i| i.id.clone()).collect();
@@ -186,7 +187,8 @@ impl Orchestrator<'_> {
         let settings = self.settings();
         match self.ctx.tracker.fetch_issues_by_ids(&settings, &ids).await {
             Err(err) => tracing::debug!(
-                "Failed to refresh blocked issue states: {err}; keeping blocked issues"
+                "Failed to refresh blocked issue states: {}; keeping blocked issues",
+                error_chain(&err)
             ),
             Ok(issues) => {
                 let visible: HashSet<String> = issues.iter().filter_map(|i| i.id.clone()).collect();
@@ -315,7 +317,8 @@ impl Orchestrator<'_> {
             Ok(issues) => issues,
             Err(err) => {
                 tracing::warn!(
-                    "Skipping startup terminal workspace cleanup; failed to fetch terminal issues: {err}"
+                    "Skipping startup terminal workspace cleanup; failed to fetch terminal issues: {}",
+                    error_chain(&err)
                 );
                 return;
             }

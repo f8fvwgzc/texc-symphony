@@ -3,10 +3,34 @@
 //! `Display` keeps the Elixir snake_case reason tags (`missing_linear_api_token`,
 //! `invalid_workflow_config: ...`) because log lines and API payloads embed them.
 //! [`ConfigError::user_message`] reproduces Elixir's `Config.format_config_error/1` strings.
+//! [`error_chain`] renders an error with its causes for whatever reports it.
 
+use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+
+/// Renders `err` and everything under its [`source()`](Error::source) as `"outer: middle: root"`.
+///
+/// `Display` prints one level, so a log line, an API field or stderr reports through this. The
+/// `{:#}` flag cannot do it: only `anyhow::Error` honours that flag, `thiserror` types ignore it.
+/// A level whose text an earlier one already holds is skipped, because some libraries repeat their
+/// source in `Display`.
+///
+/// A library's causes end up in the output, so check what they can quote before using this on one
+/// that handles secrets.
+pub fn error_chain(err: &dyn Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        if !parts.iter().any(|part| part.contains(&text)) {
+            parts.push(text);
+        }
+        source = inner.source();
+    }
+    parts.join(": ")
+}
 
 /// POSIX-style reason for an I/O failure (`enoent`, `eacces`, ...), mirroring the Elixir atoms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,5 +300,35 @@ impl ConfigError {
                 None => format!("Invalid WORKFLOW.md config: :{err}"),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct Layer {
+        message: &'static str,
+        #[source]
+        source: Option<Box<Layer>>,
+    }
+
+    fn layer(message: &'static str, source: Option<Layer>) -> Layer {
+        Layer {
+            message,
+            source: source.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn the_chain_joins_every_level_and_skips_a_repeated_one() {
+        assert_eq!(error_chain(&layer("root", None)), "root");
+        let nested = layer("outer", Some(layer("middle", Some(layer("root", None)))));
+        assert_eq!(nested.to_string(), "outer");
+        assert_eq!(error_chain(&nested), "outer: middle: root");
+        let repeating = layer("request failed: refused", Some(layer("refused", None)));
+        assert_eq!(error_chain(&repeating), "request failed: refused");
     }
 }

@@ -1,5 +1,7 @@
 //! Typed store errors.
 
+use symphony_core::error_chain;
+
 use crate::model::RunId;
 
 /// Convenience alias for results returned by the store.
@@ -86,10 +88,20 @@ impl From<rusqlite::Error> for StoreError {
 
 impl From<postgres::Error> for StoreError {
     fn from(err: postgres::Error) -> Self {
-        // `Display` of a server error carries its message and code; never the connection string.
-        StoreError::Postgres(match err.as_db_error() {
-            Some(db) => format!("{}: {}", db.code().code(), db.message()),
-            None => err.to_string(),
-        })
+        StoreError::Postgres(postgres_reason(&err))
+    }
+}
+
+/// What to report for a PostgreSQL failure. `Display` of `postgres::Error` is a bare label (`db
+/// error`, `error connecting to server`) with the cause left in `source()`.
+///
+/// A server error gives its code and message only: its `Display` adds `DETAIL`, which can quote row
+/// values. Any other cause (an OS error, a TLS error, the driver's own text) names no credential;
+/// the one that can quote the connection string is a parse failure, see
+/// [`crate::store::postgres_config`].
+pub(crate) fn postgres_reason(err: &postgres::Error) -> String {
+    match err.as_db_error() {
+        Some(db) => format!("{}: {}", db.code().code(), db.message()),
+        None => error_chain(err),
     }
 }

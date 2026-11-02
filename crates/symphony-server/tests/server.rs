@@ -163,6 +163,13 @@ async fn invalid_hosts_and_busy_ports_are_startup_errors() {
     .await
     .unwrap_err();
     assert!(matches!(error, ServerError::Bind { .. }), "{error}");
+    let tag = format!("bind_failed: 127.0.0.1:{}", first.port());
+    assert_eq!(error.to_string(), tag);
+    let reported = symphony_core::error_chain(&error);
+    assert!(
+        reported.starts_with(&format!("{tag}: ")),
+        "the OS error is reported: {reported}"
+    );
     shutdown.cancel();
     first.wait().await.unwrap();
 }
