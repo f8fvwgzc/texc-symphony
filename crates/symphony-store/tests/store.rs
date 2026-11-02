@@ -1549,3 +1549,26 @@ async fn interrupted_runs_use_up_attempts_and_hand_offs_do_not() {
         TaskStatus::Failed
     );
 }
+
+/// `Display` of a `postgres::Error` says only `db error`, and that of its cause adds `DETAIL`, which
+/// quotes row values. The store reports the code and the message.
+#[test]
+fn a_postgres_server_error_gives_its_code_and_message_without_row_values() {
+    let Ok(url) = std::env::var("SYMPHONY_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute("CREATE TEMP TABLE unique_values (value TEXT PRIMARY KEY)")
+        .unwrap();
+    let insert = "INSERT INTO unique_values VALUES ('row-value')";
+    client.batch_execute(insert).unwrap();
+    let err = client.batch_execute(insert).unwrap_err();
+    assert_eq!(err.to_string(), "db error");
+    let reported = StoreError::from(err).to_string();
+    assert!(
+        reported.starts_with("store_postgres_error: 23505: duplicate key"),
+        "{reported}"
+    );
+    assert!(!reported.contains("row-value"), "{reported}");
+}

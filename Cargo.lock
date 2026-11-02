@@ -2813,6 +2813,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "symphony-core",
  "tempfile",
  "thiserror",
  "tokio",

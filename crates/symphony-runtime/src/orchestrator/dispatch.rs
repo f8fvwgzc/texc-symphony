@@ -155,8 +155,9 @@ impl Orchestrator<'_> {
                 refreshed.blocked_by.len()
             ),
             Revalidation::Error(err) => tracing::warn!(
-                "Skipping dispatch; issue refresh failed for {}: {err}",
-                issue_context(issue)
+                "Skipping dispatch; issue refresh failed for {}: {}",
+                issue_context(issue),
+                error_chain(err)
             ),
         }
         result
@@ -489,7 +490,7 @@ fn log_fetch_error(err: &FetchError) {
         FetchError::Tracker(TrackerError::UnsupportedTrackerKind(kind)) => {
             log_config_error(&ConfigError::UnsupportedTrackerKind(kind.clone()))
         }
-        other => format!("Failed to fetch from issue tracker: {other}"),
+        other => format!("Failed to fetch from issue tracker: {}", error_chain(other)),
     };
     tracing::error!("{message}");
 }

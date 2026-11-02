@@ -40,6 +40,7 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `LLM_*` | unset | the platform LLM connection contract: provider, endpoint, key file, model, gateway ([configuration.md](configuration.md#llm-connection-contract)) |
 | `SYMPHONY_LOG_FORMAT` | `text` | `json` for one JSON object per line on stdout (the log file stays text) |
 | `RUST_LOG` | `info` | `tracing` filter, e.g. `info` or `symphony=debug,info` |
+| `RUST_BACKTRACE`, `RUST_LIB_BACKTRACE` | `1`, `0` in the image | a backtrace on panic, none captured per error; set them in the environment of any other install |
 | `SYMPHONY_SSH_CONFIG` | | SSH client config for `worker.ssh_hosts` |
 | `LINEAR_API_KEY`, `GITHUB_TOKEN`, `GITLAB_PAT`, `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN`, `ASANA_PAT` | | tracker credentials (only the one your workflow uses); kept out of the Codex child environment |
 
@@ -162,6 +163,8 @@ LINEAR_API_KEY=...
 SYMPHONY_PORT=4000
 SYMPHONY_DB_RETENTION_DAYS=30
 RUST_LOG=info
+RUST_BACKTRACE=1
+RUST_LIB_BACKTRACE=0
 ```
 
 `/etc/systemd/system/symphony.service`:

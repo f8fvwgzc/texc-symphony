@@ -15,7 +15,7 @@ pub const DEFAULT_TRACKER_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FetchError {
     /// The adapter returned an error.
-    #[error("{0}")]
+    #[error(transparent)]
     Tracker(#[from] TrackerError),
     /// The read exceeded the runtime's tracker timeout (new in the Rust port).
     #[error("tracker_timeout: {0}ms")]

@@ -184,7 +184,10 @@ RUN apt-get update && \
 COPY --from=codex / /
 COPY --from=rust /out/symphony /usr/local/bin/symphony
 
+# Backtraces on panic only: capturing one for every error costs too much under a high error rate.
 ENV PATH=/opt/codex/bin:/opt/claude/bin:$PATH \
+    RUST_BACKTRACE=1 \
+    RUST_LIB_BACKTRACE=0 \
     SYMPHONY_HOST=0.0.0.0 \
     SYMPHONY_PORT=4000 \
     SYMPHONY_DB_PATH=/data/symphony.db \

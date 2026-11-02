@@ -154,7 +154,7 @@ impl Orchestrator<'_> {
         }
         let reason = match &result {
             Ok(()) => "normal".to_owned(),
-            Err(err) => err.to_string(),
+            Err(err) => error_chain(err),
         };
         self.handle_agent_down(&issue_id, entry, result);
         tracing::info!(
@@ -196,7 +196,7 @@ impl Orchestrator<'_> {
                 Err(err) => (
                     RunStatus::Failed,
                     TaskStatus::Failed,
-                    Some(format!("agent exited: {err}")),
+                    Some(format!("agent exited: {}", error_chain(err))),
                     Some(match err {
                         RunError::TaskTimeout(_) => TaskFailure::Timeout,
                         _ => TaskFailure::Error,
@@ -217,7 +217,7 @@ impl Orchestrator<'_> {
             let fallback = match (&result, outcome_blocker) {
                 (_, Some(blocker)) => blocker.message().to_owned(),
                 (Ok(()), None) => "agent exited: normal".to_owned(),
-                (Err(err), None) => format!("agent exited: {err}"),
+                (Err(err), None) => format!("agent exited: {}", error_chain(err)),
             };
             let error = blocker_error(
                 entry.last_codex_event,
@@ -251,9 +251,10 @@ impl Orchestrator<'_> {
                 self.schedule_issue_retry(issue_id, Some(1), meta, DelayType::Continuation);
             }
             Err(err) => {
-                let error = format!("agent exited: {err}");
+                let reason = error_chain(&err);
+                let error = format!("agent exited: {reason}");
                 tracing::warn!(
-                    "Agent task exited for issue_id={issue_id} session_id={session_id} reason={err}; scheduling retry"
+                    "Agent task exited for issue_id={issue_id} session_id={session_id} reason={reason}; scheduling retry"
                 );
                 entry
                     .recorder

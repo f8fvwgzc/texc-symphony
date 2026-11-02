@@ -28,7 +28,7 @@ pub mod workspace_key;
 
 pub use config::Settings;
 pub use env::{EnvSource, MapEnv, ProcessEnv};
-pub use error::{ConfigError, IoReason, TrackerConfigError};
+pub use error::{ConfigError, IoReason, TrackerConfigError, error_chain};
 pub use issue::{BlockerRef, Issue};
 pub use path_safety::PathError;
 pub use prompt::PromptError;

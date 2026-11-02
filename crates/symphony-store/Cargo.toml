@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+symphony-core.workspace = true
 
 [features]
 # Exposes `Store::open_in_memory_shared` (a shared in-memory store) for other crates' tests only;

@@ -143,24 +143,25 @@ impl WorkerContext {
     }
 }
 
-/// Why an agent run failed. `Display` is the reason used in `"agent exited: <reason>"`.
+/// Why an agent run failed. [`symphony_core::error_chain`] of it is the reason used in
+/// `"agent exited: <reason>"`; `Display` alone stops at the variant's tag.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum RunError {
     /// Workspace creation or a fatal hook failed.
-    #[error("{0}")]
+    #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     /// The Codex session failed.
-    #[error("{0}")]
+    #[error(transparent)]
     Codex(#[from] CodexError),
     /// The prompt could not be rendered.
-    #[error("{0}")]
+    #[error(transparent)]
     Prompt(#[from] PromptError),
     /// `{:issue_state_refresh_failed, reason}` between turns.
-    #[error("issue_state_refresh_failed: {0}")]
-    IssueStateRefresh(FetchError),
+    #[error("issue_state_refresh_failed")]
+    IssueStateRefresh(#[source] FetchError),
     /// The tracker's agent tools could not be bound.
-    #[error("tool_binding_failed: {0}")]
-    ToolBinding(TrackerError),
+    #[error("tool_binding_failed")]
+    ToolBinding(#[source] TrackerError),
     /// The run names a backend that `backends` does not define.
     #[error("unknown_backend: {0}")]
     UnknownBackend(String),
@@ -175,8 +176,8 @@ pub enum RunError {
     #[error("isolation_unavailable: {0}")]
     IsolationUnavailable(String),
     /// The task's repository token (`isolation.github_app`) could not be minted.
-    #[error("task_credentials_failed: {0}")]
-    TaskCredentials(crate::credentials::CredentialError),
+    #[error("task_credentials_failed")]
+    TaskCredentials(#[source] crate::credentials::CredentialError),
     /// The run was cancelled by the orchestrator.
     #[error("cancelled")]
     Cancelled,
@@ -221,5 +222,44 @@ where
 impl<F> std::fmt::Debug for FnWorkerFactory<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("FnWorkerFactory")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use symphony_core::error_chain;
+    use symphony_trackers::{Provider, TransportError};
+
+    use super::*;
+    use crate::credentials::CredentialError;
+
+    /// `"agent exited: <reason>"` reaches run history and the API, so a reason keeps its whole text
+    /// even though `Display` of a wrapping variant now stops at its own tag.
+    #[test]
+    fn a_reason_reads_the_same_from_tag_to_root_cause() {
+        let timeout = || TrackerError::request(Provider::Linear, TransportError::Timeout);
+        let cases = [
+            (
+                RunError::IssueStateRefresh(FetchError::Tracker(timeout())),
+                "issue_state_refresh_failed: linear_api_request: timeout",
+            ),
+            (
+                RunError::IssueStateRefresh(FetchError::Timeout(2_000)),
+                "issue_state_refresh_failed: tracker_timeout: 2000ms",
+            ),
+            (
+                RunError::ToolBinding(timeout()),
+                "tool_binding_failed: linear_api_request: timeout",
+            ),
+            (
+                RunError::TaskCredentials(CredentialError::Signing),
+                "task_credentials_failed: github_app_signing_failed",
+            ),
+            (RunError::Codex(CodexError::TurnTimeout), "turn_timeout"),
+            (RunError::Other("boom".into()), "boom"),
+        ];
+        for (error, reason) in cases {
+            assert_eq!(error_chain(&error), reason);
+        }
     }
 }

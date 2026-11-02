@@ -10,7 +10,8 @@ use symphony_store::StoreError;
 
 use crate::view::ErrorEnvelope;
 
-/// Failure to start or run the HTTP server.
+/// Failure to start or run the HTTP server. Report it with [`symphony_core::error_chain`]: the OS
+/// error of `Bind` and `Io` is in `source()`.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     /// `server.host` is neither an IP literal nor a resolvable name.
@@ -22,7 +23,7 @@ pub enum ServerError {
         reason: String,
     },
     /// The listener could not be bound.
-    #[error("bind_failed: {addr}: {source}")]
+    #[error("bind_failed: {addr}")]
     Bind {
         /// Address that was being bound.
         addr: SocketAddr,
@@ -30,7 +31,7 @@ pub enum ServerError {
         source: io::Error,
     },
     /// The accept loop failed.
-    #[error("server_failed: {0}")]
+    #[error("server_failed")]
     Io(#[from] io::Error),
     /// The server task panicked or was aborted.
     #[error("server_task_failed: {0}")]
