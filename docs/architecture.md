@@ -121,7 +121,9 @@ sequenceDiagram
 
 Retry delay after a failure is `min(10 s · 2^(attempt-1), agent.max_retry_backoff_ms)`. A normal
 exit schedules a 1 s continuation that either dispatches the issue again, releases the claim (the
-issue is inactive or gone), or cleans the workspace (the issue is terminal).
+issue is inactive or gone), or cleans the workspace (the issue is terminal). With
+`agent.max_continuations` set, an issue still active after that many continuations is blocked
+instead of dispatched again.
 
 ## Live monitoring
 

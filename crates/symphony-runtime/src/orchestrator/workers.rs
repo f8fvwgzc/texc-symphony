@@ -240,6 +240,7 @@ impl Orchestrator<'_> {
             error: None,
             worker_host: entry.worker_host.clone(),
             workspace_path: entry.workspace_path.clone(),
+            continuations: entry.continuations,
         };
         match result {
             Ok(()) => {
@@ -248,6 +249,10 @@ impl Orchestrator<'_> {
                 );
                 entry.recorder.finish(RunStatus::Succeeded, None);
                 self.state.completed.insert(issue_id.to_owned());
+                let meta = RetryMeta {
+                    continuations: entry.continuations.saturating_add(1),
+                    ..meta
+                };
                 self.schedule_issue_retry(issue_id, Some(1), meta, DelayType::Continuation);
             }
             Err(err) => {

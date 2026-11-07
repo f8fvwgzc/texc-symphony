@@ -39,6 +39,9 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  # Runs that end with the issue still active start another run, without limit by default. Set a cap
+  # to block such an issue for an operator instead (docs/configuration.md#agent).
+  # max_continuations: 5
 codex:
   # Safe defaults (docs/configuration.md#codex): Codex only sees a filtered environment, sandbox
   # escalations and MCP prompts are rejected, and turns run in a workspace-write sandbox without

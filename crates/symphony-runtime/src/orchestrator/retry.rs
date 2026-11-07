@@ -56,6 +56,7 @@ impl Orchestrator<'_> {
                     error: retry.error,
                     worker_host: retry.worker_host,
                     workspace_path: retry.workspace_path,
+                    continuations: retry.continuations,
                 },
             );
         }
@@ -99,6 +100,19 @@ impl Orchestrator<'_> {
             "retry limit reached: {limit} retries failed (last error: {})",
             meta.error.as_deref().unwrap_or("unknown")
         );
+        self.block_instead_of_retry(issue_id, issue, meta, error);
+    }
+
+    /// Blocks `issue` instead of running it again, like one waiting for an operator: it stays
+    /// claimed, keeps the host and workspace of its last run, and is released when it leaves the
+    /// active states or this worker's routing.
+    fn block_instead_of_retry(
+        &mut self,
+        issue_id: &str,
+        issue: &Issue,
+        meta: RetryMeta,
+        error: String,
+    ) {
         let identifier = meta.identifier.unwrap_or_else(|| issue_id.to_owned());
         tracing::warn!("Blocking issue_id={issue_id} issue_identifier={identifier}: {error}");
         self.remove_retry_entry(issue_id);
@@ -181,6 +195,7 @@ impl Orchestrator<'_> {
                 error: error.clone(),
                 worker_host: worker_host.clone(),
                 workspace_path: workspace_path.clone(),
+                continuations: meta.continuations,
             })
             .detach();
         self.state.claimed.insert(issue_id.to_owned());
@@ -196,6 +211,7 @@ impl Orchestrator<'_> {
                 error,
                 worker_host,
                 workspace_path,
+                continuations: meta.continuations,
             },
         );
     }
@@ -311,6 +327,25 @@ impl Orchestrator<'_> {
         meta: RetryMeta,
     ) {
         let settings = self.settings();
+        // Checked here, once the issue is known to be still active: a run that moved the issue on
+        // released its claim, and its count with it, before getting this far.
+        if let Some(limit) = settings
+            .agent
+            .max_continuations
+            .filter(|limit| meta.continuations > *limit)
+        {
+            let error = format!(
+                "continuation limit reached: {} runs ended normally with the issue still active \
+                 (agent.max_continuations: {limit})",
+                meta.continuations
+            );
+            let meta = RetryMeta {
+                identifier: issue.identifier.clone().or(meta.identifier),
+                ..meta
+            };
+            self.block_instead_of_retry(issue_id, &issue, meta, error);
+            return;
+        }
         let host = self
             .state
             .select_worker_host(&settings, meta.worker_host.as_deref());
@@ -366,6 +401,9 @@ impl Orchestrator<'_> {
                         meta,
                         DelayType::Failure,
                     );
+                } else if let Some(run) = self.state.running.get_mut(issue_id) {
+                    // The run carries the count to its exit, which hands it to the next retry.
+                    run.continuations = meta.continuations;
                 }
             }
             Revalidation::SkipMissing => self.release_issue_claim(issue_id),

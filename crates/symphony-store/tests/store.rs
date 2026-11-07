@@ -695,6 +695,7 @@ fn retry(issue_id: &str, attempt: u32, due_in_ms: i64) -> RetryRecord {
         error: Some("agent exited: boom".into()),
         worker_host: None,
         workspace_path: Some(format!("/tmp/ws/MT-{issue_id}")),
+        continuations: 0,
     }
 }
 
@@ -702,7 +703,11 @@ fn retry(issue_id: &str, attempt: u32, due_in_ms: i64) -> RetryRecord {
 async fn the_retry_queue_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("symphony.db");
-    let (late, soon) = (retry("a", 3, 60_000), retry("b", 1, 1_000));
+    let late = RetryRecord {
+        continuations: 2,
+        ..retry("a", 3, 60_000)
+    };
+    let soon = retry("b", 1, 1_000);
     {
         let store = Store::open(&path).unwrap();
         store.save_retry(retry("a", 2, 30_000)).detach();
@@ -720,6 +725,31 @@ async fn the_retry_queue_survives_a_reopen() {
     let disabled = Store::disabled();
     disabled.save_retry(retry("a", 1, 0)).await.unwrap();
     assert!(disabled.list_retries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_retry_carries_its_continuation_count() {
+    let store = memory();
+    let continued = |issue_id, continuations| RetryRecord {
+        continuations,
+        ..retry(issue_id, 1, 1_000)
+    };
+    store.save_retry(continued("a", 4)).detach();
+    store.save_retry(continued("b", 4)).detach();
+    // A replacement replaces the count too, down to none.
+    store.save_retry(continued("a", 0)).detach();
+    store.save_retry(continued("b", 5)).detach();
+    // The count goes with its retry.
+    store.save_retry(continued("gone", 1)).detach();
+    store.delete_retry("gone").await.unwrap();
+    let counts: Vec<_> = store
+        .list_retries()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|retry| (retry.issue_id, retry.continuations))
+        .collect();
+    assert_eq!(counts, [("a".to_owned(), 0), ("b".to_owned(), 5)]);
 }
 
 #[tokio::test]

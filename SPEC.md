@@ -465,6 +465,11 @@ Fields:
   - Default: implementation-defined and finite (Symphony: `10`).
   - Failed runs in a row that are retried; the next failure blocks the issue (Section 8.4).
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `max_continuations` (positive integer, OPTIONAL extension)
+  - Default: unlimited (Symphony: unset).
+  - Continuation runs an issue gets while it stays active; the next continuation blocks the issue
+    (Section 8.4).
+  - Changes SHOULD be re-applied at runtime and affect the next continuation check.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -641,6 +646,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_retry_attempts`: positive integer, default `10` (Symphony extension)
+- `agent.max_continuations`: positive integer, default unlimited (Symphony extension)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -721,7 +727,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Remove running entry.
   - Update aggregate runtime totals.
   - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+    turn loop, counting one more normal exit for the continuation limit (Section 8.4).
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -811,7 +817,7 @@ The runtime counts issues by their current tracked state in the `running` map.
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+- Store `attempt`, `identifier`, `error`, `due_at_ms`, the continuation count, and new timer handle.
 
 Backoff formula:
 
@@ -830,12 +836,25 @@ Retry limit (OPTIONAL extension, finite by default in Symphony):
 - Failures that are not the agent's (a failed tracker refresh before a retry) never block the
   issue; they still advance the attempt used for the backoff.
 
+Continuation limit (OPTIONAL extension, off by default in Symphony):
+
+- A claimed issue counts its runs that ended normally. The count travels with the issue's retry
+  entry and running entry, so it ends with the claim; implementations that keep the retry queue
+  across restarts SHOULD keep the count with it.
+- When a retry finds the issue still active and routable while the count is greater than
+  `agent.max_continuations`, the issue is not dispatched. It becomes blocked like one at the retry
+  limit, with an error naming the count and the limit, and is released the same way.
+- The check runs only after the refresh, so a run that moved the issue out of the active states has
+  its claim released, never blocked, and the issue starts from zero when it is active again.
+- A failed run neither counts nor resets the count, and neither does a move between active states.
+
 Retry handling behavior:
 
 1. Refresh the specific issue with `fetch_issues_by_ids([issue_id])`.
 2. If not found, release claim.
 3. If found in a terminal state, clean its workspace and release claim.
 4. If found and still active and routable:
+   - Block it if the continuation limit is reached.
    - Dispatch if slots are available.
    - Otherwise requeue with error `no available orchestrator slots`.
 5. If found but no longer active or routable, release claim without dispatch.

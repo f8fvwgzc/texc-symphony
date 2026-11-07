@@ -401,6 +401,7 @@ impl Orchestrator<'_> {
                 tokens: Default::default(),
                 turn_count: 0,
                 retry_attempt: attempt.filter(|a| *a > 0).unwrap_or(0),
+                continuations: 0,
                 started_at,
                 started: now,
                 recorder,
