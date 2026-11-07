@@ -253,22 +253,42 @@ impl Orchestrator<'_> {
             Err(err) => {
                 let reason = error_chain(&err);
                 let error = format!("agent exited: {reason}");
-                tracing::warn!(
-                    "Agent task exited for issue_id={issue_id} session_id={session_id} reason={reason}; scheduling retry"
-                );
                 entry
                     .recorder
                     .finish(RunStatus::Failed, Some(error.clone()));
-                let next = next_retry_attempt_from_running(&entry);
-                self.retry_failed_run(
-                    issue_id,
-                    next,
-                    RetryMeta {
-                        error: Some(error),
-                        ..meta
-                    },
-                    &entry.issue,
+                let meta = RetryMeta {
+                    error: Some(error),
+                    ..meta
+                };
+                // A run the provider refused before any work is not the agent's failure: the
+                // retry keeps its attempt (at least 1, like a continuation: a retry is never 0),
+                // so a limit that lasts hours never brings the retry limit closer. A limited run
+                // that spent tokens first counts (still at the limit's delay), so a 429 that
+                // never lifts cannot re-spend them forever.
+                let limited = err.is_rate_limited();
+                if limited && entry.tokens.totals.processed() == 0 {
+                    tracing::warn!(
+                        "Agent task hit a provider limit for issue_id={issue_id} issue_identifier={} session_id={session_id} reason={reason}; waiting without counting a retry",
+                        entry.identifier
+                    );
+                    self.schedule_issue_retry(
+                        issue_id,
+                        Some(entry.retry_attempt.max(1)),
+                        meta,
+                        DelayType::ProviderLimit,
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    "Agent task exited for issue_id={issue_id} session_id={session_id} reason={reason}; scheduling retry"
                 );
+                let next = next_retry_attempt_from_running(&entry);
+                let delay = if limited {
+                    DelayType::ProviderLimit
+                } else {
+                    DelayType::Failure
+                };
+                self.retry_failed_run(issue_id, next, meta, &entry.issue, delay);
             }
         }
     }

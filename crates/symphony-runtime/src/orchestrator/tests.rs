@@ -489,6 +489,120 @@ async fn failed_retries_stop_at_the_retry_limit_and_block_the_issue() {
     assert!(!orch.state.claimed.contains("i-1"));
 }
 
+/// A provider limit is not the agent's failure: however many runs it ends, the issue waits the
+/// slowest backoff at the same attempt and is never blocked. Genuine failures around the limited
+/// runs still count, from the attempt the limit kept.
+#[tokio::test(start_paused = true)]
+async fn provider_limits_wait_without_counting_toward_the_retry_limit() {
+    const LIMIT: &str = "claude reported success: You've hit your session limit · resets 5:10pm";
+    // Four limited runs (past the retry limit of 2), a failure, three more limits, a failure.
+    let script = [true, true, true, true, false, true, true, true, false];
+    let started: Arc<Mutex<Vec<Option<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory({
+        let started = Arc::clone(&started);
+        move |ctx: WorkerContext| {
+            let mut started = started.lock().unwrap();
+            started.push(ctx.attempt);
+            let limited = script.get(started.len() - 1) == Some(&true);
+            async move {
+                Err(if limited {
+                    RunError::Codex(CodexError::RateLimited(LIMIT.into()))
+                } else {
+                    RunError::Other("boom".into())
+                })
+            }
+        }
+    }));
+    let mut h = Harness::new(
+        json!({"agent": {"max_retry_attempts": 2, "max_retry_backoff_ms": 60_000}}),
+        factory,
+    );
+    h.memory.set(vec![issue("i-1", "MT-559", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-559", "In Progress"), None, None)
+        .await;
+    let finished = |runs: usize| {
+        let started = Arc::clone(&started);
+        move |o: &Orchestrator<'_>| {
+            started.lock().unwrap().len() == runs
+                && o.state.running.is_empty()
+                && (o.state.retry_attempts.contains_key("i-1")
+                    || o.state.blocked.contains_key("i-1"))
+        }
+    };
+    let limited = format!("agent exited: agent_rate_limited: {LIMIT}");
+
+    for (runs, attempt) in [(1, 1), (2, 1), (3, 1), (4, 1), (6, 2), (7, 2), (8, 2)] {
+        run_until(&mut orch, finished(runs)).await;
+        assert!(orch.state.blocked.is_empty(), "a limit never blocks");
+        let entry = &orch.state.retry_attempts["i-1"];
+        assert_eq!(entry.attempt, attempt, "after run {runs}");
+        assert_eq!(entry.error.as_deref(), Some(limited.as_str()));
+        assert!((59_000..=60_000).contains(&retry_due_in(&orch, "i-1")));
+        if runs == 4 {
+            // The failure after the limited runs is retry 2, with its own backoff.
+            run_until(&mut orch, finished(5)).await;
+            let entry = &orch.state.retry_attempts["i-1"];
+            assert_eq!(entry.attempt, 2);
+            assert_eq!(entry.error.as_deref(), Some("agent exited: boom"));
+            assert!((19_000..=20_000).contains(&retry_due_in(&orch, "i-1")));
+        }
+    }
+
+    // The second failure is the one past the limit.
+    run_until(&mut orch, finished(9)).await;
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "retry limit reached: 2 retries failed (last error: agent exited: boom)"
+    );
+    assert_eq!(
+        *started.lock().unwrap(),
+        [
+            None,
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(2),
+            Some(2)
+        ]
+    );
+}
+
+/// A run that spent tokens before the provider's 429 counts like any failure, though it still
+/// waits the limit's delay: a 429 that never lifts (a request too large for the rate limit, say)
+/// cannot re-spend them forever.
+#[tokio::test(start_paused = true)]
+async fn a_limited_run_that_spent_tokens_counts_toward_the_retry_limit() {
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory(
+        |ctx: WorkerContext| async move {
+            ctx.events.emit(notification(json!({"method": "thread/tokenUsage/updated",
+                "params": {"tokenUsage": {"total": {"inputTokens": 900, "outputTokens": 100, "totalTokens": 1000}}}})));
+            Err(RunError::Codex(CodexError::RateLimited(
+                "Anthropic API: HTTP 429: request too large".into(),
+            )))
+        },
+    ));
+    let mut h = Harness::new(json!({"agent": {"max_retry_attempts": 2}}), factory);
+    h.memory.set(vec![issue("i-1", "MT-559", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-559", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    assert_eq!(orch.state.retry_attempts["i-1"].attempt, 1);
+    assert!((299_000..=300_000).contains(&retry_due_in(&orch, "i-1")));
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "retry limit reached: 2 retries failed (last error: agent exited: agent_rate_limited: \
+         Anthropic API: HTTP 429: request too large)"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn continuation_requeued_without_slots_waits_twenty_seconds() {
     let started = Arc::new(Mutex::new(Vec::new()));

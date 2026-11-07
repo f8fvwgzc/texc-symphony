@@ -21,7 +21,8 @@
 //! `api_key_env` is set its value is passed as `ANTHROPIC_API_KEY`; otherwise the LLM contract
 //! applies when it serves Anthropic Messages ([`contract_env`]), and else Claude Code uses its own
 //! login. A turn that prints nothing for `turn_timeout_ms` is killed (`turn_timeout`);
-//! a dropped turn kills its whole process group.
+//! a dropped turn kills its whole process group. A turn that a usage or rate limit ended (an
+//! HTTP 429) fails as `agent_rate_limited`, which the orchestrator waits out.
 //!
 //! The tracker's scoped tools reach Claude Code through MCP ([`crate::mcp`]): when the session
 //! has tools, each turn also gets `--mcp-config <file>` (a `symphony agent-tools` server
@@ -497,14 +498,20 @@ impl ClaudeSession {
                         final_message: text,
                     })
                 }
-                Finished::Error { subtype, message } => {
+                Finished::Error {
+                    subtype,
+                    message,
+                    rate_limited,
+                } => {
                     let detail = message
                         .map(|m| format!(": {}", truncate(&m, 500)))
                         .unwrap_or_default();
-                    Err(CodexError::Backend(format!(
-                        "claude reported {subtype}{detail}{}",
-                        stderr_suffix(&tail)
-                    )))
+                    let text = format!("claude reported {subtype}{detail}{}", stderr_suffix(&tail));
+                    Err(if rate_limited {
+                        CodexError::RateLimited(text)
+                    } else {
+                        CodexError::Backend(text)
+                    })
                 }
             };
         };

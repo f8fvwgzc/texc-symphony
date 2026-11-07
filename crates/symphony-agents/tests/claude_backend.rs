@@ -252,6 +252,46 @@ async fn an_error_result_fails_the_turn() {
     );
 }
 
+/// Turn 1 replays what Claude Code 2.1.302 printed (then exit 1) against a model API answering
+/// HTTP 429; turn 2 is a plan limit's message without `api_error_status`, as builds without that
+/// field report it. Both are provider limits; an ordinary error result is not (see above).
+#[tokio::test]
+async fn a_usage_or_rate_limit_fails_the_turn_as_rate_limited() {
+    let f = fixture();
+    f.write(
+        "turn.1.sh",
+        r#"cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"d32a9546-4585-40ad-867e-12e8a6af098c","apiKeySource":"ANTHROPIC_API_KEY"}
+{"type":"assistant","error":"rate_limit","api_error_status":429,"is_api_error_message":true,"session_id":"d32a9546-4585-40ad-867e-12e8a6af098c","message":{"content":[{"type":"text","text":"API Error: Request rejected (429) · Rate limit exceeded"}]}}
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"duration_ms":1052,"num_turns":1,"result":"API Error: Request rejected (429) · Rate limit exceeded","stop_reason":"stop_sequence","terminal_reason":"api_error","session_id":"d32a9546-4585-40ad-867e-12e8a6af098c","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}
+EOF
+exit 1
+"#,
+    );
+    f.write(
+        "turn.2.jsonl",
+        r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit · resets 5:10pm (Asia/Tokyo)","session_id":"sess-1","usage":{"input_tokens":0,"output_tokens":0}}
+"#,
+    );
+    let backend = ClaudeCodeBackend::new(backend_settings(claude_settings(), 60_000));
+    let mut session = backend.start(f.options()).await.unwrap();
+    let (sink, mut rx) = events();
+    for expected in [
+        "Request rejected (429) · Rate limit exceeded",
+        "You've hit your session limit",
+    ] {
+        let err = session.run_turn("x", &issue(), &sink).await.unwrap_err();
+        let CodexError::RateLimited(message) = &err else {
+            panic!("expected a rate limit, got {err:?}");
+        };
+        assert!(message.contains(expected), "{message}");
+        assert_eq!(err.tag(), "agent_rate_limited");
+        let kinds: Vec<CodexEventKind> = drain(&mut rx).iter().map(CodexEvent::kind).collect();
+        assert_eq!(kinds.last(), Some(&CodexEventKind::TurnEndedWithError));
+    }
+    session.stop().await;
+}
+
 #[tokio::test]
 async fn exiting_without_a_result_reports_the_status_and_stderr() {
     let f = fixture();

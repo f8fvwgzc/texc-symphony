@@ -4,6 +4,7 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +88,82 @@ async fn runtime_dispatches_records_and_cleans_up_an_issue() {
         run.workspace_path.as_deref(),
         Some(workspace.to_string_lossy().as_ref())
     );
+}
+
+/// A Claude Code run that a provider limit ends (the result Claude Code 2.1.302 prints for an HTTP
+/// 429) waits instead of counting toward `agent.max_retry_attempts`: the issue is retried again
+/// and again at the same attempt and never blocked. Genuine failures after it still count.
+#[tokio::test]
+async fn a_rate_limited_claude_run_waits_instead_of_blocking_the_issue() {
+    let bin = tempfile::tempdir().unwrap();
+    let claude = bin.path().join("claude");
+    fs::write(
+        &claude,
+        r#"#!/bin/sh
+dir=$(dirname "$0")
+cat > /dev/null
+echo x >> "$dir/runs"
+if [ -f "$dir/fail" ]; then
+  echo '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom"}'
+else
+  echo '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"API Error: Request rejected (429) · Rate limit exceeded","terminal_reason":"api_error","session_id":"s-1"}'
+fi
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let runs = || {
+        fs::read_to_string(bin.path().join("runs"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    let wf = TestWorkflow::new(json!({
+        "polling": {"interval_ms": 100},
+        "agent": {
+            "max_turns": 1,
+            "max_retry_attempts": 2,
+            "max_retry_backoff_ms": 50,
+            "backend": "claude",
+        },
+        "backends": {"claude": {"kind": "claude_code", "command": claude.to_string_lossy()}},
+    }));
+    let memory = MemoryIssues::new();
+    memory.set(vec![issue("i-1", "MT-LIM", "In Progress")]);
+    let options = RuntimeOptions::new(Arc::clone(&wf.store), TrackerDeps::new().unwrap())
+        .with_tracker(Arc::new(MemoryTracker::new(memory.clone())))
+        .with_runner_options(RunnerOptions {
+            symphony_executable: None,
+            ..RunnerOptions::default()
+        });
+    let runtime = Runtime::start(options);
+    let handle = runtime.handle();
+
+    // Five limited runs, more than the retry limit allows failures: still waiting at attempt 1.
+    let snapshot = wait_for(&handle, |s| {
+        runs() >= 5 && s.retrying.iter().any(|r| r.identifier == "MT-LIM")
+    })
+    .await;
+    assert!(snapshot.blocked.is_empty(), "{snapshot:#?}");
+    let retry = &snapshot.retrying[0];
+    assert_eq!(retry.attempt, 1);
+    assert!(
+        retry
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("agent_rate_limited") && e.contains("(429)")),
+        "{retry:#?}"
+    );
+
+    // Genuine failures count: retry 2, then the issue is blocked.
+    fs::write(bin.path().join("fail"), "").unwrap();
+    let snapshot = wait_for(&handle, |s| !s.blocked.is_empty()).await;
+    assert_eq!(
+        snapshot.blocked[0].error,
+        "retry limit reached: 2 retries failed (last error: agent exited: agent_backend_failed: \
+         claude reported error_during_execution: boom)"
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 async fn wait_for(
