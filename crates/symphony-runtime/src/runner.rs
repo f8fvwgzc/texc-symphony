@@ -41,6 +41,7 @@ use symphony_core::prompt::{build_run_prompt, continuation_prompt, render_backen
 use symphony_core::reference::{self, REFERENCE_TOOL, Reference};
 use symphony_core::{Issue, LoadedWorkflow, Settings, WorkflowStore};
 use symphony_trackers::ToolBinding;
+use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::agents;
@@ -198,6 +199,18 @@ impl DynamicToolHandler for RunToolHandler {
     }
 }
 
+/// Waits between the attempts of the between-turns issue read.
+const ISSUE_REFRESH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// No attempt of that read starts this long after the first. All the delays fit while the failing
+/// reads total under a second. A read that spent them itself, on a timeout, a `Retry-After` or
+/// transport retries, is not repeated, so the wait stays well under the stall timeout.
+const ISSUE_REFRESH_RETRY_BUDGET: Duration = Duration::from_secs(8);
+
 /// Outcome of the between-turns issue check (`continue_with_issue?/2`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Continuation {
@@ -219,7 +232,10 @@ fn is_active(settings: &Settings, state: Option<&str>) -> bool {
 }
 
 /// `continue_with_issue?/2`: re-fetches the issue; continue only while its state is active **and** it
-/// is still routable (`dispatchable` + required labels). A missing issue or id ends the run.
+/// is still routable (`dispatchable` + required labels). A missing issue or id ends the run. A
+/// [transient](FetchError::is_transient) failure is retried after each of
+/// [`ISSUE_REFRESH_RETRY_DELAYS`], within [`ISSUE_REFRESH_RETRY_BUDGET`], before it fails the run,
+/// whose session a new run would have to rebuild.
 pub async fn continue_with_issue(
     issue: &Issue,
     fetcher: &dyn IssueFetcher,
@@ -228,7 +244,28 @@ pub async fn continue_with_issue(
     let Some(id) = issue.id.clone() else {
         return Ok(Continuation::Done(issue.clone()));
     };
-    let issues = fetcher.fetch_issues_by_ids(&[id]).await?;
+    let ids = [id];
+    let began = Instant::now();
+    let mut delays = ISSUE_REFRESH_RETRY_DELAYS.into_iter();
+    let issues = loop {
+        match fetcher.fetch_issues_by_ids(&ids).await {
+            Ok(issues) => break issues,
+            Err(err) => {
+                let delay = delays.next().filter(|delay| {
+                    err.is_transient() && began.elapsed() + *delay < ISSUE_REFRESH_RETRY_BUDGET
+                });
+                let Some(delay) = delay else {
+                    return Err(err);
+                };
+                tracing::warn!(
+                    "Issue refresh failed for {}: {err}; retrying in {}ms",
+                    issue_log(issue),
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    };
     Ok(match issues.into_iter().next() {
         Some(refreshed)
             if is_active(settings, refreshed.state.as_deref())
@@ -645,7 +682,11 @@ impl AgentRunner {
                 outcome.session_id
             );
             let settings = self.workflow.settings();
-            match continue_with_issue(&issue, self.fetcher.as_ref(), &settings).await {
+            let refresh = tracing::warn_span!("issue_refresh", session_id = %outcome.session_id);
+            match continue_with_issue(&issue, self.fetcher.as_ref(), &settings)
+                .instrument(refresh)
+                .await
+            {
                 Ok(Continuation::Continue(refreshed)) if turn < max_turns => {
                     tracing::info!(
                         "Continuing agent run for {} after normal turn completion turn={turn}/{max_turns}",

@@ -97,7 +97,7 @@ sequenceDiagram
     participant W as Workspace + hooks
     participant C as codex app-server
     participant S as SQLite store
-    O->>T: fetch issues in active states (every polling.interval_ms)
+    O->>T: fetch issues in active states (each poll, when a slot is free)
     O->>O: reconcile running/blocked, sort by priority, check slots and labels
     O->>T: revalidate the candidate by id
     O->>A: dispatch (JoinSet), claim the issue
@@ -121,7 +121,9 @@ sequenceDiagram
 
 Retry delay after a failure is `min(10 s · 2^(attempt-1), agent.max_retry_backoff_ms)`. A normal
 exit schedules a 1 s continuation that either dispatches the issue again, releases the claim (the
-issue is inactive or gone), or cleans the workspace (the issue is terminal).
+issue is inactive or gone), or cleans the workspace (the issue is terminal). A release with a slot
+free runs the next poll at once. A retry with no free slot keeps its attempt and waits for a poll,
+which offers free slots to waiting retries and new issues in dispatch order, after queued tasks.
 
 ## Live monitoring
 

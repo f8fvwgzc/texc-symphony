@@ -265,7 +265,7 @@ stopped but its workspace is kept.
 
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
-| `polling.interval_ms` | integer | `30000` | `> 0`. Time between tracker polls. `POST /api/v1/refresh` triggers an immediate poll. | live |
+| `polling.interval_ms` | integer | `30000` | `> 0`. Time between tracker polls. `POST /api/v1/refresh`, releasing the kill switch, a task settling and unblocking a task all trigger an immediate poll. So does a retry that releases its issue with a slot free, which for a finished run comes `agent.continuation_delay_ms` after it ends. This interval therefore mostly decides how fast Symphony notices new and closed issues, and it does not cap tracker reads. No other end of a run brings a poll forward: after a blocked or budget-stopped run, or a retry that restarts its issue, the next issue waits for the next regular poll, and a failed run's slot stays free until then or until its retry takes it. | live |
 
 ### `workspace`
 
@@ -296,8 +296,8 @@ there through `bash -lc`.
 | `agent.max_concurrent_agents` | integer | `10` | `> 0`. Global cap on running agents. | live |
 | `agent.max_concurrent_agents_by_state` | map of state to integer | `{}` | Per-state caps; keys are compared after trim + lowercase. Every key must be non-blank (`state names must not be blank`) and every value a positive YAML integer (`limits must be positive integers`; `"2"` is rejected here). One bad entry rejects the whole file. A state without an entry uses `max_concurrent_agents`. | live |
 | `agent.max_turns` | integer | `20` | `> 0`. Maximum back-to-back Codex turns in one agent run while the issue stays active. | live |
-| `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. A run that ends normally is re-checked after 1 s instead. | live |
-| `agent.max_retry_attempts` | integer | `10` | `> 0`. Failed runs in a row that are retried (about half an hour with the default backoff). The next failure **blocks** the issue (`retry limit reached: ...`) instead of retrying it forever; move it out of the active states (or off this worker) to release it. A run that ends normally restarts the count. A tracker error while retrying never blocks an issue (it still lengthens the backoff). | live |
+| `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. A run that ends normally is re-checked after 1 s instead. A retry that finds no free slot, or fires while dispatch is stopped, is offered a slot at each poll, in dispatch order with new issues and after queued tasks. Until a poll starts it, it re-checks its issue at the longest failure backoff (this cap, or about 2 h 50 min if lower), so if its issue drops out of the candidate list, that is how long it takes to notice. | live |
+| `agent.max_retry_attempts` | integer | `10` | `> 0`. Failed runs in a row that are retried (about half an hour with the default backoff). The next failure **blocks** the issue (`retry limit reached: ...`) instead of retrying it forever; move it out of the active states (or off this worker) to release it. A run that ends normally restarts the count. Waiting for a slot does not count. A tracker error while retrying never blocks an issue (it still lengthens the backoff). | live |
 | `agent.continuation_delay_ms` | integer | `1000` | `> 0`. How long to wait after a run ends normally before checking whether the issue is still active (and running it again if so). Raise it when something outside the agent moves the issue to a terminal state after the run, for example an orchestrating service. | live |
 | `agent.backend` | string | `codex` | The `backends` entry that runs tracker issues and tasks without their own backend (`agent.backend must name an entry of backends`). | new runs |
 
@@ -948,7 +948,9 @@ The adapter tags are listed with each [tracker kind](#tracker-kinds).
 
 Symphony watches `WORKFLOW.md` by polling: every second, and before each use, it compares the
 file's modification time, size and content hash with the last good load, and reloads when any of
-them changed. There is no need to restart or signal the process.
+them changed. There is no need to restart or signal the process. Running agents are the exception
+to "before each use": they are checked against budget limits on every event, using the last load,
+so a change to a limit reaches them within a second.
 
 - **Valid change:** the new settings and prompt replace the old ones atomically. Values marked
   **live** apply to their next use: the next poll (interval, states, labels, concurrency), the

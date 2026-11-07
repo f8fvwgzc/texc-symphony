@@ -309,8 +309,8 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 - **Retry-After cap.** Req's `safe_transient` retry policy is reproduced: `GET`/`HEAD` only; status
   408/429/500/502/503/504 or timeout/refused/closed; 3 retries at 1 s, 2 s and 4 s, or
   `Retry-After`. A server-supplied `Retry-After` is now capped at 60 s
-  (`RetryPolicy::max_delay`), so one bad header cannot stall a poll for an hour. POST (Linear, Jira
-  search/bulkfetch) and all non-GET tool calls are still never retried.
+  (`RetryPolicy::max_delay`), so one bad header cannot stall a poll for an hour. The transport still
+  never retries POST (Linear, Jira search/bulkfetch) or any non-GET tool call.
 - **Redirects.** Redirects are followed manually: at most 10 hops, then `too_many_redirects`.
   - On a scheme, host or port change, `Authorization`, `Private-Token`, `Cookie` and
     `Proxy-Authorization` are dropped. They stay dropped for the rest of the chain, including a
@@ -435,6 +435,9 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 
 ## symphony-runtime
 
+- **Between-turns read.** A transient failure of the issue read between turns is retried after 1 s,
+  2 s and 4 s, within 8 s, because a failed read costs the live session. Elixir ended the run at
+  once. A read that already spent that long, in the transport or on a timeout, is not repeated.
 - **Actor instead of GenServer.** The orchestrator is one tokio task that owns all scheduling state
   and handles one event at a time from a biased `select!`: commands (snapshot, refresh), timer
   events (tick, poll cycle, retry), worker runtime info, per-run Codex event streams, and worker

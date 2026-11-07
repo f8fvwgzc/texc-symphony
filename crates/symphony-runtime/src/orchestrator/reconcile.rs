@@ -23,7 +23,9 @@ impl Orchestrator<'_> {
         ids.sort();
         let settings = self.settings();
         match self.ctx.tracker.fetch_issues_by_ids(&settings, &ids).await {
-            Err(err) => tracing::debug!(
+            // A warning: with every slot full this is the poll's only read, so nothing else reports
+            // a tracker failure.
+            Err(err) => tracing::warn!(
                 "Failed to refresh running issue states: {err}; keeping active workers"
             ),
             Ok(issues) => {

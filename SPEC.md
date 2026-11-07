@@ -770,6 +770,16 @@ Tick sequence:
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.
 
+Step 3 MAY be skipped when no slot is free or dispatch is stopped, because its result only feeds
+step 5.
+
+A retry that releases its issue and leaves a slot free SHOULD run the next tick right away, so a
+finished run refills its slot without waiting for the interval. A retry that keeps its issue frees
+no slot and MUST NOT bring a tick forward, or a looping or failing agent would turn the poll into a
+loop against the tracker. A worker exit does not bring a tick forward by itself. Task runs are
+outside this rule: a task that settles asks for a tick so its dependants start, bounded by its
+`max_attempts`.
+
 ### 8.2 Candidate Selection Rules
 
 An issue is dispatch-eligible only if all are true:
@@ -818,6 +828,8 @@ Backoff formula:
 - Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+- A retry waiting for a slot, or for dispatch to resume after a stop, uses the longest of those
+  delays at any attempt: `min(10000 * 2^10, agent.max_retry_backoff_ms)`.
 
 Retry limit (OPTIONAL extension, finite by default in Symphony):
 
@@ -837,7 +849,12 @@ Retry handling behavior:
 3. If found in a terminal state, clean its workspace and release claim.
 4. If found and still active and routable:
    - Dispatch if slots are available.
-   - Otherwise requeue with error `no available orchestrator slots`.
+   - Otherwise requeue with error `no available orchestrator slots`, keeping the attempt: waiting
+     is not a failure and never counts toward the retry limit. A global dispatch stop requeues the
+     same way, and status surfaces SHOULD show its reason on such a retry. A tick offers free slots
+     to such retries and to new issues alike, in dispatch order (8.2), after queued tasks. The
+     retry's timer is a safety net: it re-checks the issue, releases one that left the active
+     states, and dispatches it if a slot happens to be free.
 5. If found but no longer active or routable, release claim without dispatch.
 
 Note:
@@ -1975,6 +1992,11 @@ on_tick(state):
     schedule_tick(state.poll_interval_ms)
     return state
 
+  if no_available_slots(state) or dispatch_stopped(state):  # MAY skip the fetch (8.1)
+    notify_observers()
+    schedule_tick(state.poll_interval_ms)
+    return state
+
   issues = tracker.fetch_issues_by_states(active_states)
   if issues failed:
     log_tracker_error()
@@ -1988,6 +2010,9 @@ on_tick(state):
 
     if should_dispatch(issue, state):
       state = dispatch_issue(issue, state, attempt=null)
+    else if waiting_for_a_slot(issue, state):  # 8.4: claimed, but it keeps its place in this order
+      retry_entry = state.retry_attempts.pop(issue.id)
+      state = dispatch_issue(issue, state, attempt=retry_entry.attempt)
 
   notify_observers()
   schedule_tick(state.poll_interval_ms)
@@ -2006,7 +2031,7 @@ function reconcile_running_issues(state):
 
   refreshed = tracker.fetch_issues_by_ids(running_ids)
   if refreshed failed:
-    log_debug("keep workers running")
+    log_warn("keep workers running")
     return state
 
   for issue in refreshed:
@@ -2105,8 +2130,8 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
-    refreshed_issue = tracker.fetch_issues_by_ids([issue.id])
-    if refreshed_issue failed:
+    refreshed_issue = tracker.fetch_issues_by_ids([issue.id])  # may retry briefly: a failure
+    if refreshed_issue failed:                                 # costs the live session
       app_server.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
@@ -2159,6 +2184,12 @@ on_retry_timer(issue_id, state):
   if missing:
     return state
 
+  state = handle_retry(issue_id, retry_entry, state)
+  if issue_id not in state.claimed and available_slots(state) > 0:
+    schedule_tick(0)  # 8.1: the released issue's slot refills
+  return state
+
+function handle_retry(issue_id, retry_entry, state):
   refreshed = tracker.fetch_issues_by_ids([issue_id])
   if fetch failed:
     return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
@@ -2176,9 +2207,10 @@ on_retry_timer(issue_id, state):
     return state
 
   if no_available_slots(state):
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+    return schedule_retry(state, issue_id, retry_entry.attempt, {
       identifier: issue.identifier,
-      error: "no available orchestrator slots"
+      error: "no available orchestrator slots",
+      delay_type: no_slots
     })
 
   return dispatch_issue(issue, state, attempt=retry_entry.attempt)
@@ -2271,7 +2303,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
-- Slot exhaustion requeues retries with explicit error reason
+- Slot exhaustion requeues retries with explicit error reason, keeping the attempt
+- A retry that keeps its issue does not bring a poll tick forward
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
 - If a snapshot API is implemented, timeout/unavailable cases are surfaced
