@@ -281,6 +281,8 @@ pub(crate) enum TaskWrite {
         /// The run's attempt number ([`TaskRun::attempt`]).
         attempt: u32,
         reason: String,
+        /// How long the task waits before it may be dispatched again.
+        delay: Duration,
     },
     /// A task's dispatch lease, released after its status writes (a replica recovering tasks
     /// must not see it `running` without a lease).
@@ -336,8 +338,9 @@ impl TaskWrite {
                 id,
                 attempt,
                 reason,
+                delay,
             } => store
-                .release_task(*id, reason.clone(), Some(fence(*attempt)))
+                .release_task(*id, reason.clone(), *delay, Some(fence(*attempt)))
                 .await
                 .map(drop),
             Self::DropLease { key, owner } => store.release_lease(key.clone(), owner.clone()).await,
@@ -508,12 +511,14 @@ impl<'w> Orchestrator<'w> {
         });
     }
 
-    /// Puts the running task `id` back to `queued` (its run `attempt` was stopped from outside).
-    pub(crate) fn task_release(&self, id: i64, attempt: u32, reason: &str) {
+    /// Puts the running task `id` back to `queued` (its run `attempt` was stopped from outside),
+    /// without counting the attempt; it is not dispatched again before `delay`.
+    pub(crate) fn task_release(&self, id: i64, attempt: u32, reason: &str, delay: Duration) {
         self.send_task_write(TaskWrite::Release {
             id,
             attempt,
             reason: reason.to_owned(),
+            delay,
         });
     }
 

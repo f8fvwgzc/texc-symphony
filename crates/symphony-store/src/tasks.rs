@@ -9,7 +9,8 @@
 //! Retries (`task_retry`): a run that ends in a failure the task's policy retries (`error`,
 //! `timeout`, `interrupted`) while fewer than `max_attempts` attempts have failed goes back to
 //! `queued`, not before `backoff_ms * 2^(failures - 1)` (at most `max_backoff_ms`; at once after an
-//! interruption). A run handed off on purpose (kill switch, daily budget, shutdown) does not count.
+//! interruption). A run handed off on purpose (kill switch, daily budget, shutdown) does not count,
+//! nor does one a provider's usage or rate limit refused before any work (it waits instead).
 //! Writes for a running task can be fenced by its dispatch lease: a replica that lost the lease
 //! (another took the task over) cannot finish or release it.
 //!
@@ -276,7 +277,8 @@ pub struct TaskRecord {
     pub retry: TaskRetry,
     /// Failed attempts counted against `retry.max_attempts` (since creation or the last unblock).
     pub failed_attempts: u32,
-    /// When a retried task may run again (`None`: as soon as a slot is free).
+    /// When a retried task, or one waiting out a provider limit, may run again (`None`: as soon
+    /// as a slot is free).
     pub next_attempt_at: Option<DateTime<Utc>>,
     /// Creation time (millisecond precision).
     pub created_at: DateTime<Utc>,
@@ -879,26 +881,38 @@ pub(crate) fn requeue_task(
 }
 
 /// A running task whose run was stopped for an outside reason (kill switch, daily budget,
-/// shutdown) goes back to `queued`, keeping `reason` as its error; the attempt does not count
-/// against its retry policy. Other statuses, and a task whose run is not `fence`'s any more (see
-/// [`TaskFence`]), are left alone.
+/// shutdown, a provider limit) goes back to `queued`, keeping `reason` as its error, and is not
+/// dispatched before `delay` from now; the attempt does not count against its retry policy. Other
+/// statuses, and a task whose run is not `fence`'s any more (see [`TaskFence`]), are left alone.
 pub(crate) fn release_task(
     db: &mut dyn Db,
     id: i64,
     reason: &str,
+    delay: std::time::Duration,
     fence: Option<&TaskFence>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
     let (owner, attempt) = TaskFence::params(fence);
-    db.execute(
-        concat!(
-            "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 ",
-            "WHERE id = ?1 AND status = 'running' AND (CAST(?4 AS TEXT) IS NULL OR (",
-            held_by!("?4", "?3"),
-            " AND attempts = ?5))"
-        ),
-        &vals![id, reason, now.timestamp_millis(), owner, attempt],
-    )?;
+    let now_ms = now.timestamp_millis();
+    let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+    in_transaction(db, |db| {
+        let changed = db.execute(
+            concat!(
+                "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 ",
+                "WHERE id = ?1 AND status = 'running' AND (CAST(?4 AS TEXT) IS NULL OR (",
+                held_by!("?4", "?3"),
+                " AND attempts = ?5))"
+            ),
+            &vals![id, reason, now_ms, owner, attempt],
+        )?;
+        if changed > 0 {
+            db.execute(
+                "UPDATE task_retry SET not_before = ?2 WHERE task_id = ?1",
+                &vals![id, (delay_ms > 0).then(|| now_ms.saturating_add(delay_ms))],
+            )?;
+        }
+        Ok(())
+    })?;
     get_task(db, id)
 }
 

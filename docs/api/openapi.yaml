@@ -1244,7 +1244,9 @@ components:
         A failed run of a kind in `on` runs again while fewer than `max_attempts` attempts have
         failed, after `backoff_ms * 2^(failed_attempts - 1)` (at most `max_backoff_ms`; at once
         after an interruption). Runs handed off on purpose (kill switch, daily budget, shutdown)
-        do not count. Unblocking resets the count.
+        do not count, nor does a run that a provider's usage or rate limit refused before it
+        processed any tokens: that task is queued again after `agent.max_retry_backoff_ms` (at
+        most 10 s · 2^10; `next_attempt_at`), whatever `on` says. Unblocking resets the count.
       required: [max_attempts, backoff_ms, max_backoff_ms, on]
       additionalProperties: false
       properties:
@@ -1285,7 +1287,7 @@ components:
         attempts: { type: integer, minimum: 0, description: 'Runs started so far.' }
         retry: { $ref: '#/components/schemas/TaskRetry' }
         failed_attempts: { type: integer, minimum: 0, description: 'Failed attempts counted against `retry.max_attempts` since creation or the last unblock.' }
-        next_attempt_at: { type: [string, 'null'], format: date-time, description: 'When a retried task may run again; `null`: as soon as a slot is free.' }
+        next_attempt_at: { type: [string, 'null'], format: date-time, description: 'When a retried task, or one waiting out a provider limit, may run again; `null`: as soon as a slot is free.' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }
