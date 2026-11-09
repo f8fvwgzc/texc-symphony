@@ -1,0 +1,85 @@
+On-CPU samples: 27.79 s (the kernel's thread counters say 22.26 s)
+
+Self time (the function itself, callees excluded)
+ 31.58 %  fsync
+ 26.95 %  pwrite
+  7.59 %  pread
+  3.77 %  __fcntl
+  3.24 %  __psynch_cvsignal
+  2.12 %  walChecksumBytes
+  1.33 %  _platform_memmove
+  1.26 %  mach_absolute_time
+  0.84 %  <alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::insert
+  0.75 %  sqlite3VdbeExec
+  0.54 %  _platform_memcmp
+  0.53 %  core::ptr::drop_glue::<serde_json::value::Value>
+  0.51 %  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>::dying_next
+  0.48 %  _platform_memset
+  0.45 %  <&mut serde_json::ser::Serializer<&mut alloc::vec::Vec<u8>> as serde_core::ser::Serializer>::serialize_str
+  0.44 %  0x2b4fc
+  0.33 %  0x300e0
+  0.31 %  0x2a1cc
+  0.31 %  sqlite3WalCheckpoint
+  0.24 %  0x2ff94
+  0.23 %  sqlite3BtreeTableMoveto
+  0.23 %  std::sys::alloc::unix::alloc
+  0.23 %  0x3acd0
+  0.23 %  pcache1TruncateUnsafe
+  0.22 %  0x2a230
+  0.21 %  vdbeRecordCompareInt
+  0.20 %  0x3a0c8
+  0.19 %  pthread_mutex_unlock
+  0.19 %  0x2b730
+  0.19 %  0x2ffa4
+  0.19 %  0x3a120
+  0.17 %  pcache1Fetch
+  0.16 %  0x2b248
+  0.16 %  0xb832a4
+  0.16 %  0x2b1f4
+  0.15 %  0x30238
+  0.15 %  0x301dc
+  0.15 %  0x3ad1c
+  0.15 %  balance
+  0.15 %  pcache1FetchStage2
+
+Inclusive time (the function and everything it calls)
+ 89.16 %  <std::sys::thread::unix::Thread>::new::thread_start
+ 89.16 %  _pthread_start
+ 84.48 %  <tokio::runtime::context::CONTEXT::{K#0}::{closure#0} as core::ops::function::FnOnce<(core::option::Option<&mut core::option::Option<tokio::runtime::context::Context>>,)>>::call_once
+ 84.48 %  tokio::runtime::context::CONTEXT::{K#0}::{closure#0}
+ 84.47 %  <core::cell::Cell<std::sys::thread_local::native::eager::State>>::get
+ 84.47 %  <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 84.47 %  <std::sys::thread_local::native::eager::Storage<tokio::runtime::context::Context>>::get
+ 84.47 %  <std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+ 84.47 %  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::try_with::<tokio::runtime::context::budget<tokio::task::coop::with_budget::ResetGuard, tokio::task::coop::with_budget<core::task::poll::Poll<core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>, <tokio::runtime::park::CachedParkThread>::block_on<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>::{closure#0}>::{closure#0}>::{closure#0}, tokio::task::coop::with_budget::ResetGuard>
+ 84.47 %  <symphony_store::store::Store>::spawn::<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}
+ 84.47 %  <tokio::runtime::context::blocking::BlockingRegionGuard>::block_on::<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>
+ 84.47 %  <tokio::runtime::park::CachedParkThread>::block_on::<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>
+ 84.47 %  <tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::blocking_recv
+ 84.47 %  std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 84.47 %  std::panicking::catch_unwind::<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>>
+ 84.47 %  std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 84.47 %  std::sys::backtrace::__rust_begin_short_backtrace::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>
+ 84.47 %  std::thread::lifecycle::spawn_unchecked::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}
+ 84.47 %  std::thread::lifecycle::spawn_unchecked::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}
+ 84.47 %  symphony-store
+ 84.47 %  tokio::future::block_on::block_on::<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>
+ 84.47 %  tokio::runtime::context::budget::<tokio::task::coop::with_budget::ResetGuard, tokio::task::coop::with_budget<core::task::poll::Poll<core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>, <tokio::runtime::park::CachedParkThread>::block_on<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>::{closure#0}>::{closure#0}>
+ 84.47 %  tokio::task::coop::budget::<core::task::poll::Poll<core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>, <tokio::runtime::park::CachedParkThread>::block_on<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>::{closure#0}>
+ 84.47 %  tokio::task::coop::with_budget::<core::task::poll::Poll<core::option::Option<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>, <tokio::runtime::park::CachedParkThread>::block_on<<tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::recv::{closure#0}>::{closure#0}>
+ 83.98 %  <<symphony_store::store::Store>::submit<i64, <symphony_store::store::Store>::append_event<&str>::{closure#1}, <symphony_store::store::Store>::append_event<&str>::{closure#0}>::{closure#0} as core::ops::function::FnOnce<(&mut dyn symphony_store::db::Db,)>>::call_once::{shim:vtable#0}
+ 81.21 %  symphony_store::db::in_transaction::<i64, symphony_store::ops::append_event::{closure#0}>
+ 81.21 %  symphony_store::ops::append_event
+ 79.05 %  sqlite3_step
+ 69.19 %  <symphony_store::db::SqliteDb as symphony_store::db::Db>::batch
+ 69.18 %  <core::cell::BorrowRefMut>::new
+ 69.18 %  <core::cell::Cell<isize>>::replace
+ 69.18 %  <core::cell::RefCell<rusqlite::inner_connection::InnerConnection>>::borrow_mut
+ 69.18 %  <core::cell::RefCell<rusqlite::inner_connection::InnerConnection>>::try_borrow_mut
+ 69.18 %  <rusqlite::Connection>::execute_batch
+ 69.18 %  core::mem::replace::<isize>
+ 41.79 %  sqlite3WalCheckpoint
+ 41.79 %  sqlite3BtreeCheckpoint
+ 41.79 %  sqlite3WalDefaultHook
+ 41.79 %  sqlite3_wal_checkpoint_v2
+ 37.13 %  sqlite3VdbeExec

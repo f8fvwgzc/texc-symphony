@@ -1,0 +1,257 @@
+{
+  "host": {
+    "arch": "aarch64",
+    "logical_cpus": 10,
+    "os": "macos"
+  },
+  "recorded_at": "2026-11-09T22:22:32.856938+00:00",
+  "results": [
+    {
+      "agents": 100,
+      "events_per_agent_per_sec": 10.0,
+      "freed_slot_idle": {
+        "max_ms": 29962.516,
+        "mean_ms": 14823.383,
+        "min_ms": 95.225,
+        "n": 736,
+        "p50_ms": 14696.798,
+        "p90_ms": 27034.012,
+        "p99_ms": 29652.195
+      },
+      "integrated_per_sec": 804.0,
+      "log": {
+        "errors": 0,
+        "other_warnings": {
+          "Retrying in (attempt": 771
+        },
+        "recorder_dropped_events": 0,
+        "store_busy": 0
+      },
+      "mean_run_secs": 60,
+      "occupancy": 0.8,
+      "offered_per_sec": 800.0,
+      "poll_interval_ms": 30000,
+      "refill_wave": {
+        "duration": {
+          "max_ms": 23.081,
+          "mean_ms": 13.777,
+          "min_ms": 6.647,
+          "n": 18,
+          "p50_ms": 12.405,
+          "p90_ms": 21.777,
+          "p99_ms": 23.081
+        },
+        "max_starts": 60.0,
+        "mean_starts": 40.889,
+        "waves": 18
+      },
+      "rss_mib": {
+        "after_warmup": 27.813,
+        "end": 26.125,
+        "max": 28.766,
+        "slope_per_min": -0.26
+      },
+      "runs_started": 836,
+      "seconds_measured": 540.015,
+      "secs": 600,
+      "series": [
+        {
+          "mean_running": 99.668,
+          "queue_delay_max_ms": 54.494,
+          "rss_bytes": 26378240,
+          "snapshot_p99_ms": 1.968,
+          "t_secs": 30.0
+        },
+        {
+          "mean_running": 80.21,
+          "queue_delay_max_ms": 25.52,
+          "rss_bytes": 25018368,
+          "snapshot_p99_ms": 1.7,
+          "t_secs": 60.0
+        },
+        {
+          "mean_running": 70.927,
+          "queue_delay_max_ms": 22.031,
+          "rss_bytes": 29474816,
+          "snapshot_p99_ms": 2.288,
+          "t_secs": 90.0
+        },
+        {
+          "mean_running": 90.257,
+          "queue_delay_max_ms": 19.269,
+          "rss_bytes": 29949952,
+          "snapshot_p99_ms": 2.761,
+          "t_secs": 120.0
+        },
+        {
+          "mean_running": 78.437,
+          "queue_delay_max_ms": 25.13,
+          "rss_bytes": 27312128,
+          "snapshot_p99_ms": 2.3,
+          "t_secs": 150.0
+        },
+        {
+          "mean_running": 83.93,
+          "queue_delay_max_ms": 30.515,
+          "rss_bytes": 29573120,
+          "snapshot_p99_ms": 0.877,
+          "t_secs": 180.0
+        },
+        {
+          "mean_running": 76.643,
+          "queue_delay_max_ms": 22.124,
+          "rss_bytes": 26656768,
+          "snapshot_p99_ms": 0.978,
+          "t_secs": 210.0
+        },
+        {
+          "mean_running": 80.363,
+          "queue_delay_max_ms": 28.765,
+          "rss_bytes": 28622848,
+          "snapshot_p99_ms": 0.895,
+          "t_secs": 240.0
+        },
+        {
+          "mean_running": 76.233,
+          "queue_delay_max_ms": 120.186,
+          "rss_bytes": 28950528,
+          "snapshot_p99_ms": 3.85,
+          "t_secs": 270.0
+        },
+        {
+          "mean_running": 81.754,
+          "queue_delay_max_ms": 26.485,
+          "rss_bytes": 29540352,
+          "snapshot_p99_ms": 2.273,
+          "t_secs": 300.0
+        },
+        {
+          "mean_running": 80.436,
+          "queue_delay_max_ms": 99.836,
+          "rss_bytes": 26148864,
+          "snapshot_p99_ms": 1.726,
+          "t_secs": 330.0
+        },
+        {
+          "mean_running": 77.872,
+          "queue_delay_max_ms": 86.516,
+          "rss_bytes": 29065216,
+          "snapshot_p99_ms": 1.589,
+          "t_secs": 360.0
+        },
+        {
+          "mean_running": 82.542,
+          "queue_delay_max_ms": 103.56,
+          "rss_bytes": 29736960,
+          "snapshot_p99_ms": 1.446,
+          "t_secs": 390.0
+        },
+        {
+          "mean_running": 77.377,
+          "queue_delay_max_ms": 77.635,
+          "rss_bytes": 29540352,
+          "snapshot_p99_ms": 0.784,
+          "t_secs": 420.0
+        },
+        {
+          "mean_running": 79.993,
+          "queue_delay_max_ms": 77.825,
+          "rss_bytes": 28868608,
+          "snapshot_p99_ms": 1.573,
+          "t_secs": 450.0
+        },
+        {
+          "mean_running": 80.937,
+          "queue_delay_max_ms": 58.205,
+          "rss_bytes": 25624576,
+          "snapshot_p99_ms": 3.962,
+          "t_secs": 480.0
+        },
+        {
+          "mean_running": 79.017,
+          "queue_delay_max_ms": 22.624,
+          "rss_bytes": 25264128,
+          "snapshot_p99_ms": 1.491,
+          "t_secs": 510.0
+        },
+        {
+          "mean_running": 80.217,
+          "queue_delay_max_ms": 31.402,
+          "rss_bytes": 28065792,
+          "snapshot_p99_ms": 2.988,
+          "t_secs": 540.0
+        },
+        {
+          "mean_running": 80.19,
+          "queue_delay_max_ms": 43.077,
+          "rss_bytes": 26329088,
+          "snapshot_p99_ms": 2.172,
+          "t_secs": 570.0
+        },
+        {
+          "mean_running": 82.323,
+          "queue_delay_max_ms": 21.499,
+          "rss_bytes": 27394048,
+          "snapshot_p99_ms": 1.553,
+          "t_secs": 600.0
+        }
+      ],
+      "snapshot": {
+        "event_queue_delay": {
+          "max_ms": 120.186,
+          "mean_ms": 12.003,
+          "min_ms": 0.049,
+          "n": 5389,
+          "p50_ms": 6.665,
+          "p90_ms": 30.209,
+          "p99_ms": 77.098
+        },
+        "failed": 0,
+        "latency": {
+          "max_ms": 28.361,
+          "mean_ms": 0.431,
+          "min_ms": 0.081,
+          "n": 5389,
+          "p50_ms": 0.293,
+          "p90_ms": 0.825,
+          "p99_ms": 2.139
+        },
+        "mean_running": 79.971
+      },
+      "sse": {
+        "delivery": {
+          "max_ms": 132.098,
+          "mean_ms": 9.458,
+          "min_ms": 0.0,
+          "n": 2669,
+          "p50_ms": 4.305,
+          "p90_ms": 26.84,
+          "p99_ms": 61.421
+        },
+        "frames": 2669,
+        "gap": {
+          "max_ms": 276.853,
+          "mean_ms": 202.314,
+          "min_ms": 142.53,
+          "n": 2668,
+          "p50_ms": 202.047,
+          "p90_ms": 203.326,
+          "p99_ms": 206.906
+        },
+        "max_frame_bytes": 53072,
+        "mean_frame_bytes": 42302.0
+      },
+      "sse_error": null,
+      "store": {
+        "db_bytes": 61718528,
+        "events": 121679,
+        "runs": 836,
+        "runs_with_dropped_events": 0,
+        "wal_bytes": 5158272
+      },
+      "tracker_calls_per_min": 164.6,
+      "warmup_secs": 60
+    }
+  ],
+  "scenario": "soak"
+}
