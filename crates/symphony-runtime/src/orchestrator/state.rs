@@ -263,6 +263,117 @@ impl Counter {
     }
 }
 
+/// The running agents by issue id, with an index from run id to issue id, so that an agent event
+/// or a worker message finds its entry without looking at the other entries.
+///
+/// The map is private: entries are added and removed only by [`Running::insert`],
+/// [`Running::remove`] and [`Running::drain`], and each updates the index in the same call. The
+/// index therefore has exactly one key per entry. This relies on run ids being unique (the
+/// orchestrator numbers its runs from one counter) and on an entry's `run_id` staying as it was
+/// inserted.
+#[derive(Debug, Default)]
+pub(crate) struct Running {
+    entries: HashMap<String, RunningEntry>,
+    issue_by_run: HashMap<u64, String>,
+}
+
+impl Running {
+    /// Adds the entry of `issue_id` and returns the entry it replaces, if any.
+    pub(crate) fn insert(&mut self, issue_id: String, entry: RunningEntry) -> Option<RunningEntry> {
+        let run_id = entry.run_id;
+        let replaced = self.entries.insert(issue_id.clone(), entry);
+        if let Some(replaced) = &replaced {
+            self.issue_by_run.remove(&replaced.run_id);
+        }
+        let other = self.issue_by_run.insert(run_id, issue_id);
+        debug_assert!(other.is_none(), "run id {run_id} is running twice");
+        replaced
+    }
+
+    /// Removes and returns the entry of `issue_id`.
+    pub(crate) fn remove(&mut self, issue_id: &str) -> Option<RunningEntry> {
+        let entry = self.entries.remove(issue_id)?;
+        self.issue_by_run.remove(&entry.run_id);
+        Some(entry)
+    }
+
+    /// Removes and returns every entry.
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (String, RunningEntry)> + '_ {
+        self.issue_by_run.clear();
+        self.entries.drain()
+    }
+
+    /// The issue id and the entry of run `run_id`. `None` once that run's entry was removed,
+    /// also when its issue is running again as a newer run.
+    pub(crate) fn by_run_mut(&mut self, run_id: u64) -> Option<(&str, &mut RunningEntry)> {
+        let issue_id = self.issue_by_run.get(&run_id)?;
+        let entry = self.entries.get_mut(issue_id)?;
+        // The index already says so. The comparison makes sure that a wrong index entry could
+        // only lose an event, never deliver it to another run.
+        (entry.run_id == run_id).then_some((issue_id.as_str(), entry))
+    }
+
+    /// The entry of `issue_id`.
+    pub(crate) fn get(&self, issue_id: &str) -> Option<&RunningEntry> {
+        self.entries.get(issue_id)
+    }
+
+    /// The entry of `issue_id`, to update it (never its `run_id`).
+    pub(crate) fn get_mut(&mut self, issue_id: &str) -> Option<&mut RunningEntry> {
+        self.entries.get_mut(issue_id)
+    }
+
+    /// Whether `issue_id` is running.
+    pub(crate) fn contains_key(&self, issue_id: &str) -> bool {
+        self.entries.contains_key(issue_id)
+    }
+
+    /// The number of running agents.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no agent is running.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The issue ids of the running agents, in no particular order.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.entries.keys()
+    }
+
+    /// The running entries, in no particular order.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &RunningEntry> {
+        self.entries.values()
+    }
+
+    /// Issue ids with their entries, in no particular order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &RunningEntry)> {
+        self.entries.iter()
+    }
+
+    /// Test check of the index: one key per entry, each pointing at the entry with that run id.
+    #[cfg(test)]
+    pub(crate) fn assert_index_matches(&self) {
+        assert_eq!(
+            self.issue_by_run.len(),
+            self.entries.len(),
+            "the run index has one key per running entry: {:?} for {:?}",
+            self.issue_by_run,
+            self.entries.keys().collect::<Vec<_>>()
+        );
+        for (issue_id, entry) in &self.entries {
+            assert_eq!(
+                self.issue_by_run.get(&entry.run_id),
+                Some(issue_id),
+                "run {} is indexed under its issue",
+                entry.run_id
+            );
+        }
+    }
+}
+
 /// Orchestrator scheduling state (single owner: the orchestrator task).
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -272,7 +383,7 @@ pub(crate) struct State {
     pub poll_check_in_progress: bool,
     pub tick_token: Option<u64>,
     pub tick_timer: Option<AbortHandle>,
-    pub running: HashMap<String, RunningEntry>,
+    pub running: Running,
     /// Bookkeeping only (never read for gating), like Elixir.
     pub completed: HashSet<String>,
     pub claimed: HashSet<String>,

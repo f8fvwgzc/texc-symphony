@@ -291,13 +291,9 @@ impl Orchestrator<'_> {
                 },
             );
         }
-        if let Some(limit) = max_tokens {
-            let used = self.state.spend.issue(issue_id).tokens;
-            if used >= limit {
-                return Some(format!(
-                    "task token limit exhausted: {used} of {limit} tokens used"
-                ));
-            }
+        if let Some(stop) = max_tokens.and_then(|limit| self.state.spend.task_stop(issue_id, limit))
+        {
+            return Some(stop);
         }
         self.state
             .spend

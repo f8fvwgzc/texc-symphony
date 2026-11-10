@@ -1,7 +1,8 @@
 # Performance
 
 How the orchestrator and the store behave under load, measured with the load harness in
-[`crates/symphony/benches/load`](../crates/symphony/benches/load). Every number on this page
+[`crates/symphony/benches/load`](../crates/symphony/benches/load). Every number on this page,
+except in the [update](#update-2026-11-10-the-event-path) that follows,
 comes from one run of the command below on 2026-11-10, at commit `f877d3a`, on one laptop
 ([Machine](#machine)). They describe that run: they are evidence, not guarantees for other
 hardware, for a real tracker or for real agents.
@@ -11,6 +12,43 @@ cargo bench -p symphony --bench load
 ```
 
 The run takes about 50 minutes. Its raw results are in [`performance/results`](performance/results).
+
+## Update, 2026-11-10: the event path
+
+After that run, [bottlenecks 3 and 4](#bottlenecks-ranked) were fixed. The orchestrator no longer
+reads `WORKFLOW.md` after an agent event: it re-reads the file at each tick, poll cycle, due retry
+and snapshot, and uses the loaded settings in between
+([Reloading](configuration.md#reloading)). An event finds its run through an index by run id,
+and after it only the kill switch, the daily budget and the limits of that event's issue are
+checked. The rest of this page still describes `f877d3a`.
+
+`cargo bench -p symphony --bench load -- events --agents 10,100,500`, one run on the same
+machine:
+
+| Highest event rate that kept up | 10 agents | 100 agents | 500 agents |
+|---|---|---|---|
+| Before (`f877d3a`) | 40,000/s | 35,000/s | 25,000/s |
+| After | 400,000/s | 400,000/s | 200,000/s |
+
+- 400,000 events/s is the top of the ramp, so the limit at 10 and 100 agents was not reached.
+  At 500 agents the 400,000 step did not keep up (237,000 integrated per second). A second ramp
+  at 500 agents in steps of 50,000 kept up at every step to its last, 350,000 events/s.
+- In a profile at 500 agents and 100,000 events/s (30 s) the orchestrator task used 3.3 µs of
+  CPU per event (before: 38 µs). `WorkflowStore::reload` and `Spend::issue_stop`, 39.6 % and
+  17.4 % of the process's CPU in the [profile of `f877d3a`](#cpu-profiles), were 0.1 % each.
+- The store is the limit now ([bottleneck 6](#bottlenecks-ranked)). A tenth of the events of
+  this mix are history rows, and the store wrote at most 11,000 of them per second at 500
+  agents, 15,000 at 100 and 20,000 at 10. Above that (from the 150,000, 200,000 and 400,000
+  steps) the recorders' queues filled: every run dropped history events (usage totals and the
+  final status are still written) and resident memory peaked at 1.8 GiB, 0.6 GiB and 0.1 GiB.
+- One cost per event still grows with the number of agents: the orchestrator polls the event
+  streams of idle runs until it finds one with an event (`tokio_stream::StreamMap`). Popping
+  the channels and registering wakers, useful or not, was 3.0 % of the process's CPU in that
+  profile.
+- A dispatch no longer reads the file either: in a burst of 500 without tracker delay the last
+  worker started after 118 ms (before: 153 ms), 0.19 ms per dispatch (before: 0.26 ms).
+
+The results are in [`performance/results/event-path`](performance/results/event-path).
 
 ## Summary
 
@@ -369,7 +407,8 @@ Ranked by how much each limits a 500-agent deployment that wants to call itself 
    agents events waited up to 16.7 s to be integrated, the SSE stream paused for 15.2 s, one of
    904 snapshots timed out, resident memory rose from 51 MiB to as much as 150 MiB while events
    queued, and slots in use fell from 80 % to 69 %.
-3. **`WORKFLOW.md` is read and hashed on every `settings()` call.** `WorkflowStore::settings()`
+3. **`WORKFLOW.md` is read and hashed on every `settings()` call.** (Fixed for the orchestrator's
+   event and dispatch paths: [update](#update-2026-11-10-the-event-path).) `WorkflowStore::settings()`
    calls `reload()`, which stats, reads and SipHashes the file (`current_stamp`,
    `crates/symphony-core/src/workflow_store.rs`). `enforce_spend()` asks for the settings after
    every agent event; a dispatch asks five times. Evidence: 39.6 % of process CPU in the event
@@ -377,7 +416,8 @@ Ranked by how much each limits a 500-agent deployment that wants to call itself 
    events/s. [Experiment X1](#throwaway-experiments) (use the already loaded settings in
    `enforce_spend`) raised the ceiling to 50,000 at 500 agents and to 200,000 or more at 10 and
    100.
-4. **Work per event grows with the number of running agents.** `enforce_spend()` checks the
+4. **Work per event grows with the number of running agents.** (Fixed:
+   [update](#update-2026-11-10-the-event-path).) `enforce_spend()` checks the
    budget of every running issue after each event (17.4 % of CPU at 500 agents), and
    `handle_codex_event` finds its entry by scanning the running entries. Evidence: the ceiling
    falls from 40,000 events/s at 10 agents to 25,000 at 500; with X1 in place the gap is
