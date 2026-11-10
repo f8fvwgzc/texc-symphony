@@ -1,0 +1,160 @@
+{
+  "host": {
+    "arch": "aarch64",
+    "logical_cpus": 10,
+    "os": "macos"
+  },
+  "recorded_at": "2026-11-09T22:36:35.013527+00:00",
+  "results": [
+    {
+      "agents": 100,
+      "events_per_agent_per_sec": 10.0,
+      "freed_slot_idle": {
+        "max_ms": 32869.609,
+        "mean_ms": 16997.42,
+        "min_ms": 629.367,
+        "n": 176,
+        "p50_ms": 16994.429,
+        "p90_ms": 29441.251,
+        "p99_ms": 32415.322
+      },
+      "integrated_per_sec": 767.0,
+      "log": {
+        "errors": 0,
+        "other_warnings": {
+          "Retrying in (attempt": 197
+        },
+        "recorder_dropped_events": 0,
+        "store_busy": 0
+      },
+      "mean_run_secs": 60,
+      "occupancy": 0.766,
+      "offered_per_sec": 763.0,
+      "poll_interval_ms": 30000,
+      "refill_wave": {
+        "duration": {
+          "max_ms": 2840.428,
+          "mean_ms": 1772.001,
+          "min_ms": 205.435,
+          "n": 5,
+          "p50_ms": 2081.373,
+          "p90_ms": 2840.428,
+          "p99_ms": 2840.428
+        },
+        "max_starts": 56.0,
+        "mean_starts": 35.2,
+        "waves": 5
+      },
+      "rss_mib": {
+        "after_warmup": 28.563,
+        "end": 30.984,
+        "max": 31.438,
+        "slope_per_min": -0.489
+      },
+      "runs_started": 276,
+      "seconds_measured": 120.006,
+      "secs": 180,
+      "series": [
+        {
+          "mean_running": 99.6,
+          "queue_delay_max_ms": 43.359,
+          "rss_bytes": 34193408,
+          "snapshot_p99_ms": 1.183,
+          "t_secs": 30.0
+        },
+        {
+          "mean_running": 87.745,
+          "queue_delay_max_ms": 371.234,
+          "rss_bytes": 29687808,
+          "snapshot_p99_ms": 33.749,
+          "t_secs": 60.0
+        },
+        {
+          "mean_running": 72.364,
+          "queue_delay_max_ms": 2348.448,
+          "rss_bytes": 32899072,
+          "snapshot_p99_ms": 46.005,
+          "t_secs": 90.0
+        },
+        {
+          "mean_running": 77.783,
+          "queue_delay_max_ms": 2999.526,
+          "rss_bytes": 30949376,
+          "snapshot_p99_ms": 49.186,
+          "t_secs": 120.0
+        },
+        {
+          "mean_running": 81.206,
+          "queue_delay_max_ms": 1623.585,
+          "rss_bytes": 30588928,
+          "snapshot_p99_ms": 44.013,
+          "t_secs": 150.0
+        },
+        {
+          "mean_running": 75.011,
+          "queue_delay_max_ms": 2554.141,
+          "rss_bytes": 32489472,
+          "snapshot_p99_ms": 48.363,
+          "t_secs": 180.0
+        }
+      ],
+      "snapshot": {
+        "event_queue_delay": {
+          "max_ms": 2999.526,
+          "mean_ms": 32.763,
+          "min_ms": 0.052,
+          "n": 1115,
+          "p50_ms": 6.304,
+          "p90_ms": 23.198,
+          "p99_ms": 369.185
+        },
+        "failed": 0,
+        "latency": {
+          "max_ms": 2916.811,
+          "mean_ms": 10.397,
+          "min_ms": 0.096,
+          "n": 1115,
+          "p50_ms": 0.252,
+          "p90_ms": 1.193,
+          "p99_ms": 46.807
+        },
+        "mean_running": 76.617
+      },
+      "sse": {
+        "delivery": {
+          "max_ms": 2996.19,
+          "mean_ms": 26.198,
+          "min_ms": 0.0,
+          "n": 547,
+          "p50_ms": 3.002,
+          "p90_ms": 23.024,
+          "p99_ms": 79.85
+        },
+        "frames": 547,
+        "gap": {
+          "max_ms": 3079.259,
+          "mean_ms": 219.557,
+          "min_ms": 200.493,
+          "n": 546,
+          "p50_ms": 202.101,
+          "p90_ms": 204.226,
+          "p99_ms": 251.224
+        },
+        "max_frame_bytes": 50997,
+        "mean_frame_bytes": 40531.0
+      },
+      "sse_error": null,
+      "store": {
+        "db_bytes": 18128896,
+        "events": 35266,
+        "runs": 276,
+        "runs_with_dropped_events": 0,
+        "wal_bytes": 4346632
+      },
+      "tracker_calls_per_min": 160.333,
+      "tracker_latency_ms": 50,
+      "warmup_secs": 36
+    }
+  ],
+  "scenario": "soak"
+}

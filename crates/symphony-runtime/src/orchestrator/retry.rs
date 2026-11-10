@@ -221,7 +221,9 @@ impl Orchestrator<'_> {
         attempt: u32,
         meta: RetryMeta,
     ) {
-        let settings = self.settings();
+        // A due retry can dispatch, so it starts from the current `WORKFLOW.md` (while the file
+        // is invalid, from the last good one: only a poll cycle holds dispatch back for that).
+        let settings = self.reload_settings();
         let ids = [issue_id.to_owned()];
         match self.ctx.tracker.fetch_issues_by_ids(&settings, &ids).await {
             Err(err) => {

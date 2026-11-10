@@ -1,0 +1,85 @@
+On-CPU samples: 4.48 s (the kernel's thread counters say 4.86 s)
+
+Self time (the function itself, callees excluded)
+ 14.37 %  __open
+ 10.87 %  pwrite
+  8.48 %  core::intrinsics::rotate_left::<u64>
+  4.31 %  _platform_memmove
+  3.28 %  fsync
+  3.26 %  stat
+  2.99 %  __fcntl
+  2.95 %  __psynch_cvsignal
+  2.05 %  read
+  1.94 %  std::sys::alloc::unix::alloc
+  1.23 %  0x2b4fc
+  1.14 %  _platform_memset
+  1.05 %  0x2a1cc
+  0.96 %  mach_absolute_time
+  0.89 %  walChecksumBytes
+  0.83 %  0x3a0c8
+  0.80 %  0x300e0
+  0.78 %  close
+  0.69 %  0x3a120
+  0.65 %  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.60 %  0x2b730
+  0.54 %  0x2a230
+  0.54 %  0x301dc
+  0.54 %  <str>::to_lowercase
+  0.54 %  fstat
+  0.54 %  sqlite3VdbeExec
+  0.51 %  0x2b198
+  0.49 %  0x3a0f4
+  0.49 %  core::ptr::drop_glue::<symphony_core::issue::Issue>
+  0.47 %  0x3acd0
+  0.47 %  0x3ad1c
+  0.47 %  pthread_mutex_lock
+  0.45 %  0xb83454
+  0.45 %  _platform_memcmp
+  0.42 %  0x2b5f0
+  0.38 %  0x2ff94
+  0.38 %  __unlinkat
+  0.36 %  0x2b200
+  0.36 %  0x2ff48
+  0.36 %  0x2ff88
+
+Inclusive time (the function and everything it calls)
+ 94.47 %  _pthread_start
+ 94.44 %  <std::sys::thread::unix::Thread>::new::thread_start
+ 65.72 %  <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 65.72 %  <std::sync::poison::condvar::Condvar>::wait_timeout::<tokio::runtime::blocking::pool::LockedInner>
+ 65.72 %  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+ 65.72 %  <tokio::runtime::blocking::pool::Inner>::run
+ 65.72 %  <tokio::runtime::blocking::pool::InnerImpl>::run_worker
+ 65.72 %  <tokio::runtime::blocking::pool::LockedImpl>::run_worker
+ 65.72 %  <tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}
+ 65.72 %  std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 65.72 %  std::panicking::catch_unwind::<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>>
+ 65.72 %  std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 65.72 %  std::sys::backtrace::__rust_begin_short_backtrace::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>
+ 65.72 %  std::thread::lifecycle::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}
+ 65.72 %  std::thread::lifecycle::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}
+ 65.72 %  symphony
+ 65.70 %  <core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 65.70 %  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::try_with::<tokio::runtime::context::set_scheduler<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>::{closure#0}, ()>
+ 65.70 %  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::set_scheduler<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>::{closure#0}, ()>
+ 65.70 %  <tokio::loom::std::unsafe_cell::UnsafeCell<tokio::runtime::task::core::Stage<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>>>>::with_mut::<core::task::poll::Poll<()>, <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll::{closure#0}>
+ 65.70 %  <tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}> as core::future::future::Future>::poll
+ 65.70 %  <tokio::runtime::context::scoped::Scoped<tokio::runtime::scheduler::Context>>::set::<tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}, ()>
+ 65.70 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::maintenance
+ 65.70 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_yield
+ 65.70 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::run
+ 65.70 %  <tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}
+ 65.70 %  <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll
+ 65.70 %  <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll::{closure#0}
+ 65.70 %  <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll
+ 65.70 %  <tokio::runtime::task::harness::Harness<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll_inner
+ 65.70 %  std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::{closure#0}>, core::task::poll::Poll<()>>
+ 65.70 %  std::panicking::catch_unwind::<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::{closure#0}>>
+ 65.70 %  std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::{closure#0}>, core::task::poll::Poll<()>>
+ 65.70 %  tokio::runtime::context::runtime::enter_runtime::<tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}, ()>
+ 65.70 %  tokio::runtime::context::set_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>
+ 65.70 %  tokio::runtime::context::set_scheduler::<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>::{closure#0}
+ 65.70 %  tokio::runtime::scheduler::multi_thread::worker::run
+ 65.70 %  tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}
+ 65.70 %  tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}
+ 65.70 %  tokio::runtime::task::harness::poll_future::<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>

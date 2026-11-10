@@ -12,12 +12,7 @@ impl Orchestrator<'_> {
                 worker_host,
                 workspace_path,
             } => {
-                let Some(entry) = self
-                    .state
-                    .running
-                    .values_mut()
-                    .find(|entry| entry.run_id == run_id)
-                else {
+                let Some((_, entry)) = self.state.running.by_run_mut(run_id) else {
                     return;
                 };
                 if worker_host.is_some() {
@@ -34,9 +29,8 @@ impl Orchestrator<'_> {
                 if let Some(task) = self
                     .state
                     .running
-                    .values_mut()
-                    .find(|entry| entry.run_id == run_id)
-                    .and_then(|entry| entry.task.as_mut())
+                    .by_run_mut(run_id)
+                    .and_then(|(_, entry)| entry.task.as_mut())
                 {
                     task.result = Some(result);
                 }
@@ -44,16 +38,12 @@ impl Orchestrator<'_> {
         }
     }
 
-    /// `handle_info({:codex_worker_update, ...})` for a running entry of the same run.
-    pub(crate) fn handle_codex_event(&mut self, run_id: u64, event: CodexEvent) {
-        let Some(entry) = self
-            .state
-            .running
-            .values_mut()
-            .find(|entry| entry.run_id == run_id)
-        else {
-            return;
-        };
+    /// `handle_info({:codex_worker_update, ...})` for a running entry of the same run. Returns
+    /// the issue the event was integrated into (`None`: the run is not running any more), for
+    /// [`Self::enforce_spend_after_event`].
+    pub(crate) fn handle_codex_event(&mut self, run_id: u64, event: CodexEvent) -> Option<String> {
+        let (issue_id, entry) = self.state.running.by_run_mut(run_id)?;
+        let issue_id = issue_id.to_owned();
         let (delta, new_turn) = entry.integrate(&event, Instant::now());
         entry.recorder.event(&event);
         if new_turn {
@@ -64,7 +54,6 @@ impl Orchestrator<'_> {
             entry
                 .recorder
                 .usage(entry.tokens.totals, entry.cost_micro_usd);
-            let issue_id = entry.issue.id.clone().unwrap_or_default();
             self.state
                 .spend
                 .record(&issue_id, delta.processed(), cost_delta, Utc::now());
@@ -79,6 +68,7 @@ impl Orchestrator<'_> {
             self.state.codex_rate_limits = Some(rate_limits);
         }
         self.notify();
+        Some(issue_id)
     }
 
     pub(crate) fn drain_worker_messages(&mut self) {

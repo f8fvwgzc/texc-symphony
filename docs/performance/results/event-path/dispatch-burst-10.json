@@ -1,0 +1,67 @@
+{
+  "host": {
+    "arch": "aarch64",
+    "logical_cpus": 10,
+    "os": "macos"
+  },
+  "recorded_at": "2026-11-10T07:43:36.569192+00:00",
+  "results": [
+    {
+      "agents": 10,
+      "all_started": {
+        "max_ms": 25.115,
+        "mean_ms": 24.193,
+        "min_ms": 23.314,
+        "n": 5,
+        "p50_ms": 24.211,
+        "p90_ms": 25.115,
+        "p99_ms": 25.115
+      },
+      "eligible_to_start": {
+        "max_ms": 25.115,
+        "mean_ms": 23.592,
+        "min_ms": 22.654,
+        "n": 50,
+        "p50_ms": 23.543,
+        "p90_ms": 24.399,
+        "p99_ms": 25.115
+      },
+      "first_start": {
+        "max_ms": 23.752,
+        "mean_ms": 22.976,
+        "min_ms": 22.654,
+        "n": 5,
+        "p50_ms": 22.756,
+        "p90_ms": 23.752,
+        "p99_ms": 23.752
+      },
+      "per_dispatch_ms": 0.151,
+      "rounds": 5,
+      "snapshot_during_burst": {
+        "event_queue_delay": {
+          "max_ms": 0.0,
+          "mean_ms": 0.0,
+          "min_ms": 0.0,
+          "n": 10,
+          "p50_ms": 0.0,
+          "p90_ms": 0.0,
+          "p99_ms": 0.0
+        },
+        "failed": 0,
+        "latency": {
+          "max_ms": 2.434,
+          "mean_ms": 0.319,
+          "min_ms": 0.047,
+          "n": 10,
+          "p50_ms": 0.082,
+          "p90_ms": 0.129,
+          "p99_ms": 2.434
+        },
+        "mean_running": 1.0
+      },
+      "tracker_calls_per_round": 11,
+      "tracker_latency_ms": 0
+    }
+  ],
+  "scenario": "dispatch-burst"
+}

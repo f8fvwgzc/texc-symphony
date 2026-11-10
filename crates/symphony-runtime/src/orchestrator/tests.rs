@@ -2,7 +2,7 @@
 //! and B.13.3, plus the Rust improvements). Workers are fakes from [`FnWorkerFactory`]; timing tests
 //! run on tokio's paused clock, tests that run hook subprocesses use real time.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,13 +74,15 @@ impl Harness {
     }
 }
 
-/// Steps until `done` holds (bounded number of events).
+/// Steps until `done` holds (bounded number of events). After every step the run index must
+/// match the running entries, whatever the step added or removed.
 async fn run_until(orch: &mut Orchestrator<'_>, done: impl Fn(&Orchestrator<'_>) -> bool) {
     for _ in 0..500 {
         if done(orch) {
             return;
         }
         assert!(orch.step().await, "orchestrator stopped");
+        orch.state.running.assert_index_matches();
     }
     panic!("condition not reached");
 }
@@ -179,9 +181,11 @@ fn retry_due_in(orch: &Orchestrator<'_>, id: &str) -> u128 {
 
 /// Puts a synthetic running entry (no real worker) into the state.
 fn fake_entry(identifier: &str, issue: Issue, worker_host: Option<&str>) -> RunningEntry {
+    // Unique like real run ids, and far above them (an orchestrator counts its runs up from 1).
+    static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1 << 40);
     let now = Instant::now();
     RunningEntry {
-        run_id: 0,
+        run_id: NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed),
         worker: None,
         identifier: identifier.into(),
         issue,
@@ -1216,7 +1220,13 @@ async fn reconcile_updates_running_issue_state_for_active_issues() {
     orch.reconcile_running_issues().await;
     assert!(orch.state.claimed.contains("i-1"));
     assert_eq!(
-        orch.state.running["i-1"].issue.state.as_deref(),
+        orch.state
+            .running
+            .get("i-1")
+            .unwrap()
+            .issue
+            .state
+            .as_deref(),
         Some("In Progress")
     );
 }
@@ -1279,7 +1289,7 @@ async fn stale_codex_events_never_reach_a_newer_run() {
             () = tokio::time::sleep(ms(10)) => {}
         }
     }
-    assert_eq!(orch.state.running["i-1"].session_id, None);
+    assert_eq!(orch.state.running.get("i-1").unwrap().session_id, None);
     assert_eq!(generation.load(Ordering::SeqCst), 2);
 }
 
@@ -1861,7 +1871,7 @@ async fn queued_tasks_run_once_and_record_their_result() {
     let issue_id = format!("task:{id}");
     assert!(orch.state.running.contains_key(&issue_id));
     assert_eq!(
-        orch.state.running[&issue_id].identifier,
+        orch.state.running.get(&issue_id).unwrap().identifier,
         format!("task-{id}")
     );
     run_until(&mut orch, |o| o.state.running.is_empty()).await;
@@ -2781,4 +2791,501 @@ async fn task_workspaces_are_separate_from_tracker_issues_and_removed_when_final
     }
     assert!(!workspace.exists());
     assert!(kept.exists());
+}
+
+// ----- the per-event path: run index, loaded settings, spend check of one issue --------------------
+
+/// What a test holds of a worker started by [`fed_factory`]: its event sink and a way to end it.
+struct Fed {
+    events: EventSink,
+    exit: mpsc::UnboundedSender<WorkerResult>,
+}
+
+/// The workers a [`fed_factory`] started, by issue id (the newest run of each issue).
+type Feds = Arc<Mutex<std::collections::HashMap<String, Fed>>>;
+
+/// Worker that does nothing by itself: the test emits its events ([`feed`]) and ends it
+/// ([`end_run`]); until then it runs until it is cancelled.
+fn fed_factory(feds: Feds) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        let (exit, mut exits) = mpsc::unbounded_channel();
+        feds.lock().unwrap().insert(
+            ctx.issue.id.clone().unwrap_or_default(),
+            Fed {
+                events: ctx.events.clone(),
+                exit,
+            },
+        );
+        async move {
+            tokio::select! {
+                () = ctx.cancel.cancelled() => Err(RunError::Cancelled),
+                Some(result) = exits.recv() => result,
+            }
+        }
+    }))
+}
+
+/// Emits `event` as the running agent of `issue_id` and steps the orchestrator until it has
+/// integrated it: the entry carries the event's time, or the event stopped the run.
+async fn feed(orch: &mut Orchestrator<'_>, feds: &Feds, issue_id: &str, mut event: CodexEvent) {
+    let entry = orch.state.running.get(issue_id).expect("issue is running");
+    // Later than the entry's last event, whatever the clock's resolution.
+    if let Some(last) = entry.last_codex_timestamp {
+        event.timestamp = event
+            .timestamp
+            .max(last + chrono::Duration::microseconds(1));
+    }
+    let at = event.timestamp;
+    feds.lock().unwrap()[issue_id].events.emit(event);
+    run_until(orch, |o| {
+        o.state
+            .running
+            .get(issue_id)
+            .is_none_or(|entry| entry.last_codex_timestamp == Some(at))
+    })
+    .await;
+}
+
+/// Ends the worker of `issue_id` with `result` and steps until the orchestrator handled its exit.
+async fn end_run(orch: &mut Orchestrator<'_>, feds: &Feds, issue_id: &str, result: WorkerResult) {
+    let run_id = orch.state.running.get(issue_id).expect("running").run_id;
+    feds.lock().unwrap()[issue_id].exit.send(result).unwrap();
+    run_until(orch, |o| {
+        o.state
+            .running
+            .get(issue_id)
+            .is_none_or(|entry| entry.run_id != run_id)
+    })
+    .await;
+}
+
+fn some_event() -> CodexEvent {
+    notification(json!({"method": "some-event"}))
+}
+
+/// `i-1` and `i-2` running on fed workers.
+async fn dispatch_two(h: &Harness, orch: &mut Orchestrator<'_>) {
+    let issues = vec![
+        issue("i-1", "MT-1", "In Progress"),
+        issue("i-2", "MT-2", "In Progress"),
+    ];
+    h.memory.set(issues.clone());
+    for issue in issues {
+        orch.dispatch_issue(issue, None, None).await;
+    }
+    assert_eq!(orch.state.running.len(), 2);
+}
+
+#[tokio::test]
+async fn the_run_index_follows_inserts_replacements_removals_and_drains() {
+    let entry = |id: &str| fake_entry(id, issue(id, id, "Todo"), None);
+    let issue_of = |running: &mut state::Running, run_id: u64| {
+        running.by_run_mut(run_id).map(|(id, _)| id.to_owned())
+    };
+    let mut running = state::Running::default();
+    let (a, b) = (entry("a"), entry("b"));
+    let (run_a, run_b) = (a.run_id, b.run_id);
+    assert!(running.insert("a".into(), a).is_none());
+    assert!(running.insert("b".into(), b).is_none());
+    running.assert_index_matches();
+    assert_eq!(issue_of(&mut running, run_a).as_deref(), Some("a"));
+    assert_eq!(issue_of(&mut running, run_b).as_deref(), Some("b"));
+    assert_eq!(issue_of(&mut running, run_b + 1), None);
+
+    // A newer run of the same issue replaces the entry, and the older run is not found again.
+    let rerun = entry("a");
+    let run_a2 = rerun.run_id;
+    assert_eq!(running.insert("a".into(), rerun).unwrap().run_id, run_a);
+    running.assert_index_matches();
+    assert_eq!(issue_of(&mut running, run_a), None);
+    assert_eq!(issue_of(&mut running, run_a2).as_deref(), Some("a"));
+
+    assert_eq!(running.remove("a").unwrap().run_id, run_a2);
+    assert!(running.remove("a").is_none());
+    running.assert_index_matches();
+    assert_eq!(issue_of(&mut running, run_a2), None);
+    assert_eq!(issue_of(&mut running, run_b).as_deref(), Some("b"));
+
+    assert_eq!(running.drain().count(), 1);
+    assert!(running.is_empty());
+    running.assert_index_matches();
+    assert_eq!(issue_of(&mut running, run_b), None);
+
+    // The lookup compares the entry's own run id too: an index entry that pointed at another
+    // run's entry would find nothing instead of delivering to it.
+    let c = entry("c");
+    let run_c = c.run_id;
+    running.insert("c".into(), c);
+    running.get_mut("c").unwrap().run_id = run_c + 1;
+    assert_eq!(issue_of(&mut running, run_c), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_and_worker_messages_reach_their_own_run_and_stale_ones_reach_none() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(json!({}), fed_factory(Arc::clone(&feds)));
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    dispatch_two(&h, &mut orch).await;
+    let run_1 = orch.state.running.get("i-1").unwrap().run_id;
+    let run_2 = orch.state.running.get("i-2").unwrap().run_id;
+    let info = |run_id, path: &str| WorkerMessage::RuntimeInfo {
+        run_id,
+        worker_host: None,
+        workspace_path: path.to_owned(),
+    };
+
+    let integrated = orch.handle_codex_event(run_2, session_started("s-2"));
+    assert_eq!(integrated.as_deref(), Some("i-2"));
+    orch.handle_worker_message(info(run_1, "/w/MT-1"));
+    let (one, two) = (
+        orch.state.running.get("i-1").unwrap(),
+        orch.state.running.get("i-2").unwrap(),
+    );
+    assert_eq!(
+        (one.session_id.as_deref(), one.workspace_path.as_deref()),
+        (None, Some("/w/MT-1"))
+    );
+    assert_eq!(
+        (two.session_id.as_deref(), two.workspace_path.as_deref()),
+        (Some("s-2"), None)
+    );
+
+    // `i-1` stops and runs again as a newer run: whatever the old run still sends finds nothing.
+    orch.terminate_running_issue("i-1", false, "test").await;
+    assert_eq!(
+        orch.handle_codex_event(run_1, session_started("late")),
+        None
+    );
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    assert_ne!(orch.state.running.get("i-1").unwrap().run_id, run_1);
+    assert_eq!(
+        orch.handle_codex_event(run_1, session_started("late")),
+        None
+    );
+    orch.handle_worker_message(info(run_1, "/w/late"));
+    orch.handle_worker_message(WorkerMessage::TaskResult {
+        run_id: run_1,
+        result: "late".into(),
+    });
+    let rerun = orch.state.running.get("i-1").unwrap();
+    assert_eq!(
+        (rerun.session_id.as_deref(), &rerun.workspace_path),
+        (None, &None)
+    );
+    orch.state.running.assert_index_matches();
+    orch.stop_all_workers().await;
+}
+
+/// The run index has no entry of a run that ended, whichever way it ended: an agent event of that
+/// run finds nothing afterwards, and the index still matches the running entries.
+#[tokio::test(start_paused = true)]
+async fn every_way_a_run_ends_takes_it_out_of_the_run_index() {
+    // A shared store, so runs are watched by the lease watchdog (the fence below needs it).
+    let store = Store::open_in_memory_shared().unwrap();
+    let feds: Feds = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"codex": {"stall_timeout_ms": 1000}}),
+        fed_factory(Arc::clone(&feds)),
+        store,
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+
+    /// Starts a run of `id` and returns its run id.
+    async fn start(h: &Harness, orch: &mut Orchestrator<'_>, id: &str) -> u64 {
+        let issue = issue(id, &id.to_uppercase(), "In Progress");
+        h.memory.set(vec![issue.clone()]);
+        orch.dispatch_issue(issue, None, None).await;
+        orch.state.running.assert_index_matches();
+        orch.state.running.get(id).expect("dispatched").run_id
+    }
+    /// The run is gone from the entries and from the index; the issue is let go for the next case.
+    fn ended(orch: &mut Orchestrator<'_>, id: &str, run_id: u64, how: &str) {
+        assert!(!orch.state.running.contains_key(id), "{how}: still running");
+        orch.state.running.assert_index_matches();
+        assert_eq!(
+            orch.handle_codex_event(run_id, some_event()),
+            None,
+            "{how}: an event of the ended run found an entry"
+        );
+        orch.release_issue_claim(id);
+    }
+
+    let run = start(&h, &mut orch, "exit-ok").await;
+    end_run(&mut orch, &feds, "exit-ok", Ok(())).await;
+    ended(&mut orch, "exit-ok", run, "normal worker exit");
+
+    let run = start(&h, &mut orch, "exit-err").await;
+    let failure = Err(RunError::Other("boom".into()));
+    end_run(&mut orch, &feds, "exit-err", failure).await;
+    ended(&mut orch, "exit-err", run, "failed worker exit");
+
+    let run = start(&h, &mut orch, "terminated").await;
+    orch.terminate_running_issue("terminated", false, "test")
+        .await;
+    ended(&mut orch, "terminated", run, "terminate");
+
+    let run = start(&h, &mut orch, "lease-lost").await;
+    orch.abandon_running_issue("lease-lost", "dispatch lease lost")
+        .await;
+    ended(&mut orch, "lease-lost", run, "abandon after a lost lease");
+
+    let run = start(&h, &mut orch, "blocked").await;
+    orch.stop_and_block("blocked", "issue token budget exhausted".into())
+        .await;
+    ended(&mut orch, "blocked", run, "stop and block");
+
+    // Stalled while waiting for operator input: blocked by the stall check.
+    let run = start(&h, &mut orch, "stalled").await;
+    feed(&mut orch, &feds, "stalled", input_required()).await;
+    tokio::time::advance(ms(5_000)).await;
+    orch.reconcile_stalled_running_issues().await;
+    assert!(orch.state.blocked.contains_key("stalled"));
+    ended(&mut orch, "stalled", run, "stall of a blocked agent");
+
+    // Fenced by the lease watchdog: the worker's `Cancelled` exit is an abandon.
+    let run = start(&h, &mut orch, "fenced").await;
+    {
+        let mut watches = orch.lease_watch.lock().unwrap();
+        let watch = watches.get_mut("fenced").expect("the run is watched");
+        watch.fenced = true;
+        watch.cancel.cancel();
+    }
+    run_until(&mut orch, |o| !o.state.running.contains_key("fenced")).await;
+    ended(&mut orch, "fenced", run, "lease fence");
+
+    // Shutdown ends whatever is still running.
+    let run_a = start(&h, &mut orch, "last-a").await;
+    let run_b = start(&h, &mut orch, "last-b").await;
+    assert_eq!(orch.state.running.len(), 2);
+    orch.stop_all_workers().await;
+    ended(&mut orch, "last-a", run_a, "shutdown");
+    ended(&mut orch, "last-b", run_b, "shutdown");
+    assert!(orch.state.running.is_empty());
+}
+
+/// The kill switch, engaged without the full check that follows a command, stops every running
+/// agent at the next event of any one of them.
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_stops_every_agent_at_the_next_agent_event() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(json!({}), fed_factory(Arc::clone(&feds)));
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    dispatch_two(&h, &mut orch).await;
+
+    feed(&mut orch, &feds, "i-2", some_event()).await;
+    assert_eq!(orch.state.running.len(), 2, "not paused: both keep running");
+
+    assert!(orch.set_paused(true, Some("incident".into())).paused);
+    feed(&mut orch, &feds, "i-2", some_event()).await;
+    assert!(orch.state.running.is_empty(), "i-1 had no event of its own");
+    // Stopped, not blocked: both run again once the switch is released.
+    assert!(orch.state.claimed.is_empty());
+    assert!(orch.state.blocked.is_empty());
+}
+
+/// The daily budget, reached by one agent's usage, stops every running agent in the same step.
+#[tokio::test(start_paused = true)]
+async fn an_exhausted_day_stops_every_agent_at_the_event_that_reached_the_budget() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(
+        json!({"budget": {"max_tokens_per_day": 50}}),
+        fed_factory(Arc::clone(&feds)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    dispatch_two(&h, &mut orch).await;
+
+    feed(&mut orch, &feds, "i-1", usage_event(30, 10)).await;
+    assert_eq!(
+        orch.state.running.len(),
+        2,
+        "40 of 50 tokens: both keep running"
+    );
+
+    feed(&mut orch, &feds, "i-1", usage_event(40, 20)).await;
+    assert!(orch.state.running.is_empty(), "i-2 had no event of its own");
+    assert!(orch.state.claimed.is_empty());
+    assert!(orch.state.blocked.is_empty());
+    assert_eq!(
+        orch.snapshot().spend.stopped_reason.as_deref(),
+        Some("daily token budget exhausted: 60 of 50 tokens used today (UTC)")
+    );
+}
+
+/// An issue budget stops the issue whose usage reached it, when it reaches it, and no other.
+#[tokio::test(start_paused = true)]
+async fn an_issue_budget_stops_the_issue_whose_event_reached_it_and_no_other() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(
+        json!({"budget": {"max_tokens_per_issue": 100}}),
+        fed_factory(Arc::clone(&feds)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    dispatch_two(&h, &mut orch).await;
+
+    feed(&mut orch, &feds, "i-1", usage_event(60, 10)).await;
+    feed(&mut orch, &feds, "i-2", usage_event(100, 20)).await;
+    assert_eq!(
+        orch.state.blocked["i-2"].error,
+        "issue token budget exhausted: 120 of 100 tokens used"
+    );
+    assert!(orch.state.running.contains_key("i-1"), "70 of 100 tokens");
+    assert!(!orch.state.blocked.contains_key("i-1"));
+
+    feed(&mut orch, &feds, "i-1", usage_event(90, 20)).await;
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "issue token budget exhausted: 110 of 100 tokens used"
+    );
+    assert!(orch.state.running.is_empty());
+}
+
+/// A task's token limit fails the task whose usage reached it and leaves the other task running.
+#[tokio::test(start_paused = true)]
+async fn a_task_token_limit_stops_the_task_whose_event_reached_it_and_no_other() {
+    use symphony_store::TaskStatus;
+    let store = Store::open_in_memory().unwrap();
+    let mut tasks = Vec::new();
+    for max_tokens in [50, 500] {
+        let task = store
+            .create_task(symphony_store::NewTask {
+                prompt: "x".into(),
+                limits: symphony_store::TaskLimits {
+                    max_tokens: Some(max_tokens),
+                    timeout_ms: None,
+                },
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tasks.push(task.id);
+    }
+    let (small, large) = (task_issue_id(tasks[0]), task_issue_id(tasks[1]));
+    let feds: Feds = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        fed_factory(Arc::clone(&feds)),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    assert_eq!(orch.state.running.len(), 2);
+
+    // The same usage is over the first task's limit and within the second's.
+    feed(&mut orch, &feds, &large, usage_event(40, 20)).await;
+    assert_eq!(orch.state.running.len(), 2);
+    feed(&mut orch, &feds, &small, usage_event(40, 20)).await;
+    assert!(!orch.state.running.contains_key(&small));
+    assert!(orch.state.running.contains_key(&large));
+    let failed = task_status(&store, tasks[0], TaskStatus::Failed).await;
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("task token limit exhausted: 60 of 50 tokens used")
+    );
+    assert_eq!(
+        store.get_task(tasks[1]).await.unwrap().unwrap().status,
+        TaskStatus::Running
+    );
+    orch.stop_all_workers().await;
+}
+
+/// An agent event does not read `WORKFLOW.md`. Once an edit has been loaded (here by the
+/// workflow store's poll, which the binary runs every second), every running issue is checked
+/// against it without any agent sending an event.
+#[tokio::test(start_paused = true)]
+async fn a_reloaded_budget_is_checked_for_every_run_without_waiting_for_an_event() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(
+        json!({"budget": {"max_tokens_per_issue": 1000}}),
+        fed_factory(Arc::clone(&feds)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    dispatch_two(&h, &mut orch).await;
+    feed(&mut orch, &feds, "i-1", usage_event(50, 10)).await;
+
+    // An operator lowers the budget below what `i-1` has used.
+    h.wf.rewrite(json!({"budget": {"max_tokens_per_issue": 50}}));
+    feed(&mut orch, &feds, "i-1", some_event()).await;
+    feed(&mut orch, &feds, "i-2", some_event()).await;
+    assert_eq!(
+        orch.settings().budget.max_tokens_per_issue,
+        Some(1000),
+        "agent events left the file alone"
+    );
+    assert_eq!(orch.state.running.len(), 2);
+
+    // The load wakes the orchestrator; both agents stay silent.
+    h.wf.store.poll();
+    assert!(orch.step().await);
+    assert_eq!(
+        orch.state.blocked["i-1"].error,
+        "issue token budget exhausted: 60 of 50 tokens used"
+    );
+    assert!(orch.state.running.contains_key("i-2"));
+
+    // An edit that does not load keeps the last good budget in force, for events too, and the
+    // orchestrator is not woken for it (the next step is the event's).
+    h.wf.rewrite(json!({"budget": {"max_tokens_per_issue": 0}}));
+    h.wf.store.poll();
+    feed(&mut orch, &feds, "i-2", usage_event(40, 5)).await;
+    assert!(orch.state.running.contains_key("i-2"), "45 of 50 tokens");
+    feed(&mut orch, &feds, "i-2", usage_event(40, 15)).await;
+    assert_eq!(
+        orch.state.blocked["i-2"].error,
+        "issue token budget exhausted: 55 of 50 tokens used"
+    );
+}
+
+/// An agent event, a worker message and a worker exit use the loaded settings and leave
+/// `WORKFLOW.md` alone. A tick, a poll cycle, a snapshot and a due retry re-read it.
+#[tokio::test(start_paused = true)]
+async fn agent_events_and_exits_use_the_loaded_workflow_and_polls_and_retries_re_read_it() {
+    let feds: Feds = Arc::default();
+    let mut h = Harness::new(json!({}), fed_factory(Arc::clone(&feds)));
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let limit = |agents: u32| json!({"agent": {"max_concurrent_agents": agents}});
+    let loaded = |orch: &Orchestrator<'_>| orch.settings().agent.max_concurrent_agents;
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    let run_id = orch.state.running.get("i-1").unwrap().run_id;
+    assert_eq!(loaded(&orch), 10);
+
+    h.wf.rewrite(limit(11));
+    feed(&mut orch, &feds, "i-1", usage_event(1, 1)).await;
+    orch.handle_worker_message(WorkerMessage::RuntimeInfo {
+        run_id,
+        worker_host: None,
+        workspace_path: "/w/MT-1".into(),
+    });
+    end_run(&mut orch, &feds, "i-1", Err(RunError::Other("boom".into()))).await;
+    assert!(orch.state.retry_attempts.contains_key("i-1"));
+    assert_eq!(
+        loaded(&orch),
+        10,
+        "event, message and exit used what was loaded"
+    );
+
+    orch.handle_tick(None);
+    assert_eq!(loaded(&orch), 11);
+    assert_eq!(orch.state.max_concurrent_agents, 11);
+    h.wf.rewrite(limit(12));
+    orch.run_poll_cycle().await;
+    assert_eq!(loaded(&orch), 12);
+    // By the cycle's own read, before its dispatch preflight reads the file again.
+    assert_eq!(orch.state.max_concurrent_agents, 12);
+    h.wf.rewrite(limit(13));
+    assert_eq!(orch.snapshot().max_concurrent_agents, 13);
+    h.wf.rewrite(limit(14));
+    orch.handle_retry_issue("i-gone", 1, RetryMeta::default())
+        .await;
+    assert_eq!(loaded(&orch), 14);
 }
