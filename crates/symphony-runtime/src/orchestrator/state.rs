@@ -150,14 +150,21 @@ pub enum DelayType {
     Continuation,
     /// Exponential failure backoff.
     Failure,
+    /// Waiting for a slot or for a stop to end: a poll ends the wait, so this is only a safety net at
+    /// the slowest failure backoff. It releases an issue that left the active states, and starts
+    /// one if a slot happens to be free.
+    NoSlots,
 }
 
 /// `retry_delay/2`: continuation attempt 1 → `agent.continuation_delay_ms` (1 s by default);
-/// otherwise `min(10_000 · 2^min(attempt − 1, 10), max_retry_backoff_ms)`. No jitter, no maximum
-/// count.
+/// otherwise `min(10_000 · 2^min(attempt − 1, 10), max_retry_backoff_ms)`, at any attempt the
+/// longest of those for [`DelayType::NoSlots`]. No jitter, no maximum count.
 pub fn retry_delay(attempt: u32, delay_type: DelayType, agent: &AgentSettings) -> Duration {
     if delay_type == DelayType::Continuation && attempt == 1 {
         return Duration::from_millis(agent.continuation_delay_ms);
+    }
+    if delay_type == DelayType::NoSlots {
+        return retry_delay(u32::MAX, DelayType::Failure, agent);
     }
     let power = attempt.saturating_sub(1).min(10);
     let delay = FAILURE_RETRY_BASE_MS.saturating_mul(1 << power);
@@ -561,6 +568,7 @@ mod tests {
         assert_eq!(ms(5, DelayType::Failure), 160_000);
         assert_eq!(ms(6, DelayType::Failure), 300_000);
         assert_eq!(ms(500, DelayType::Failure), 300_000);
+        assert_eq!(ms(1, DelayType::NoSlots), 300_000);
         let uncapped = AgentSettings {
             max_retry_backoff_ms: u64::MAX,
             continuation_delay_ms: 15_000,
@@ -568,6 +576,10 @@ mod tests {
         };
         assert_eq!(
             retry_delay(40, DelayType::Failure, &uncapped).as_millis(),
+            10_240_000
+        );
+        assert_eq!(
+            retry_delay(1, DelayType::NoSlots, &uncapped).as_millis(),
             10_240_000
         );
         assert_eq!(

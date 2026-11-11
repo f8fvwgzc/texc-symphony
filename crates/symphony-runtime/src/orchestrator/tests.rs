@@ -2,15 +2,18 @@
 //! and B.13.3, plus the Rust improvements). Workers are fakes from [`FnWorkerFactory`]; timing tests
 //! run on tokio's paused clock, tests that run hook subprocesses use real time.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use symphony_codex::{CodexError, CodexEvent, CodexEventData, CodexEventKind, StreamMessage};
 use symphony_core::Issue;
-use symphony_store::{RunQuery, RunStatus, Store};
-use symphony_trackers::{MemoryIssues, MemoryTracker, Provider, TrackerDeps, TransportError};
+use symphony_core::config::TrackerSettings;
+use symphony_store::{RetryRecord, RunQuery, RunStatus, Store};
+use symphony_trackers::{
+    MemoryIssues, MemoryTracker, Provider, Tracker, TrackerDeps, TrackerError, TransportError,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -111,6 +114,68 @@ fn uncancellable_factory(started: Started) -> Arc<dyn WorkerFactory> {
         ));
         async move { std::future::pending::<WorkerResult>().await }
     }))
+}
+
+/// Worker that records its start, keeps its cancel token and ignores it (like
+/// [`uncancellable_factory`]), so a test can see which runs were cancelled and when.
+fn cancel_recording_factory(cancels: Arc<Mutex<Vec<CancellationToken>>>) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        cancels.lock().unwrap().push(ctx.cancel.clone());
+        async move { std::future::pending::<WorkerResult>().await }
+    }))
+}
+
+/// A memory tracker that counts its reads, can fail the by-id ones and can act during one.
+#[derive(Default)]
+struct CountingTracker {
+    inner: MemoryTracker,
+    candidate_fetches: AtomicUsize,
+    by_id_fetches: AtomicUsize,
+    fail_by_id: AtomicBool,
+    during_by_id: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait::async_trait]
+impl Tracker for CountingTracker {
+    fn kind(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn fetch_issues_by_states(
+        &self,
+        settings: &TrackerSettings,
+        states: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        self.candidate_fetches.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_issues_by_states(settings, states).await
+    }
+
+    async fn fetch_issues_by_ids(
+        &self,
+        settings: &TrackerSettings,
+        ids: &[String],
+    ) -> Result<Vec<Issue>, TrackerError> {
+        self.by_id_fetches.fetch_add(1, Ordering::SeqCst);
+        if let Some(during) = self.during_by_id.lock().unwrap().take() {
+            during();
+        }
+        if self.fail_by_id.load(Ordering::SeqCst) {
+            return Err(TrackerError::MissingLinearViewerIdentity);
+        }
+        self.inner.fetch_issues_by_ids(settings, ids).await
+    }
+
+    fn secret_environment_names(&self, settings: &TrackerSettings) -> Vec<String> {
+        self.inner.secret_environment_names(settings)
+    }
+}
+
+/// The metadata of a retry waiting for a slot.
+fn parked_meta() -> RetryMeta {
+    RetryMeta {
+        error: Some("no available orchestrator slots".into()),
+        ..RetryMeta::default()
+    }
 }
 
 fn result_factory(result: fn() -> WorkerResult) -> Arc<dyn WorkerFactory> {
@@ -490,8 +555,8 @@ async fn failed_retries_stop_at_the_retry_limit_and_block_the_issue() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn continuation_requeued_without_slots_waits_twenty_seconds() {
-    let started = Arc::new(Mutex::new(Vec::new()));
+async fn waiting_for_a_slot_never_uses_up_the_retry_limit() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
     let mut h = Harness::new(
         json!({"agent": {"max_concurrent_agents": 1}}),
         blocking_factory(Arc::clone(&started)),
@@ -512,19 +577,572 @@ async fn continuation_requeued_without_slots_waits_twenty_seconds() {
         DelayType::Continuation,
     );
     assert!((900..=1_000).contains(&retry_due_in(&orch, "i-1")));
-    run_until(&mut orch, |o| {
-        o.state
-            .retry_attempts
-            .get("i-1")
-            .is_some_and(|e| e.attempt == 2)
-    })
-    .await;
+    // More rechecks than the default limit of 10 retries.
+    for _ in 0..12 {
+        let token = orch.state.retry_attempts["i-1"].token;
+        run_until(&mut orch, |o| o.state.retry_attempts["i-1"].token != token).await;
+    }
     let entry = &orch.state.retry_attempts["i-1"];
+    assert_eq!(entry.attempt, 1);
     assert_eq!(
         entry.error.as_deref(),
         Some("no available orchestrator slots")
     );
-    assert!((19_000..=20_000).contains(&retry_due_in(&orch, "i-1")));
+    assert!((299_000..=300_000).contains(&retry_due_in(&orch, "i-1")));
+
+    // When a slot frees, it runs as the attempt it was.
+    orch.terminate_running_issue("busy", false, "finished")
+        .await;
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key("i-1"));
+    assert!(!orch.state.retry_attempts.contains_key("i-1"));
+    assert_eq!(orch.state.running["i-1"].retry_attempt, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_retry_keeps_its_place_in_the_dispatch_order() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![issue("busy", "MT-B", "In Progress")]);
+    orch.dispatch_issue(issue("busy", "MT-B", "In Progress"), None, None)
+        .await;
+    orch.schedule_issue_retry("parked", Some(3), parked_meta(), DelayType::NoSlots);
+    orch.terminate_running_issue("busy", false, "finished")
+        .await;
+    // The retry sorts first. The poll skips claimed issues, so only the wake gives it the slot.
+    h.memory.set(vec![
+        issue("parked", "MT-A", "In Progress"),
+        issue("new", "MT-Z", "In Progress"),
+    ]);
+    orch.maybe_dispatch().await;
+    assert!(orch.state.retry_attempts.is_empty());
+    assert_eq!(orch.state.running["parked"].retry_attempt, 3);
+    assert!(!orch.state.running.contains_key("new"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_issue_that_outranks_a_parked_retry_takes_the_slot() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.schedule_issue_retry("parked", Some(3), parked_meta(), DelayType::NoSlots);
+    h.memory.set(vec![
+        Issue {
+            priority: Some(4),
+            ..issue("parked", "MT-A", "In Progress")
+        },
+        Issue {
+            priority: Some(1),
+            ..issue("urgent", "MT-Z", "In Progress")
+        },
+    ]);
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key("urgent"));
+    assert_eq!(orch.state.retry_attempts["parked"].attempt, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_failed_read_stops_the_wake_for_the_rest_of_the_poll() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let tracker = Arc::new(CountingTracker::default());
+    let ids = ["p-0", "p-1", "p-2", "p-3", "p-4"];
+    tracker.inner.issues().set(
+        ids.iter()
+            .map(|id| issue(id, &id.to_uppercase(), "In Progress"))
+            .collect(),
+    );
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_tracker(fixed),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    for id in ids {
+        orch.schedule_issue_retry(id, Some(1), parked_meta(), DelayType::NoSlots);
+    }
+    tracker.fail_by_id.store(true, Ordering::SeqCst);
+    orch.maybe_dispatch().await;
+    assert_eq!(tracker.by_id_fetches.load(Ordering::SeqCst), 1);
+    let charged = orch
+        .state
+        .retry_attempts
+        .values()
+        .filter(|entry| entry.attempt > 1)
+        .count();
+    assert_eq!(charged, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_retry_behind_a_dead_replicas_lease_keeps_its_attempt() {
+    let store = Store::open_in_memory_shared().unwrap();
+    assert!(store.acquire_lease("i-1", "dead", LEASE_TTL).await.unwrap());
+    store
+        .save_retry(RetryRecord {
+            issue_id: "i-1".into(),
+            attempt: 7,
+            due_at: Utc::now() + chrono::Duration::seconds(300),
+            identifier: "MT-1".into(),
+            issue_url: None,
+            error: Some("no available orchestrator slots".into()),
+            worker_host: None,
+            workspace_path: None,
+        })
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    let shared = store.clone();
+    let mut h = Harness::build(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_store(shared).with_replica_id("new"),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.restore_retry_queue().await;
+    orch.maybe_dispatch().await;
+    store.flush().await.unwrap();
+    assert_eq!(orch.state.retry_attempts["i-1"].attempt, 7);
+    assert_eq!(store.list_retries().await.unwrap().len(), 1);
+    // The dead replica's lease lapses, and the issue goes on from where it was.
+    store
+        .acquire_lease("i-1", "dead", Duration::ZERO)
+        .await
+        .unwrap();
+    orch.maybe_dispatch().await;
+    assert_eq!(
+        started.lock().unwrap().first().map(|run| run.1),
+        Some(Some(7))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lapsed_lease_is_not_trusted_once_a_peer_took_it() {
+    let store = Store::open_in_memory_shared().unwrap();
+    let started: Started = Arc::default();
+    let shared = store.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_store(shared).with_replica_id("me"),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    assert!(orch.take_lease("i-1").await);
+    orch.schedule_issue_retry("i-1", Some(1), parked_meta(), DelayType::NoSlots);
+    // The actor stalls for a whole TTL, so the renewal never ran, and a peer takes the issue.
+    tokio::time::advance(LEASE_TTL + ms(1)).await;
+    store
+        .acquire_lease("i-1", "me", Duration::ZERO)
+        .await
+        .unwrap();
+    std::thread::sleep(ms(5));
+    assert!(store.acquire_lease("i-1", "peer", LEASE_TTL).await.unwrap());
+    orch.maybe_dispatch().await;
+    assert!(!orch.state.running.contains_key("i-1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_outage_does_not_cost_a_retry_its_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    let started: Started = Arc::default();
+    let shared = store.clone();
+    let mut h = Harness::build(
+        json!({}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_store(shared),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    assert!(orch.take_lease("i-1").await);
+    orch.schedule_issue_retry(
+        "i-1",
+        Some(4),
+        RetryMeta {
+            error: Some("agent exited: boom".into()),
+            ..RetryMeta::default()
+        },
+        DelayType::Failure,
+    );
+    store.flush().await.unwrap();
+    // A minute of failed renewals: only a shared store has peers to lose the lease to.
+    tokio::time::advance(LEASE_TTL + ms(1)).await;
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let token = orch.state.retry_attempts["i-1"].token;
+    orch.handle_retry_due("i-1", token).await;
+    drop(lock);
+    assert_eq!(
+        started.lock().unwrap().first().map(|run| run.1),
+        Some(Some(4))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_row_names_the_stop_it_waits_for() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(json!({}), blocking_factory(Arc::clone(&started)));
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.schedule_issue_retry("p", Some(1), parked_meta(), DelayType::NoSlots);
+    assert_eq!(orch.snapshot().retrying[0].error, parked_meta().error);
+    orch.set_paused(true, Some("incident".into()));
+    let row = &orch.snapshot().retrying[0];
+    assert_eq!(row.error.as_deref(), Some("dispatch paused: incident"));
+    // Only the view changes: the wake still finds the entry when the stop ends.
+    assert_eq!(orch.state.retry_attempts["p"].error, parked_meta().error);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_parks_a_retry_instead_of_reading_the_tracker_every_ten_seconds() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let tracker = Arc::new(CountingTracker::default());
+    tracker
+        .inner
+        .issues()
+        .set(vec![issue("p", "MT-P", "In Progress")]);
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_tracker(fixed),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.set_paused(true, Some("incident".into()));
+    orch.schedule_issue_retry("p", Some(1), RetryMeta::default(), DelayType::Continuation);
+    let until = Instant::now() + Duration::from_secs(3600);
+    while Instant::now() < until {
+        assert!(orch.step().await);
+    }
+    // One read as the continuation fires, then one each 300 s.
+    let reads = tracker.by_id_fetches.load(Ordering::SeqCst);
+    assert!(
+        reads <= 13,
+        "{reads} tracker reads in an hour of kill switch"
+    );
+    // It kept its attempt and its place: the first poll after the stop starts it.
+    orch.set_paused(false, None);
+    orch.maybe_dispatch().await;
+    assert_eq!(orch.state.running["p"].retry_attempt, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_retry_stays_parked_while_its_state_is_at_its_cap() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(
+        json!({"agent": {
+            "max_concurrent_agents": 3,
+            "max_concurrent_agents_by_state": {"in progress": 1},
+        }}),
+        blocking_factory(Arc::clone(&started)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![issue("busy", "MT-B", "In Progress")]);
+    orch.dispatch_issue(issue("busy", "MT-B", "In Progress"), None, None)
+        .await;
+    orch.schedule_issue_retry(
+        "parked",
+        Some(1),
+        RetryMeta {
+            error: Some("no available orchestrator slots".into()),
+            ..RetryMeta::default()
+        },
+        DelayType::NoSlots,
+    );
+    let token = orch.state.retry_attempts["parked"].token;
+    h.memory.set(vec![
+        issue("busy", "MT-B", "In Progress"),
+        issue("parked", "MT-P", "In Progress"),
+        issue("new", "MT-N", "Todo"),
+    ]);
+    orch.maybe_dispatch().await;
+    // Not requeued on every poll, and the free slots still go to work that can use them.
+    assert_eq!(orch.state.retry_attempts["parked"].token, token);
+    assert!(orch.state.running.contains_key("new"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_parked_retry_stays_parked_while_its_host_is_full() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(
+        json!({
+            "agent": {"max_concurrent_agents": 3},
+            "worker": {"ssh_hosts": ["worker-a"], "max_concurrent_agents_per_host": 1},
+        }),
+        blocking_factory(Arc::clone(&started)),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![
+        issue("busy", "MT-B", "In Progress"),
+        issue("parked", "MT-P", "In Progress"),
+    ]);
+    orch.dispatch_issue(issue("busy", "MT-B", "In Progress"), None, None)
+        .await;
+    orch.schedule_issue_retry("parked", Some(3), parked_meta(), DelayType::NoSlots);
+    let token = orch.state.retry_attempts["parked"].token;
+    orch.maybe_dispatch().await;
+    // Not even re-queued: that would push the timer out at every poll.
+    assert_eq!(orch.state.retry_attempts["parked"].token, token);
+    assert!(!orch.state.running.contains_key("parked"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_that_loses_its_host_while_it_revalidates_waits_without_a_penalty() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let tracker = Arc::new(CountingTracker::default());
+    tracker.inner.issues().set(vec![
+        issue("busy", "MT-B", "In Progress"),
+        issue("parked", "MT-P", "In Progress"),
+    ]);
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let config = |cap: u32| json!({"worker": {"ssh_hosts": ["worker-a"], "max_concurrent_agents_per_host": cap}});
+    let mut h = Harness::build(
+        config(2),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_tracker(fixed),
+    );
+    // A reload during the read lowers the cap between the retry's check and its dispatch.
+    h.wf.rewrite(config(1));
+    let lowered = std::fs::read(&h.wf.path).unwrap();
+    h.wf.rewrite(config(2));
+    let path = h.wf.path.clone();
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("busy", "MT-B", "In Progress"), None, None)
+        .await;
+    *tracker.during_by_id.lock().unwrap() =
+        Some(Box::new(move || std::fs::write(path, lowered).unwrap()));
+    orch.handle_active_retry(
+        issue("parked", "MT-P", "In Progress"),
+        "parked",
+        3,
+        RetryMeta::default(),
+    )
+    .await;
+    let entry = &orch.state.retry_attempts["parked"];
+    assert_eq!(entry.attempt, 3);
+    assert_eq!(entry.error, parked_meta().error);
+    assert_eq!(retry_due_in(&orch, "parked"), 300_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_that_ended_normally_refills_its_slot_before_the_next_tick() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&started);
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        recorded.lock().unwrap().push((
+            ctx.issue.id.clone().unwrap_or_default(),
+            ctx.attempt,
+            ctx.worker_host.clone(),
+        ));
+        async move { Ok(()) }
+    }));
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 1}, "polling": {"interval_ms": 30_000}}),
+        factory,
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![issue("first", "MT-1", "In Progress")]);
+    orch.dispatch_issue(issue("first", "MT-1", "In Progress"), None, None)
+        .await;
+    orch.schedule_tick(ms(30_000));
+    h.memory.set(vec![
+        issue("first", "MT-1", "Done"),
+        issue("next", "MT-2", "In Progress"),
+    ]);
+    let began = Instant::now();
+    let seen = Arc::clone(&started);
+    run_until(&mut orch, |_| seen.lock().unwrap().len() == 2).await;
+    assert_eq!(started.lock().unwrap()[1].0, "next");
+    assert!(began.elapsed() < ms(2_000), "waited {:?}", began.elapsed());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_continuation_that_keeps_its_issue_does_not_bring_the_next_poll_forward() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        let run = counted.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if run > 0 {
+                ctx.cancel.cancelled().await;
+                return Err(RunError::Cancelled);
+            }
+            Ok(())
+        }
+    }));
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 10}, "polling": {"interval_ms": 30_000}}),
+        factory,
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![issue("loop", "MT-1", "In Progress")]);
+    orch.dispatch_issue(issue("loop", "MT-1", "In Progress"), None, None)
+        .await;
+    orch.schedule_tick(ms(30_000));
+    let due = orch.state.next_poll_due;
+    let seen = Arc::clone(&runs);
+    run_until(&mut orch, |_| seen.load(Ordering::SeqCst) == 2).await;
+    // It took its slot back with others free: a poll here would loop once per run.
+    assert_eq!(orch.state.next_poll_due, due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_continuation_whose_read_failed_does_not_bring_the_next_poll_forward() {
+    let tracker = Arc::new(CountingTracker::default());
+    tracker
+        .inner
+        .issues()
+        .set(vec![issue("one", "MT-1", "In Progress")]);
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_concurrent_agents": 10}, "polling": {"interval_ms": 30_000}}),
+        result_factory(|| Ok(())),
+        |options| options.with_tracker(fixed),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("one", "MT-1", "In Progress"), None, None)
+        .await;
+    orch.schedule_tick(ms(30_000));
+    let due = orch.state.next_poll_due;
+    tracker.fail_by_id.store(true, Ordering::SeqCst);
+    run_until(&mut orch, |o| {
+        o.state
+            .retry_attempts
+            .get("one")
+            .is_some_and(|e| e.error.is_some())
+    })
+    .await;
+    assert_eq!(orch.state.next_poll_due, due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_run_does_not_bring_the_next_poll_forward() {
+    // Two slots: the retry takes one when it fires, and the free one must not trigger a poll.
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 2}, "polling": {"interval_ms": 30_000}}),
+        result_factory(|| Err(RunError::Other("boom".into()))),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![
+        issue("first", "MT-1", "In Progress"),
+        issue("next", "MT-2", "In Progress"),
+    ]);
+    orch.dispatch_issue(issue("first", "MT-1", "In Progress"), None, None)
+        .await;
+    orch.schedule_tick(ms(30_000));
+    let due = orch.state.next_poll_due;
+    run_until(&mut orch, |o| {
+        o.state
+            .retry_attempts
+            .get("first")
+            .is_some_and(|e| e.attempt == 2)
+    })
+    .await;
+    // Neither the failed exit nor the retry that failed again polled early.
+    assert_eq!(orch.state.next_poll_due, due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_issue_that_was_closed_during_its_backoff_refills_its_slot() {
+    let mut h = Harness::new(
+        json!({"agent": {"max_concurrent_agents": 1}, "polling": {"interval_ms": 30_000}}),
+        result_factory(|| Err(RunError::Other("boom".into()))),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![issue("first", "MT-1", "In Progress")]);
+    orch.dispatch_issue(issue("first", "MT-1", "In Progress"), None, None)
+        .await;
+    orch.schedule_tick(ms(30_000));
+    let due = orch.state.next_poll_due;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("first")).await;
+    h.memory.set(vec![issue("first", "MT-1", "Done")]);
+    run_until(&mut orch, |o| !o.state.claimed.contains("first")).await;
+    assert!(orch.state.next_poll_due < due);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_or_stopped_service_skips_the_candidate_fetch() {
+    let started: Started = Arc::new(Mutex::new(Vec::new()));
+    let tracker = Arc::new(CountingTracker::default());
+    tracker
+        .inner
+        .issues()
+        .set(vec![issue("busy", "MT-B", "In Progress")]);
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_concurrent_agents": 1}}),
+        blocking_factory(Arc::clone(&started)),
+        |options| options.with_tracker(fixed),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let fetches = || tracker.candidate_fetches.load(Ordering::SeqCst);
+    orch.dispatch_issue(issue("busy", "MT-B", "In Progress"), None, None)
+        .await;
+    orch.maybe_dispatch().await;
+    assert_eq!(fetches(), 0, "no slot is free");
+
+    orch.terminate_running_issue("busy", false, "finished")
+        .await;
+    orch.set_paused(true, None);
+    orch.maybe_dispatch().await;
+    assert_eq!(fetches(), 0, "the kill switch is engaged");
+
+    orch.set_paused(false, None);
+    orch.maybe_dispatch().await;
+    assert_eq!(fetches(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_global_stop_cancels_every_run_before_waiting_for_any() {
+    let cancels = Arc::new(Mutex::new(Vec::new()));
+    let mut h = Harness::new(json!({}), cancel_recording_factory(Arc::clone(&cancels)));
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    h.memory.set(vec![
+        issue("a", "MT-A", "In Progress"),
+        issue("b", "MT-B", "In Progress"),
+    ]);
+    orch.dispatch_issue(issue("a", "MT-A", "In Progress"), None, None)
+        .await;
+    orch.dispatch_issue(issue("b", "MT-B", "In Progress"), None, None)
+        .await;
+    while cancels.lock().unwrap().len() < 2 {
+        tokio::time::sleep(ms(1)).await;
+    }
+    orch.set_paused(true, None);
+    // These workers ignore their tokens, so each stop below waits out the whole grace.
+    let cancelled = async {
+        tokio::time::sleep(ms(1)).await;
+        let cancels = cancels.lock().unwrap();
+        assert!(cancels.iter().all(CancellationToken::is_cancelled));
+    };
+    tokio::join!(orch.enforce_spend(), cancelled);
+    assert!(orch.state.running.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

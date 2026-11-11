@@ -44,6 +44,7 @@ waiting ──(dependencies succeeded)──▶ queued ──▶ running ──�
 waiting / queued / blocked / running ──▶ cancelled   (POST /cancel)
 ```
 
+- Queued tasks take free slots ahead of tracker issues, oldest first, on every poll.
 - `depends_on` lists existing tasks that must succeed first. Until they have, the task is
   `waiting` and is not dispatched; it is dispatched as soon as the last one succeeds. When one of
   them fails or is cancelled, the task fails (`dependency task-<id> did not succeed`), and so do

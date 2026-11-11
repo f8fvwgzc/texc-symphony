@@ -650,7 +650,16 @@ impl<'w> Orchestrator<'w> {
     /// Takes the dispatch lease of `issue_id` (kept while the issue is claimed). `false` when
     /// another live replica holds it or the store cannot be reached (dispatch then waits).
     pub(crate) async fn take_lease(&mut self, issue_id: &str) -> bool {
-        if self.state.leases.contains_key(issue_id) {
+        // A lapsed lease may be a peer's by now, so a shared store decides, and renews it if not.
+        // Without peers it stays ours: a failing store must not cost a retry its claim.
+        let now = Instant::now();
+        let shared = self.ctx.store.is_shared();
+        if self
+            .state
+            .leases
+            .get(issue_id)
+            .is_some_and(|due| *due > now || !shared)
+        {
             return true;
         }
         // The deadline counts from before the request: the stored expiry is no earlier.
@@ -1015,11 +1024,18 @@ impl<'w> Orchestrator<'w> {
         if self.state.running.is_empty() {
             return;
         }
-        let settings = self.settings();
+        // Runs on every agent event: no reload here, the file poller and each poll cycle do that.
+        let settings = self.ctx.workflow.last_good().settings.clone();
         let now = Utc::now();
         if let Some(stop) = self.state.spend.global_stop(&settings.budget, now) {
             let ids: Vec<String> = self.state.running.keys().cloned().collect();
             tracing::warn!("Stopping {} running agents: {}", ids.len(), stop.reason());
+            // Cancel them all first, so none keeps spending while the stops below wait in turn.
+            for entry in self.state.running.values() {
+                if let Some(worker) = &entry.worker {
+                    worker.cancel.cancel();
+                }
+            }
             for issue_id in ids {
                 self.terminate_running_issue(&issue_id, false, stop.reason())
                     .await;
@@ -1144,12 +1160,16 @@ impl<'w> Orchestrator<'w> {
                 .then(a.issue_id.cmp(&b.issue_id))
         });
 
+        let spend = self.spend_snapshot(&settings, now_utc);
         let mut retrying: Vec<RetrySnapshot> = self
             .state
             .retry_attempts
             .iter()
             .map(|(issue_id, entry)| {
                 let due_in = entry.due_at.saturating_duration_since(now);
+                // A stopped retry is stored as waiting for a slot; show what it really waits for.
+                let stopped = entry.error.as_deref() == Some(retry::NO_SLOTS);
+                let stop = spend.stopped_reason.clone().filter(|_| stopped);
                 RetrySnapshot {
                     issue_id: issue_id.clone(),
                     identifier: entry.identifier.clone(),
@@ -1158,7 +1178,7 @@ impl<'w> Orchestrator<'w> {
                     due_at: now_utc
                         + chrono::Duration::from_std(due_in).unwrap_or(chrono::Duration::zero()),
                     issue_url: entry.issue_url.clone(),
-                    error: entry.error.clone(),
+                    error: stop.or_else(|| entry.error.clone()),
                     worker_host: entry.worker_host.clone(),
                     workspace_path: entry.workspace_path.clone(),
                 }
@@ -1195,7 +1215,6 @@ impl<'w> Orchestrator<'w> {
                 .then(a.issue_id.cmp(&b.issue_id))
         });
 
-        let spend = self.spend_snapshot(&settings, now_utc);
         Snapshot {
             generated_at: now_utc,
             generation: *self.ctx.generation.borrow(),

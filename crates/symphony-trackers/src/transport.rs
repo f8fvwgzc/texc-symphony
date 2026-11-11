@@ -445,7 +445,8 @@ impl Default for RetryPolicy {
     }
 }
 
-const RETRYABLE_STATUSES: [u16; 6] = [408, 429, 500, 502, 503, 504];
+/// The response statuses worth asking again for.
+pub const RETRYABLE_STATUSES: [u16; 6] = [408, 429, 500, 502, 503, 504];
 
 /// A logical request (before redirects/retries).
 #[derive(Clone)]
