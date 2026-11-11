@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior};
 
-use crate::error::{Result, StoreError};
+use crate::error::{Result, StoreError, postgres_reason};
 
 /// How long a statement waits for a lock held by another connection/process.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -102,7 +102,7 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<u32> {
 pub(crate) fn migrate_postgres(client: &mut postgres::Client) -> Result<u32> {
     let migration_err = |version: u32, err: postgres::Error| StoreError::Migration {
         version,
-        reason: err.to_string(),
+        reason: postgres_reason(&err),
     };
     client
         .batch_execute(&format!("SELECT pg_advisory_lock({MIGRATION_LOCK})"))
@@ -150,7 +150,7 @@ pub(crate) fn migrate_postgres(client: &mut postgres::Client) -> Result<u32> {
     })();
     if let Err(err) = client.batch_execute(&format!("SELECT pg_advisory_unlock({MIGRATION_LOCK})"))
     {
-        tracing::warn!(error = %err, "releasing the migration lock failed");
+        tracing::warn!(error = %postgres_reason(&err), "releasing the migration lock failed");
     }
     result
 }

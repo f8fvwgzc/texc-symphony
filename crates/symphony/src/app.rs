@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use symphony_core::WorkflowStore;
+use symphony_core::{WorkflowStore, error_chain};
 use symphony_runtime::{Runtime, RuntimeError, RuntimeOptions};
 use symphony_server::{Auth, BoundServer, ServerConfig};
 use symphony_store::{
@@ -497,8 +497,10 @@ async fn serve_until_stopped(
                 services.server = Some(server);
             }
             Err(err) => {
-                let message =
-                    format!("Failed to start Symphony with workflow {workflow_path}: {err}");
+                let message = format!(
+                    "Failed to start Symphony with workflow {workflow_path}: {}",
+                    error_chain(&err)
+                );
                 tracing::error!("{message}");
                 let _ = writeln!(std::io::stderr().lock(), "{message}");
                 stop(&mut services, &mut signals, false).await;
@@ -573,7 +575,7 @@ async fn stop(services: &mut Services, signals: &mut Signals, offline_frame: boo
         if let Some(server) = services.server.take()
             && let Err(err) = server.wait().await
         {
-            tracing::warn!("HTTP server stopped with an error: {err}");
+            tracing::warn!("HTTP server stopped with an error: {}", error_chain(&err));
         }
         services.background_cancel.cancel();
         match tokio::time::timeout(STORE_FLUSH_TIMEOUT, services.store.flush()).await {

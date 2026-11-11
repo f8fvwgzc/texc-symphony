@@ -5,6 +5,9 @@
 //! Elixir `inspect/1` form used in agent-tool `"reason"` fields (`:timeout`,
 //! `{:github_api_status, 503}`), and [`TrackerError::category`] maps every error onto the portable
 //! SPEC §11.4 categories.
+//!
+//! [`TrackerError::ApiRequest`] keeps the transport failure in `source()`, not in `Display`: report
+//! a tracker error with [`symphony_core::error_chain`] (`linear_api_request: timeout`).
 
 use std::fmt;
 
@@ -117,7 +120,7 @@ pub enum TrackerError {
         status: u16,
     },
     /// Transport failure (`{:<provider>_api_request, reason}`); never contains credentials.
-    #[error("{provider}_api_request: {source}")]
+    #[error("{provider}_api_request")]
     ApiRequest {
         /// Provider.
         provider: Provider,
@@ -290,6 +293,11 @@ mod tests {
         assert_eq!(limited.category(), ErrorCategory::TrackerRateLimited);
 
         let timeout = TrackerError::request(Provider::Linear, TransportError::Timeout);
+        assert_eq!(timeout.to_string(), "linear_api_request");
+        assert_eq!(
+            symphony_core::error_chain(&timeout),
+            "linear_api_request: timeout"
+        );
         assert_eq!(timeout.inspect(), "{:linear_api_request, :timeout}");
         assert_eq!(timeout.category(), ErrorCategory::TrackerRequest);
 

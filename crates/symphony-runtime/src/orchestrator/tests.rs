@@ -11,7 +11,9 @@ use symphony_codex::{CodexError, CodexEvent, CodexEventData, CodexEventKind, Str
 use symphony_core::Issue;
 use symphony_core::config::TrackerSettings;
 use symphony_store::{RetryRecord, RunQuery, RunStatus, Store};
-use symphony_trackers::{MemoryIssues, MemoryTracker, Tracker, TrackerDeps, TrackerError};
+use symphony_trackers::{
+    MemoryIssues, MemoryTracker, Provider, Tracker, TrackerDeps, TrackerError, TransportError,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -2573,6 +2575,44 @@ async fn a_failed_dependency_fails_the_waiting_task() {
         Some(format!("dependency task-{first} did not succeed"))
     );
     assert_eq!(failed.attempts, 0, "it never ran");
+}
+
+/// The reason in run history, a retry entry and a task record is the whole chain, not the tag that
+/// `Display` of a wrapping error stops at.
+#[tokio::test(start_paused = true)]
+async fn a_failed_run_records_its_root_cause() {
+    use symphony_store::TaskStatus;
+    fn refresh_failed() -> WorkerResult {
+        Err(RunError::IssueStateRefresh(FetchError::Tracker(
+            TrackerError::request(Provider::Linear, TransportError::Timeout),
+        )))
+    }
+    let reason = "agent exited: issue_state_refresh_failed: linear_api_request: timeout";
+
+    let mut h = Harness::new(json!({}), result_factory(refresh_failed));
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    assert_eq!(
+        orch.state.retry_attempts["i-1"].error.as_deref(),
+        Some(reason)
+    );
+
+    let (store, id) = task_store().await;
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::default(), refresh_failed),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let failed = task_status(&store, id, TaskStatus::Failed).await;
+    assert_eq!(failed.error.as_deref(), Some(reason));
 }
 
 /// A failed run of a kind the task's policy retries runs again (here at once), and the task

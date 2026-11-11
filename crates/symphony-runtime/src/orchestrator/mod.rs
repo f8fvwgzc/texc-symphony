@@ -27,7 +27,7 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
-use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError};
+use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError, error_chain};
 use symphony_store::{NewRun, RetryRecord, RunStatus, TaskFailure, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
@@ -478,8 +478,9 @@ impl<'w> Orchestrator<'w> {
             let path = self.task_workspace(id);
             if let Err(err) = crate::isolation::seal_workspace(&path) {
                 tracing::warn!(
-                    "Removing task workspace {} (could not seal it on startup): {err}",
-                    path.display()
+                    "Removing task workspace {} (could not seal it on startup): {}",
+                    path.display(),
+                    error_chain(&err)
                 );
                 self.remove_task_workspace(id);
             }

@@ -321,8 +321,9 @@ pub enum ClientError {
     /// The base URL is not an `http(s)://` URL.
     #[error("invalid_url: {0}")]
     InvalidUrl(String),
-    /// The request did not complete.
-    #[error("request_failed: {0}")]
+    /// The request did not complete; the reason is in `source()` (the chain ends at the OS or TLS
+    /// error).
+    #[error("request_failed")]
     Http(#[from] reqwest::Error),
     /// The server answered with an error envelope.
     #[error("api_error: {status} {code}: {message}")]

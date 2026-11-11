@@ -268,6 +268,7 @@ impl Orchestrator<'_> {
         let ids = [issue_id.to_owned()];
         match self.ctx.tracker.fetch_issues_by_ids(&settings, &ids).await {
             Err(err) => {
+                let err = error_chain(&err);
                 tracing::warn!(
                     "Retry poll failed for issue_id={issue_id} issue_identifier={}: {err}",
                     meta.identifier.as_deref().unwrap_or(issue_id)
@@ -413,7 +414,10 @@ impl Orchestrator<'_> {
             Revalidation::Error(err) => {
                 let meta = RetryMeta {
                     identifier: issue.identifier.clone().or(meta.identifier.clone()),
-                    error: Some(format!("retry dispatch refresh failed: {err}")),
+                    error: Some(format!(
+                        "retry dispatch refresh failed: {}",
+                        error_chain(&err)
+                    )),
                     ..meta
                 };
                 self.schedule_issue_retry(issue_id, Some(attempt + 1), meta, DelayType::Failure);

@@ -27,13 +27,13 @@ thiserror = "2.0.21"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "time", "signal", "sync", "fs", "io-util", "net"] }
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 futures = "0.3.34"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
-arc-swap = "1.9.2"
+arc-swap = "1.9.3"
 async-trait = "0.1.92"
 serde_yaml_ng = "0.10.0"
 liquid = "0.26.11"
@@ -41,10 +41,10 @@ liquid = "0.26.11"
 # prompt reference markers sit.
 liquid-core = "0.26.11"
 liquid-lib = "0.26.11"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 hex = "0.4.3"
 getrandom = "0.4.3"
-libc = "0.2.190"
+libc = "0.2.191"
 tempfile = "3.27.0"
 # HTTP stack (symphony-trackers)
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "gzip", "brotli"] }
@@ -55,7 +55,7 @@ httpdate = "1.0.3"
 wiremock = "0.6.5"
 # GitHub App JWTs (RS256) for task credentials (symphony-runtime); the same aws-lc-rs build
 # rustls already uses, so no second crypto stack.
-aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # rustls with the one crypto provider the binary installs at startup (Tutela's JWKS client and
 # reqwest share it).
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

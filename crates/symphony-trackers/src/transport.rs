@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use symphony_core::error_chain;
 use tracing::Instrument;
 use url::Url;
 
@@ -388,19 +389,6 @@ impl Transport for ReqwestTransport {
             body,
         })
     }
-}
-
-fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut parts = vec![err.to_string()];
-    let mut source = err.source();
-    while let Some(inner) = source {
-        let text = inner.to_string();
-        if !parts.iter().any(|p| p.contains(&text)) {
-            parts.push(text);
-        }
-        source = inner.source();
-    }
-    parts.join(": ")
 }
 
 fn map_reqwest_error(err: reqwest::Error) -> TransportError {

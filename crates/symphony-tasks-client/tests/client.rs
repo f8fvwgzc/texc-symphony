@@ -171,6 +171,18 @@ async fn errors_carry_the_api_code() {
 }
 
 #[tokio::test]
+async fn a_request_that_never_reached_the_server_keeps_its_cause_in_source() {
+    let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = unused.local_addr().unwrap().port();
+    drop(unused);
+    let client = TasksClient::new(&format!("http://127.0.0.1:{port}")).unwrap();
+    let err = client.get(1).await.unwrap_err();
+    assert!(matches!(err, ClientError::Http(_)), "{err:?}");
+    assert_eq!(err.to_string(), "request_failed");
+    assert!(std::error::Error::source(&err).is_some());
+}
+
+#[tokio::test]
 async fn dependencies_and_plans_round_trip() {
     let store = Store::open_in_memory().unwrap();
     let (base, shutdown) = server(store.clone()).await;

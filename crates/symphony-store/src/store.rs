@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::db::{Db, PostgresDb, SqliteDb};
 use crate::leases;
 
-use crate::error::{Result, StoreError};
+use crate::error::{Result, StoreError, postgres_reason};
 use crate::model::{
     NewRun, PruneStats, RetryRecord, RunEvent, RunId, RunPage, RunQuery, RunRecord, RunStatus,
     TokenUsage, TotalsRecord, UsageTotals,
@@ -839,6 +839,7 @@ pub const POSTGRES_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 /// answers the TLS request with a refusal. Connecting and a silent network are bounded.
 pub(crate) fn postgres_config(url: &str) -> std::result::Result<postgres::Config, String> {
     use postgres::config::SslMode;
+    // `Display` only: the causes of a parse failure quote parts of the URL, which holds the password.
     let mut config: postgres::Config = url
         .parse()
         .map_err(|err: postgres::Error| err.to_string())?;
@@ -872,7 +873,7 @@ fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::
         postgres::config::SslMode::Disable => config.connect(postgres::NoTls),
         _ => config.connect(postgres_tls().map_err(|err| err.to_string())?),
     }
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| postgres_reason(&err))?;
     // A statement that runs or waits for a lock past the network timeout is aborted, so no single
     // query pins the store thread indefinitely.
     let ms = POSTGRES_NETWORK_TIMEOUT.as_millis();
@@ -880,7 +881,7 @@ fn connect_postgres(config: &postgres::Config) -> std::result::Result<postgres::
         .batch_execute(&format!(
             "SET statement_timeout = {ms}; SET lock_timeout = {ms}"
         ))
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| postgres_reason(&err))?;
     Ok(client)
 }
 
@@ -999,6 +1000,32 @@ mod tests {
         assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(3)));
         assert_eq!(config.get_tcp_user_timeout(), Some(&Duration::from_secs(5)));
         assert!(postgres_config("postgres://u@db/x?sslmode=sometimes").is_err());
+    }
+
+    #[test]
+    fn a_connection_string_that_does_not_parse_is_not_quoted() {
+        let err = postgres_config("postgres://u:hunter2@db/x?hunter2=1").unwrap_err();
+        assert_eq!(err, "invalid connection string");
+    }
+
+    #[test]
+    fn a_failed_connection_reports_its_cause() {
+        let mut config = postgres::Config::new();
+        config
+            .host("127.0.0.1")
+            .port(1)
+            .user("u")
+            .password("hunter2");
+        let Err(err) = config.connect(postgres::NoTls) else {
+            panic!("nothing listens on port 1");
+        };
+        assert_eq!(err.to_string(), "error connecting to server");
+        let reason = postgres_reason(&err);
+        assert!(
+            reason.starts_with("error connecting to server: "),
+            "{reason}"
+        );
+        assert!(!reason.contains("hunter2"), "{reason}");
     }
 
     #[test]

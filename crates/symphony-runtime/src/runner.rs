@@ -39,7 +39,7 @@ use symphony_core::config::{BackendSettings, HooksSettings};
 use symphony_core::issue::normalize_state;
 use symphony_core::prompt::{build_run_prompt, continuation_prompt, render_backend_prompt};
 use symphony_core::reference::{self, REFERENCE_TOOL, Reference};
-use symphony_core::{Issue, LoadedWorkflow, Settings, WorkflowStore};
+use symphony_core::{Issue, LoadedWorkflow, Settings, WorkflowStore, error_chain};
 use symphony_trackers::ToolBinding;
 use tokio::time::Instant;
 use tracing::Instrument;
@@ -100,8 +100,9 @@ impl Drop for UidWorkspaceSeal {
             }
             Err(err) => {
                 tracing::error!(
-                    "Quarantining task uid {uid}: could not seal {} before releasing it: {err}",
-                    self.workspace.display()
+                    "Quarantining task uid {uid}: could not seal {} before releasing it: {}",
+                    self.workspace.display(),
+                    error_chain(&err)
                 );
                 lease.quarantine();
             }
@@ -258,8 +259,9 @@ pub async fn continue_with_issue(
                     return Err(err);
                 };
                 tracing::warn!(
-                    "Issue refresh failed for {}: {err}; retrying in {}ms",
+                    "Issue refresh failed for {}: {}; retrying in {}ms",
                     issue_log(issue),
+                    error_chain(&err),
                     delay.as_millis()
                 );
                 tokio::time::sleep(delay).await;
@@ -404,6 +406,7 @@ impl AgentRunner {
                 tracing::info!(parent: &span, "Agent run cancelled for {context}");
             }
             Err(reason) => {
+                let reason = error_chain(reason);
                 tracing::error!(parent: &span, "Agent run failed for {context}: {reason}");
             }
         }
