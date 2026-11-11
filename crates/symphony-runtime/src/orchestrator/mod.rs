@@ -28,7 +28,9 @@ use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
 use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError, error_chain};
-use symphony_store::{NewRun, RetryRecord, RunStatus, TaskFailure, TaskRecord, TaskStatus};
+use symphony_store::{
+    NewRun, RetryRecord, RunStatus, StoreError, TaskFailure, TaskFence, TaskRecord, TaskStatus,
+};
 use symphony_trackers::TrackerError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
@@ -244,8 +246,9 @@ pub(crate) struct Orchestrator<'w> {
     codex_streams: StreamMap<u64, UnboundedReceiverStream<CodexEvent>>,
     shutdown: CancellationToken,
     tokens: Counter,
-    /// Task status writes, applied in order (and retried while the store is busy).
-    task_writes: mpsc::UnboundedSender<TaskWrite>,
+    /// Task status writes with the time they were queued, applied in order (and retried while
+    /// the store refuses or fails them, see [`spawn_task_writer`]).
+    task_writes: mpsc::UnboundedSender<(TaskWrite, Instant)>,
     /// Kill-switch changes, persisted in order by [`spawn_pause_writer`].
     pause_writes: mpsc::UnboundedSender<Option<String>>,
     /// Kill-switch changes sent but not written yet.
@@ -260,6 +263,8 @@ pub(crate) struct Orchestrator<'w> {
 pub(crate) enum TaskWrite {
     Finish {
         id: i64,
+        /// The run's attempt number ([`TaskRun::attempt`]).
+        attempt: u32,
         status: TaskStatus,
         result: Option<String>,
         error: Option<String>,
@@ -268,74 +273,149 @@ pub(crate) enum TaskWrite {
     },
     Release {
         id: i64,
+        /// The run's attempt number ([`TaskRun::attempt`]).
+        attempt: u32,
         reason: String,
     },
     /// A task's dispatch lease, released after its status writes (a replica recovering tasks
     /// must not see it `running` without a lease).
-    DropLease {
-        key: String,
-        owner: String,
-    },
+    DropLease { key: String, owner: String },
 }
 
+impl TaskWrite {
+    /// What the write does and to which task, for the log (never its payload).
+    fn describe(&self) -> String {
+        match self {
+            Self::Finish { id, status, .. } => {
+                format!("record status={status} of issue_id={}", task_issue_id(*id))
+            }
+            Self::Release { id, .. } => format!("queue issue_id={} again", task_issue_id(*id)),
+            Self::DropLease { key, .. } => format!("release the dispatch lease of issue_id={key}"),
+        }
+    }
+
+    /// The task of a status write; `None` for a lease release.
+    fn status_of(&self) -> Option<i64> {
+        match self {
+            Self::Finish { id, .. } | Self::Release { id, .. } => Some(*id),
+            Self::DropLease { .. } => None,
+        }
+    }
+
+    /// Applies the write once.
+    async fn apply(&self, store: &symphony_store::Store, owner: &str) -> Result<(), StoreError> {
+        let fence = |attempt: u32| TaskFence {
+            owner: owner.to_owned(),
+            attempt,
+        };
+        match self {
+            Self::Finish {
+                id,
+                attempt,
+                status,
+                result,
+                error,
+                failure,
+            } => store
+                .finish_task_run(
+                    *id,
+                    *status,
+                    result.clone(),
+                    error.clone(),
+                    *failure,
+                    fence(*attempt),
+                )
+                .await
+                .map(drop),
+            Self::Release {
+                id,
+                attempt,
+                reason,
+            } => store
+                .release_task(*id, reason.clone(), Some(fence(*attempt)))
+                .await
+                .map(drop),
+            Self::DropLease { key, owner } => store.release_lease(key.clone(), owner.clone()).await,
+        }
+    }
+}
+
+/// How long a task status write is retried while the store is busy or has lost its connection,
+/// counted from when the orchestrator queued it. A finished run's lease stops being renewed at
+/// about that moment and lapses within [`LEASE_TTL`]; from then on the store refuses the write
+/// (its [`TaskFence`]) and recovery owns the task, so a longer retry could record nothing and
+/// would only hold up the writes queued behind it.
+const TASK_WRITE_RETRY_FOR: Duration = LEASE_TTL;
+
 /// Applies task writes one after another, so a finish always lands before a later release of the
-/// same task, and retries a write the store refused as busy instead of dropping it (a dropped
-/// finish would leave the task `running` forever). A final status written asks for a poll
-/// ([`TimerEvent::TaskSettled`]), so dependants start without waiting for the next tick. Finishes
-/// and releases are fenced by `owner`'s dispatch lease: once another replica has taken a task
-/// over, this one's late writes are refused.
+/// same task.
+///
+/// - A status write (finish, release) that fails for a passing reason
+///   ([`StoreError::is_transient`]: a full queue, a lost database connection) is repeated until
+///   [`TASK_WRITE_RETRY_FOR`] has passed since it was queued, instead of being dropped: a dropped
+///   finish leaves the task `running`, and recovery then runs it again or fails it although its
+///   run had ended. Any other failure would repeat with the write, so it is dropped at once and
+///   does not hold up the writes behind it. Both are fenced ([`TaskFence`]) by `owner`'s dispatch
+///   lease and the run's attempt number: once another replica has taken the task over, or it has
+///   started again, the write is refused, so a repeat is harmless even when the failed try had in
+///   fact been applied.
+/// - A lease release gets one try, and none at all once a status write of its task has failed
+///   with anything but a full queue. Such a write may have been applied at its first try (the reply
+///   lost with the connection) and the task dispatched again under the same lease before the
+///   release comes up; releasing then would take the lease from that next run. The lease lapses by
+///   itself instead.
+/// - A final status written asks for a poll ([`TimerEvent::TaskSettled`]), so dependants start
+///   without waiting for the next tick.
 fn spawn_task_writer(
     store: symphony_store::Store,
     timers: mpsc::UnboundedSender<TimerEvent>,
     owner: String,
-) -> mpsc::UnboundedSender<TaskWrite> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<TaskWrite>();
+) -> mpsc::UnboundedSender<(TaskWrite, Instant)> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<(TaskWrite, Instant)>();
     tokio::spawn(async move {
-        while let Some(write) = rx.recv().await {
+        // Tasks whose lease is not released any more (see above), until their release came up.
+        let mut keep_lease: HashSet<i64> = HashSet::new();
+        while let Some((write, queued)) = rx.recv().await {
+            let Some(task) = write.status_of() else {
+                let kept = matches!(&write, TaskWrite::DropLease { key, .. }
+                    if task_id(key).is_some_and(|task| keep_lease.remove(&task)));
+                if kept {
+                    tracing::debug!(
+                        "Not going to {}: a status write of the task failed; the lease lapses",
+                        write.describe()
+                    );
+                } else if let Err(err) = write.apply(&store, &owner).await {
+                    tracing::warn!("Failed to {}: {err}", write.describe());
+                }
+                continue;
+            };
+            let give_up_at = queued + TASK_WRITE_RETRY_FOR;
             let mut delay = Duration::from_millis(20);
-            for _ in 0..12 {
-                let result = match &write {
-                    TaskWrite::Finish {
-                        id,
-                        status,
-                        result,
-                        error,
-                        failure,
-                    } => store
-                        .finish_task_run(
-                            *id,
-                            *status,
-                            result.clone(),
-                            error.clone(),
-                            *failure,
-                            owner.clone(),
-                        )
-                        .await
-                        .map(drop),
-                    TaskWrite::Release { id, reason } => store
-                        .release_task(*id, reason.clone(), Some(owner.clone()))
-                        .await
-                        .map(drop),
-                    TaskWrite::DropLease { key, owner } => {
-                        store.release_lease(key.clone(), owner.clone()).await
-                    }
-                };
-                match result {
-                    Err(symphony_store::StoreError::Busy) => {
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_secs(5));
-                    }
-                    Err(err) => {
-                        tracing::error!("Failed to record a task status change: {err}");
-                        break;
-                    }
+            let mut tries = 0u32;
+            loop {
+                tries += 1;
+                let err = match write.apply(&store, &owner).await {
                     Ok(()) => {
                         if matches!(&write, TaskWrite::Finish { status, .. } if status.is_final()) {
                             let _ = timers.send(TimerEvent::TaskSettled);
                         }
                         break;
                     }
+                    Err(err) => err,
+                };
+                // Only a full queue is certain not to have applied the write.
+                if !matches!(err, StoreError::Busy) {
+                    keep_lease.insert(task);
                 }
+                if !err.is_transient() || Instant::now() + delay > give_up_at {
+                    tracing::error!(
+                        "Failed to {}; giving up after {tries} tries: {err}",
+                        write.describe()
+                    );
+                    break;
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
             }
         }
     });
@@ -379,18 +459,26 @@ impl<'w> Orchestrator<'w> {
         self.ctx.workflow.settings()
     }
 
-    /// Records the end of a task's run (`status` final or `blocked`); `failure` says why a
-    /// `failed` run failed when the task's retry policy may retry it (`None`: never retried).
+    /// Queues `write` for [`spawn_task_writer`].
+    fn send_task_write(&self, write: TaskWrite) {
+        let _ = self.task_writes.send((write, Instant::now()));
+    }
+
+    /// Records the end of the run `attempt` of task `id` (`status` final or `blocked`); `failure`
+    /// says why a `failed` run failed when the task's retry policy may retry it (`None`: never
+    /// retried).
     pub(crate) fn task_finish(
         &self,
         id: i64,
+        attempt: u32,
         status: TaskStatus,
         result: Option<String>,
         error: Option<String>,
         failure: Option<TaskFailure>,
     ) {
-        let _ = self.task_writes.send(TaskWrite::Finish {
+        self.send_task_write(TaskWrite::Finish {
             id,
+            attempt,
             status,
             result,
             error,
@@ -398,10 +486,11 @@ impl<'w> Orchestrator<'w> {
         });
     }
 
-    /// Puts a running task back to `queued` (stopped from outside).
-    pub(crate) fn task_release(&self, id: i64, reason: &str) {
-        let _ = self.task_writes.send(TaskWrite::Release {
+    /// Puts the running task `id` back to `queued` (its run `attempt` was stopped from outside).
+    pub(crate) fn task_release(&self, id: i64, attempt: u32, reason: &str) {
+        self.send_task_write(TaskWrite::Release {
             id,
+            attempt,
             reason: reason.to_owned(),
         });
     }
@@ -592,16 +681,21 @@ impl<'w> Orchestrator<'w> {
             }
             RuntimeCommand::CancelTask { id, reply } => {
                 let issue_id = task_issue_id(id);
-                let running = self.state.running.contains_key(&issue_id);
+                let running = self.state.running.get(&issue_id);
+                let attempt = running.and_then(|entry| entry.task.as_ref().map(|t| t.attempt));
+                let running = running.is_some();
                 if running {
                     tracing::info!("Cancelling task run issue_id={issue_id}");
-                    self.task_finish(
-                        id,
-                        TaskStatus::Cancelled,
-                        None,
-                        Some("cancelled by client".into()),
-                        None,
-                    );
+                    if let Some(attempt) = attempt {
+                        self.task_finish(
+                            id,
+                            attempt,
+                            TaskStatus::Cancelled,
+                            None,
+                            Some("cancelled by client".into()),
+                            None,
+                        );
+                    }
                     self.terminate_running_issue(&issue_id, false, "cancelled by client")
                         .await;
                 } else {
@@ -732,7 +826,7 @@ impl<'w> Orchestrator<'w> {
             return;
         }
         if task_id(issue_id).is_some() {
-            let _ = self.task_writes.send(TaskWrite::DropLease {
+            self.send_task_write(TaskWrite::DropLease {
                 key: issue_id.to_owned(),
                 owner: self.ctx.replica_id.clone(),
             });
@@ -1041,7 +1135,7 @@ impl<'w> Orchestrator<'w> {
         for (issue_id, reason) in over {
             self.stop_and_block(&issue_id, reason).await;
         }
-        let over_task_limit: Vec<(String, i64, String)> = self
+        let over_task_limit: Vec<(String, i64, u32, String)> = self
             .state
             .running
             .iter()
@@ -1053,14 +1147,22 @@ impl<'w> Orchestrator<'w> {
                     (
                         issue_id.clone(),
                         task.id,
+                        task.attempt,
                         format!("task token limit exhausted: {used} of {limit} tokens used"),
                     )
                 })
             })
             .collect();
-        for (issue_id, task, reason) in over_task_limit {
+        for (issue_id, task, attempt, reason) in over_task_limit {
             tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
-            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()), None);
+            self.task_finish(
+                task,
+                attempt,
+                TaskStatus::Failed,
+                None,
+                Some(reason.clone()),
+                None,
+            );
             self.terminate_running_issue(&issue_id, false, &reason)
                 .await;
         }

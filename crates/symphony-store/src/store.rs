@@ -28,7 +28,9 @@ use crate::model::{
 };
 use crate::ops::{self, NewEvent};
 use crate::schema;
-use crate::tasks::{self, NewTask, TaskFailure, TaskPage, TaskQuery, TaskRecord, TaskStatus};
+use crate::tasks::{
+    self, NewTask, TaskFailure, TaskFence, TaskPage, TaskQuery, TaskRecord, TaskStatus,
+};
 
 type Job = Box<dyn FnOnce(&mut dyn Db) + Send + 'static>;
 
@@ -64,6 +66,36 @@ struct Inner {
     shared: bool,
     /// `false` while the (PostgreSQL) connection is lost; always `true` for SQLite.
     healthy: Arc<AtomicBool>,
+    /// Failures to inject (tests of callers' error handling), see [`Store::inject_failure`].
+    #[cfg(feature = "test-util")]
+    faults: Arc<Faults>,
+}
+
+/// A failure injected into the next operations of one name.
+#[cfg(feature = "test-util")]
+struct Fault {
+    op: &'static str,
+    remaining: usize,
+    error: StoreError,
+    applied: bool,
+}
+
+#[cfg(feature = "test-util")]
+#[derive(Default)]
+struct Faults(std::sync::Mutex<Option<Fault>>);
+
+#[cfg(feature = "test-util")]
+impl Faults {
+    /// The failure for one `op` operation that is about to run, if any: `(error, applied)`.
+    fn take(&self, op: &str) -> Option<(StoreError, bool)> {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fault = slot.as_mut().filter(|f| f.op == op && f.remaining > 0)?;
+        fault.remaining -= 1;
+        Some((fault.error.clone(), fault.applied))
+    }
 }
 
 impl fmt::Debug for Store {
@@ -250,8 +282,32 @@ impl Store {
                 label,
                 shared,
                 healthy,
+                #[cfg(feature = "test-util")]
+                faults: Arc::default(),
             })),
         })
+    }
+
+    /// Makes the next `count` operations named `op` (the store method's name, for example
+    /// `"finish_task_run"`) fail with `error`, replacing an earlier injection. With `applied` the
+    /// operation still runs and only its reply is replaced, like a reply lost with the connection.
+    ///
+    /// Behind the `test-util` feature: for tests of how callers handle store failures.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn inject_failure(&self, op: &'static str, count: usize, error: StoreError, applied: bool) {
+        if let Some(inner) = &self.inner {
+            *inner
+                .faults
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Fault {
+                op,
+                remaining: count,
+                error,
+                applied,
+            });
+        }
     }
 
     /// Queue `op` on the database thread. `disabled` produces the result of a disabled store.
@@ -264,6 +320,15 @@ impl Store {
             return Pending::ready(Ok(disabled()));
         };
         let (reply, receiver) = oneshot::channel();
+        #[cfg(feature = "test-util")]
+        let op = {
+            let faults = Arc::clone(&inner.faults);
+            move |conn: &mut dyn Db| match faults.take(name) {
+                None => op(conn),
+                Some((error, false)) => Err(error),
+                Some((error, true)) => op(conn).and(Err(error)),
+            }
+        };
         let job: Job = Box::new(move |conn| {
             let result = catch_unwind(AssertUnwindSafe(|| op(conn)))
                 .unwrap_or_else(|_| Err(StoreError::Internal(format!("{name} panicked"))));
@@ -481,8 +546,9 @@ impl Store {
     }
 
     /// The orchestrator's [`Store::finish_task`] for the run it dispatched: refused (`None`) when
-    /// `owner` no longer holds the task's dispatch lease, and a `failed` run of a `failure` kind
-    /// the task's retry policy retries, with attempts left, is queued again instead.
+    /// the task is not on `fence`'s run any more (its owner lost the dispatch lease, or the task
+    /// has started again since), so it is safe to repeat after an error. A `failed` run of a
+    /// `failure` kind the task's retry policy retries, with attempts left, is queued again instead.
     pub fn finish_task_run(
         &self,
         id: i64,
@@ -490,7 +556,7 @@ impl Store {
         result: Option<String>,
         error: Option<String>,
         failure: Option<TaskFailure>,
-        owner: String,
+        fence: TaskFence,
     ) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
         self.submit(
@@ -504,7 +570,7 @@ impl Store {
                     result.as_deref(),
                     error.as_deref(),
                     failure,
-                    Some(&owner),
+                    Some(&fence),
                     now,
                 )
             },
@@ -535,19 +601,19 @@ impl Store {
     }
 
     /// A running task whose run was stopped for an outside reason goes back to `queued` (the
-    /// attempt does not count). With `owner`, only while it holds the task's dispatch lease.
+    /// attempt does not count). With `fence`, only while the task is still on that run.
     pub fn release_task(
         &self,
         id: i64,
         reason: impl Into<String>,
-        owner: Option<String>,
+        fence: Option<TaskFence>,
     ) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
         let reason = reason.into();
         self.submit(
             "release_task",
             || None,
-            move |conn| tasks::release_task(conn, id, &reason, owner.as_deref(), now),
+            move |conn| tasks::release_task(conn, id, &reason, fence.as_ref(), now),
         )
     }
 

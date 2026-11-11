@@ -56,6 +56,9 @@ pub(crate) fn task_issue_id(id: i64) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TaskRun {
     pub id: i64,
+    /// The task's attempt number when this run started; with the lease owner it fences the run's
+    /// status writes (`symphony_store::TaskFence`).
+    pub attempt: u32,
     pub max_tokens: Option<u64>,
     /// Final agent message, once the worker reported it.
     pub result: Option<String>,

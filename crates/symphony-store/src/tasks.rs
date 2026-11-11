@@ -366,6 +366,28 @@ macro_rules! held_by {
     };
 }
 
+/// The run a task write comes from: the replica that dispatched it and the task's attempt number
+/// ([`TaskRecord::attempts`]) when that run started. A fenced write is applied only while `owner`
+/// holds the task's live dispatch lease and the task is still on that attempt, so neither a
+/// replica that lost the task nor a write retried after the task started again can change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskFence {
+    /// The lease owner (replica id) that dispatched the run.
+    pub owner: String,
+    /// `attempts` of the task when the run started.
+    pub attempt: u32,
+}
+
+impl TaskFence {
+    /// `(owner, attempt)` as statement parameters; both `NULL` for an unfenced write.
+    fn params(fence: Option<&Self>) -> (Option<&str>, Option<i64>) {
+        (
+            fence.map(|f| f.owner.as_str()),
+            fence.map(|f| i64::from(f.attempt)),
+        )
+    }
+}
+
 fn opt_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok())
 }
@@ -689,10 +711,11 @@ pub(crate) fn settle_dependants(db: &mut dyn Db, now: DateTime<Utc>) -> Result<u
 }
 
 /// `running` → `status` (a final status or `blocked`). `None` when the task was not running, or
-/// when `owner` is given and no longer holds the task's live dispatch lease (another replica took
-/// it over). A `failed` run of a kind the task's policy retries ([`TaskFailure`]), with attempts
-/// left, goes back to `queued` instead (`next_attempt_at` after its backoff). A task that ends
-/// failed or cancelled fails its waiting dependants.
+/// when `fence` is given and the write is not that run's any more: its owner no longer holds the
+/// task's live dispatch lease (another replica took it over), or the task has started again since
+/// (see [`TaskFence`]). A `failed` run of a kind the task's policy retries ([`TaskFailure`]), with
+/// attempts left, goes back to `queued` instead (`next_attempt_at` after its backoff). A task that
+/// ends failed or cancelled fails its waiting dependants.
 #[allow(clippy::too_many_arguments)] // One row's whole outcome; a struct would only rename them.
 pub(crate) fn finish_task(
     db: &mut dyn Db,
@@ -701,7 +724,7 @@ pub(crate) fn finish_task(
     result: Option<&str>,
     error: Option<&str>,
     failure: Option<TaskFailure>,
-    owner: Option<&str>,
+    fence: Option<&TaskFence>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
     if matches!(
@@ -714,14 +737,15 @@ pub(crate) fn finish_task(
     }
     let now_ms = now.timestamp_millis();
     let finished = status.is_final().then_some(now_ms);
+    let (owner, attempt) = TaskFence::params(fence);
     let changed = in_transaction(db, |db| {
         let changed = db.execute(
             concat!(
                 "UPDATE tasks SET status = ?2, result = ?3, error = ?4, updated_at = ?5, ",
                 "finished_at = ?6 WHERE id = ?1 AND status = 'running' ",
-                "AND (CAST(?7 AS TEXT) IS NULL OR ",
+                "AND (CAST(?7 AS TEXT) IS NULL OR (",
                 held_by!("?7", "?5"),
-                ")"
+                " AND attempts = ?8))"
             ),
             &vals![
                 id,
@@ -731,6 +755,7 @@ pub(crate) fn finish_task(
                 now_ms,
                 finished,
                 owner,
+                attempt,
             ],
         )?;
         if changed == 0 {
@@ -855,23 +880,24 @@ pub(crate) fn requeue_task(
 
 /// A running task whose run was stopped for an outside reason (kill switch, daily budget,
 /// shutdown) goes back to `queued`, keeping `reason` as its error; the attempt does not count
-/// against its retry policy. Other statuses, and a task whose lease `owner` no longer holds, are
-/// left alone.
+/// against its retry policy. Other statuses, and a task whose run is not `fence`'s any more (see
+/// [`TaskFence`]), are left alone.
 pub(crate) fn release_task(
     db: &mut dyn Db,
     id: i64,
     reason: &str,
-    owner: Option<&str>,
+    fence: Option<&TaskFence>,
     now: DateTime<Utc>,
 ) -> Result<Option<TaskRecord>> {
+    let (owner, attempt) = TaskFence::params(fence);
     db.execute(
         concat!(
             "UPDATE tasks SET status = 'queued', error = ?2, updated_at = ?3 ",
-            "WHERE id = ?1 AND status = 'running' AND (CAST(?4 AS TEXT) IS NULL OR ",
+            "WHERE id = ?1 AND status = 'running' AND (CAST(?4 AS TEXT) IS NULL OR (",
             held_by!("?4", "?3"),
-            ")"
+            " AND attempts = ?5))"
         ),
-        &vals![id, reason, now.timestamp_millis(), owner],
+        &vals![id, reason, now.timestamp_millis(), owner, attempt],
     )?;
     get_task(db, id)
 }

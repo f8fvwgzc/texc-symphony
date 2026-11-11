@@ -68,8 +68,12 @@ waiting / queued / blocked / running ──▶ cancelled   (POST /cancel)
   them back to `queued` without using up an attempt. A replica that stops without a shutdown
   (a crash, a lost database connection) leaves its tasks to the others: once its dispatch
   leases expire (60 s) a peer, or the replica itself on restart, recovers them as `interrupted`
-  attempts. Writes are fenced by the lease, so a replica that lost a task can no longer finish
-  or release it: a task taken over is recorded once, by its current holder.
+  attempts. Writes are fenced by the lease and the attempt number, so a replica that lost a task
+  can no longer finish or release it, and a late write of one run never lands on the task's next
+  run: a task taken over is recorded once, by its current holder. A status write that meets a
+  lost database connection is repeated for up to 60 s. If it still cannot be written, the task
+  stays `running` and is recovered as `interrupted` once its lease has lapsed: by a peer with
+  PostgreSQL, at the next start with SQLite.
 - A task's identifier is `task-<id>` (lowercase, so it cannot be a Linear or Jira key); its runs
   appear in the dashboard and in `GET /api/v1/runs?issue=task-<id>`. Its workspace is
   `<workspace.root>/.tasks/<id>`, a directory no tracker identifier maps to, and it is removed
