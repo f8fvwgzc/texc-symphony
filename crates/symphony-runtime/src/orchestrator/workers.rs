@@ -207,7 +207,14 @@ impl Orchestrator<'_> {
                 "Task run finished for issue_id={issue_id} session_id={session_id} status={task_status}"
             );
             entry.recorder.finish(run_status, error.clone());
-            self.task_finish(task.id, task_status, task.result, error, failure);
+            self.task_finish(
+                task.id,
+                task.attempt,
+                task_status,
+                task.result,
+                error,
+                failure,
+            );
             self.release_issue_claim(issue_id);
             // Final: the clone is not needed any more (unblocking a failed task clones again).
             self.remove_task_workspace(task.id);
@@ -289,11 +296,18 @@ impl Orchestrator<'_> {
         error: String,
     ) {
         self.remove_retry_entry(issue_id);
-        if let Some(task) = task_id(issue_id) {
+        if let Some(task) = &entry.task {
             // The runner already sealed this workspace to root before the worker exited (see
             // `UidWorkspaceSeal`), so a re-leased uid cannot reach the blocked task's clone; an
             // unblock re-chowns it.
-            self.task_finish(task, TaskStatus::Blocked, None, Some(error.clone()), None);
+            self.task_finish(
+                task.id,
+                task.attempt,
+                TaskStatus::Blocked,
+                None,
+                Some(error.clone()),
+                None,
+            );
         }
         self.state.claimed.insert(issue_id.to_owned());
         self.state.blocked.insert(
@@ -378,7 +392,7 @@ impl Orchestrator<'_> {
         if let Some(task) = entry.task.as_ref().filter(|_| release_task) {
             // Stopped from outside (kill switch, daily budget): queued again. A task that was
             // finished first (cancel, failure) is not running any more and stays as it is.
-            self.task_release(task.id, reason);
+            self.task_release(task.id, task.attempt, reason);
         }
         if cleanup {
             self.cleanup_issue_workspace(
@@ -406,9 +420,9 @@ impl Orchestrator<'_> {
         let entries: Vec<RunningEntry> = self.state.running.drain().map(|(_, e)| e).collect();
         let mut recorders = Vec::new();
         let mut stops = Vec::new();
-        let tasks: Vec<i64> = entries
+        let tasks: Vec<(i64, u32)> = entries
             .iter()
-            .filter_map(|entry| entry.task.as_ref().map(|task| task.id))
+            .filter_map(|entry| entry.task.as_ref().map(|task| (task.id, task.attempt)))
             .collect();
         for mut entry in entries {
             if let Some(worker) = entry.worker.take() {
@@ -423,8 +437,8 @@ impl Orchestrator<'_> {
         }
         // A hand-off, not a failure: queued again without using up an attempt (before the
         // lease drops below, through the same ordered writer).
-        for task in tasks {
-            self.task_release(task, "shutdown; queued again");
+        for (task, attempt) in tasks {
+            self.task_release(task, attempt, "shutdown; queued again");
         }
         // Another replica may take the work over now instead of after the lease TTL.
         let held: Vec<String> = self.state.leases.keys().cloned().collect();

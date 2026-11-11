@@ -45,6 +45,11 @@ pub enum StoreError {
         /// Underlying cause.
         reason: String,
     },
+    /// The database connection was lost (PostgreSQL: closed, an I/O error, the server ending the
+    /// session) or could not be reopened yet. The operation may or may not have been applied; a
+    /// later operation reconnects.
+    #[error("store_connection_lost: {0}")]
+    ConnectionLost(String),
     /// The background database thread is gone (it was never started or it exited).
     #[error("store_unavailable: persistence thread is not running")]
     Unavailable,
@@ -75,6 +80,17 @@ pub enum StoreError {
     InvalidConfig(String),
 }
 
+impl StoreError {
+    /// Whether the same operation may succeed when repeated: the store refused it for now
+    /// ([`StoreError::Busy`]) or lost its database connection ([`StoreError::ConnectionLost`]).
+    /// Every other failure is about the operation itself and repeats with it. After a lost
+    /// connection the operation may already have been applied, so only repeat one that is safe to
+    /// apply twice.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Busy | Self::ConnectionLost(_))
+    }
+}
+
 impl From<rusqlite::Error> for StoreError {
     fn from(err: rusqlite::Error) -> Self {
         match err {
@@ -103,5 +119,31 @@ pub(crate) fn postgres_reason(err: &postgres::Error) -> String {
     match err.as_db_error() {
         Some(db) => format!("{}: {}", db.code().code(), db.message()),
         None => error_chain(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_full_queue_and_a_lost_connection_are_transient() {
+        assert!(StoreError::Busy.is_transient());
+        assert!(StoreError::ConnectionLost("reset by peer".into()).is_transient());
+        // About the operation itself: repeating it repeats the failure.
+        for err in [
+            StoreError::Postgres("22021: invalid byte sequence".into()),
+            StoreError::Sqlite("no such table: tasks".into()),
+            StoreError::Internal("finish_task_run panicked".into()),
+            StoreError::InvalidArgument("finish_task needs a final or blocked status".into()),
+            StoreError::Unavailable,
+        ] {
+            assert!(!err.is_transient(), "{err}");
+        }
+        assert!(
+            StoreError::ConnectionLost("reset by peer".into())
+                .to_string()
+                .starts_with("store_connection_lost: ")
+        );
     }
 }

@@ -3,15 +3,17 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use symphony_core::config::schema::is_postgres_url;
+
 use crate::error::{Result, StoreError};
 use crate::store::Store;
 
 /// Env var naming the database file (`:memory:` for an in-memory database; empty, `off`,
 /// `none`, `disabled`, `false` or `0` to turn persistence off; a `postgres://` URL works too).
-pub const ENV_DB_PATH: &str = "SYMPHONY_DB_PATH";
+pub const ENV_DB_PATH: &str = symphony_core::config::schema::ENV_DB_PATH;
 /// Env var with a PostgreSQL connection string (`postgres://user:pass@host/db?sslmode=require`);
 /// wins over [`ENV_DB_PATH`].
-pub const ENV_DATABASE_URL: &str = "SYMPHONY_DATABASE_URL";
+pub const ENV_DATABASE_URL: &str = symphony_core::config::schema::ENV_DATABASE_URL;
 /// Env var with the retention window in whole days (`0` keeps history forever).
 pub const ENV_RETENTION_DAYS: &str = "SYMPHONY_DB_RETENTION_DAYS";
 /// Env var with the payload retention window in whole days (`0` keeps payloads as long as the
@@ -55,11 +57,6 @@ impl std::fmt::Debug for StoreLocation {
                 .finish(),
         }
     }
-}
-
-fn is_postgres_url(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.starts_with("postgres://") || lower.starts_with("postgresql://")
 }
 
 /// Resolved store configuration.

@@ -247,7 +247,14 @@ impl Orchestrator<'_> {
             };
             if let Some(error) = refusal {
                 tracing::warn!("Not running {}: {error}", issue_context(&issue));
-                self.task_finish(task.id, TaskStatus::Failed, None, Some(error), None);
+                self.task_finish(
+                    task.id,
+                    task.attempts,
+                    TaskStatus::Failed,
+                    None,
+                    Some(error),
+                    None,
+                );
                 self.drop_lease(&issue_id);
                 continue;
             }
@@ -261,7 +268,12 @@ impl Orchestrator<'_> {
                         branch: task.branch.clone(),
                         timeout_ms: task.limits.timeout_ms,
                     },
-                    task.limits.max_tokens,
+                    TaskRun {
+                        id: task.id,
+                        attempt: task.attempts,
+                        max_tokens: task.limits.max_tokens,
+                        result: None,
+                    },
                 )),
             };
             self.spawn_issue_on_worker_host(issue, None, None, plan);
@@ -406,11 +418,7 @@ impl Orchestrator<'_> {
                 recorder,
                 pricing,
                 cost_micro_usd: 0,
-                task: plan.task.map(|(spec, max_tokens)| TaskRun {
-                    id: spec.id,
-                    max_tokens,
-                    result: None,
-                }),
+                task: plan.task.map(|(_, run)| run),
             },
         );
         self.state.claimed.insert(issue_id.clone());
@@ -425,8 +433,8 @@ impl Orchestrator<'_> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RunPlan {
     pub backend: Option<String>,
-    /// The task and its token limit.
-    pub task: Option<(TaskSpec, Option<u64>)>,
+    /// The task: what the worker gets, and what the running entry keeps of it.
+    pub task: Option<(TaskSpec, TaskRun)>,
 }
 
 /// The issue a task's runs are recorded under (`task:<id>` / `task-<id>`).

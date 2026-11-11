@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Result, StoreError};
+use crate::error::{Result, StoreError, postgres_reason};
 
 /// One bound or returned value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +289,7 @@ impl PostgresDb {
             return Ok(());
         }
         if self.in_transaction {
-            return Err(StoreError::Internal(
+            return Err(StoreError::ConnectionLost(
                 "the PostgreSQL connection was lost during a transaction".into(),
             ));
         }
@@ -298,7 +298,7 @@ impl PostgresDb {
         if let Some(at) = self.last_failed_reconnect
             && at.elapsed() < RECONNECT_COOLDOWN
         {
-            return Err(StoreError::Internal(
+            return Err(StoreError::ConnectionLost(
                 "the PostgreSQL connection is down; reconnect is cooling down".into(),
             ));
         }
@@ -314,7 +314,13 @@ impl PostgresDb {
             }
             Err(err) => {
                 self.last_failed_reconnect = Some(std::time::Instant::now());
-                Err(err)
+                let reason = match err {
+                    StoreError::Open { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                Err(StoreError::ConnectionLost(format!(
+                    "cannot reconnect to PostgreSQL: {reason}"
+                )))
             }
         }
     }
@@ -333,6 +339,7 @@ impl PostgresDb {
             if connection_lost {
                 self.lost = true;
                 self.set_healthy(false);
+                return Err(StoreError::ConnectionLost(postgres_reason(err)));
             }
         }
         Ok(result?)

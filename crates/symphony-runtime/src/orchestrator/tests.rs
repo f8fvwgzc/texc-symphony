@@ -1884,6 +1884,230 @@ async fn queued_tasks_run_once_and_record_their_result() {
     assert_eq!(runs[0].issue_identifier, format!("task-{id}"));
 }
 
+/// Lets `time` pass on the paused clock in steps, waiting after each for the store thread to
+/// finish what was submitted to it. The paused clock jumps ahead whenever the runtime is idle,
+/// also while a store operation is still running on its (real) thread; without the waits the
+/// clock could run past an operation "from earlier" that has not run yet.
+async fn pass_time(store: &Store, time: Duration) {
+    let step = ms(250);
+    let mut passed = Duration::ZERO;
+    while passed < time {
+        tokio::time::sleep(step).await;
+        store.flush().await.unwrap();
+        passed += step;
+    }
+}
+
+/// Waits until the store has run what the orchestrator's helper tasks (the task writer) had ready
+/// to submit.
+async fn settle(store: &Store) {
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+        store.flush().await.unwrap();
+    }
+}
+
+fn connection_lost() -> symphony_store::StoreError {
+    symphony_store::StoreError::ConnectionLost("test: the connection was reset".into())
+}
+
+/// A lost database connection while a task's final status is written must not lose it: before,
+/// the write was dropped at the first error, the task stayed `running`, and recovery ran it again
+/// (or failed it) although its run had succeeded.
+#[tokio::test(start_paused = true)]
+async fn a_task_status_write_is_retried_while_the_connection_is_lost() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::clone(&seen), || Ok(())),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let key = format!("task:{id}");
+    assert!(orch.state.running.contains_key(&key));
+
+    // The first three tries of the finish meet a dead connection (and are not applied).
+    store.inject_failure("finish_task_run", 3, connection_lost(), false);
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    pass_time(&store, Duration::from_secs(5)).await;
+
+    let task = store.get_task(id).await.unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Succeeded, "the status was lost");
+    assert_eq!(task.result.as_deref(), Some("five seven five"));
+    assert_eq!(task.attempts, 1, "the task did not run again");
+    // The lease is left to lapse: after a failed try its release could come too late (below).
+    assert_eq!(
+        store.lease_holder(&key).await.unwrap().as_deref(),
+        Some(h.ctx.replica_id.as_str())
+    );
+}
+
+/// The reply to a finish is lost with the connection although the finish was applied, and the
+/// task (queued again by its retry policy) starts its next run under the same replica's lease
+/// while the writer is still repeating that finish. Neither the repeated finish nor the first
+/// run's lease release may touch the second run: without its lease another replica would start
+/// the task a second time.
+#[tokio::test(start_paused = true)]
+async fn late_writes_of_a_run_do_not_touch_the_task_s_next_run() {
+    use symphony_store::{TaskFailure, TaskRetry, TaskStatus};
+    let store = Store::open_in_memory().unwrap();
+    let id = store
+        .create_task(symphony_store::NewTask {
+            prompt: "flaky".into(),
+            retry: TaskRetry {
+                max_attempts: 3,
+                backoff_ms: 0,
+                max_backoff_ms: 0,
+                on: vec![TaskFailure::Error],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id;
+    let key = format!("task:{id}");
+    // The first run fails at once; every later one runs until it is cancelled.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&runs);
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
+        let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+        async move {
+            if first {
+                return Err(RunError::Other("boom".into()));
+            }
+            ctx.cancel.cancelled().await;
+            Err(RunError::Cancelled)
+        }
+    }));
+    let mut h = Harness::with_store(json!({"tracker": {"kind": "none"}}), factory, store.clone());
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&key));
+
+    // Every finish is applied but answered with a lost connection, so the writer keeps repeating
+    // the first run's finish (and has not come to that run's lease release yet).
+    store.inject_failure("finish_task_run", usize::MAX, connection_lost(), true);
+    let started = tokio::time::Instant::now();
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    settle(&store).await;
+    assert_eq!(
+        store.get_task(id).await.unwrap().unwrap().status,
+        TaskStatus::Queued,
+        "the first finish was applied: the retry policy queued the task again"
+    );
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&key), "the second run");
+    assert!(
+        started.elapsed() < TASK_WRITE_RETRY_FOR / 2,
+        "the writer must still be repeating the first run's finish here ({:?})",
+        started.elapsed()
+    );
+
+    // The connection is back: the repeated finish and then the lease release come up.
+    store.inject_failure("finish_task_run", 0, connection_lost(), true);
+    pass_time(&store, Duration::from_secs(10)).await;
+    let task = store.get_task(id).await.unwrap().unwrap();
+    assert_eq!(
+        (task.status, task.attempts, task.failed_attempts),
+        (TaskStatus::Running, 2, 1),
+        "the repeated finish of run 1 did not fail run 2"
+    );
+    assert_eq!(
+        store.lease_holder(&key).await.unwrap().as_deref(),
+        Some(h.ctx.replica_id.as_str()),
+        "run 2 lost its lease to run 1's late release"
+    );
+    orch.renew_leases().await;
+    assert!(
+        orch.state.running.contains_key(&key),
+        "run 2 goes on under its lease"
+    );
+    orch.terminate_running_issue(&key, false, "test").await;
+}
+
+/// A failure that is about the write itself (here: the database rejects the row) would repeat with
+/// it. It is dropped at once, as before, and does not hold up the writes queued behind it.
+#[tokio::test(start_paused = true)]
+async fn a_task_status_write_the_store_rejects_is_not_retried() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::clone(&seen), || Ok(())),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    // One rejection only: a second try would succeed.
+    let rejected = symphony_store::StoreError::Postgres(
+        "22021: invalid byte sequence for encoding \"UTF8\": 0x00".into(),
+    );
+    store.inject_failure("finish_task_run", 1, rejected, false);
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    pass_time(&store, Duration::from_secs(5)).await;
+    assert_eq!(
+        store.get_task(id).await.unwrap().unwrap().status,
+        TaskStatus::Running,
+        "the write was not repeated"
+    );
+}
+
+/// The retry is bounded: once the run's lease would have lapsed the store refuses the write anyway
+/// (recovery owns the task), so the writer gives it up and goes on with the writes behind it.
+#[tokio::test(start_paused = true)]
+async fn a_task_status_write_is_given_up_after_the_retry_window() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}}),
+        task_factory(Arc::clone(&seen), || Ok(())),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.maybe_dispatch().await;
+    let key = format!("task:{id}");
+
+    store.inject_failure("finish_task_run", usize::MAX, connection_lost(), false);
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    pass_time(&store, TASK_WRITE_RETRY_FOR + Duration::from_secs(10)).await;
+    // The connection is back, but nobody is repeating the write any more.
+    store.inject_failure("finish_task_run", 0, connection_lost(), false);
+    pass_time(&store, Duration::from_secs(10)).await;
+    assert_eq!(
+        store.get_task(id).await.unwrap().unwrap().status,
+        TaskStatus::Running,
+        "the write was given up; the task is left to recovery"
+    );
+    assert_eq!(
+        store.lease_holder(&key).await.unwrap().as_deref(),
+        Some(h.ctx.replica_id.as_str()),
+        "the lease is left to lapse, not released behind a write that may have been applied"
+    );
+
+    // The writer is not stuck on it: the next task's status lands.
+    let next = store
+        .create_task(symphony_store::NewTask {
+            prompt: "next".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id;
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&format!("task:{next}")));
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    task_status(&store, next, TaskStatus::Succeeded).await;
+}
+
 /// A dependant waits for its dependency and is dispatched as soon as it succeeded (not at the next
 /// poll); a failed dependency fails it instead.
 #[tokio::test(start_paused = true)]

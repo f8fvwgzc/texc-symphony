@@ -223,8 +223,9 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   - A dynamic tool call is bounded by `turn_timeout_ms`. Elixir's turn clock did not run during a
     tool call. On timeout the call gets a failure reply, `Dynamic tool call timed out after Nms.`,
     and the turn continues.
-  - stdout lines go through a bounded channel, so a server that floods output gets backpressure
-    instead of unbounded buffering.
+  - stdout lines go through a channel bounded in lines and in bytes, so a server that floods
+    output gets backpressure instead of unbounded buffering. A stdout or stderr line over 10 MiB
+    (SPEC 10.1) is skipped with a warning; Elixir buffered a line of any length.
 - **Startup.** The sandbox policy is resolved before the process is spawned; Elixir opened the port
   first. Payload errors are explicit:
   - `thread/start` without `thread.id` gives `invalid_thread_payload` (C.13 #5).
