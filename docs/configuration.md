@@ -891,6 +891,11 @@ the tracker tool, which Symphony executes with the credential.
 | `asana` | `ASANA_PAT`, plus a `$NAME` in `provider.api_key` |
 | `memory` | none |
 
+Symphony's own secrets are removed the same way, for every agent backend and for hooks:
+`SYMPHONY_API_TOKEN` (and a `$NAME` in `server.api_token`), the run-history database's connection
+string (`SYMPHONY_DATABASE_URL`, and `SYMPHONY_DB_PATH` while it holds a `postgres://` URL), and
+the keys of the [LLM connection contract](#llm-connection-contract) and of `backends`.
+
 Keep credentials out of the file itself: write `$NAME` and set the variable in Symphony's
 environment. A literal token in a `WORKFLOW.md` that is committed to the repository the agents
 clone is readable by the agents. Symphony redacts credentials in its own logs and error messages.

@@ -32,7 +32,7 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_PORT` | unset (no HTTP server) | HTTP port; same as `--port` or `server.port` in `WORKFLOW.md`; `0` picks a free port |
 | `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
 | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`); a `postgres://` URL selects PostgreSQL |
-| `SYMPHONY_DATABASE_URL` | unset | PostgreSQL connection string (wins over `SYMPHONY_DB_PATH`), see [PostgreSQL and replicas](#postgresql-and-replicas) |
+| `SYMPHONY_DATABASE_URL` | unset | PostgreSQL connection string (wins over `SYMPHONY_DB_PATH`), see [PostgreSQL and replicas](#postgresql-and-replicas); kept out of agent and hook environments |
 | `SYMPHONY_REPLICA_ID` | `local` (SQLite), `<host>-<pid>-<random>` (PostgreSQL) | this process in dispatch leases; a stable id (StatefulSet pod name) lets a restarted replica recover its work at once |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
 | `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
