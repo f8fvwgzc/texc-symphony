@@ -119,6 +119,17 @@ fn result_factory(result: fn() -> WorkerResult) -> Arc<dyn WorkerFactory> {
     }))
 }
 
+/// Worker whose run number `n` (from 0, counted in `runs`) ends with `result(n)`.
+fn counted_factory(
+    runs: Arc<AtomicUsize>,
+    result: fn(usize) -> WorkerResult,
+) -> Arc<dyn WorkerFactory> {
+    Arc::new(FnWorkerFactory(move |_ctx: WorkerContext| {
+        let result = result(runs.fetch_add(1, Ordering::SeqCst));
+        async move { result }
+    }))
+}
+
 /// Worker that emits `events` and then waits for cancellation.
 fn emitting_factory(events: Vec<CodexEvent>) -> Arc<dyn WorkerFactory> {
     Arc::new(FnWorkerFactory(move |ctx: WorkerContext| {
@@ -196,6 +207,7 @@ fn fake_entry(identifier: &str, issue: Issue, worker_host: Option<&str>) -> Runn
         tokens: Default::default(),
         turn_count: 0,
         retry_attempt: 0,
+        continuations: 0,
         started_at: Utc::now(),
         started: now,
         recorder: RunRecorder::default(),
@@ -487,6 +499,131 @@ async fn failed_retries_stop_at_the_retry_limit_and_block_the_issue() {
     orch.reconcile_blocked_issues().await;
     assert!(!orch.state.blocked.contains_key("i-1"));
     assert!(!orch.state.claimed.contains("i-1"));
+}
+
+/// Runs that end normally with the issue still active stop at `agent.max_continuations`
+/// continuations: the next one blocks the issue like the retry limit does, and leaving the active
+/// states releases it.
+#[tokio::test(start_paused = true)]
+async fn normal_exits_stop_at_the_continuation_limit_and_block_the_issue() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut h = Harness::new(
+        json!({"agent": {"max_continuations": 2}}),
+        counted_factory(Arc::clone(&runs), |_| Ok(())),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+
+    // The first run and two continuations end with the issue active; a third would pass the limit.
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    let blocked = &orch.state.blocked["i-1"];
+    assert_eq!(
+        blocked.error,
+        "continuation limit reached: 3 runs ended normally with the issue still active \
+         (agent.max_continuations: 2)"
+    );
+    assert_eq!(blocked.identifier, "MT-1");
+    assert!(!orch.state.retry_attempts.contains_key("i-1"));
+    assert!(
+        orch.state.claimed.contains("i-1"),
+        "a blocked issue stays claimed"
+    );
+    assert!(orch.state.running.is_empty());
+
+    h.memory.set(vec![issue("i-1", "MT-1", "Backlog")]);
+    orch.reconcile_blocked_issues().await;
+    assert!(!orch.state.blocked.contains_key("i-1"));
+    assert!(!orch.state.claimed.contains("i-1"));
+}
+
+/// Without `agent.max_continuations` an issue that stays active keeps getting runs, past the retry
+/// limit too. A reload that sets a limit applies at the next continuation check.
+#[tokio::test(start_paused = true)]
+async fn continuations_are_unlimited_by_default_and_a_reloaded_limit_applies_next() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut h = Harness::new(json!({}), counted_factory(Arc::clone(&runs), |_| Ok(())));
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+
+    let many = symphony_core::config::DEFAULT_MAX_RETRY_ATTEMPTS as usize + 2;
+    run_until(&mut orch, |o| {
+        runs.load(Ordering::SeqCst) == many && o.state.retry_attempts.contains_key("i-1")
+    })
+    .await;
+    assert!(orch.state.blocked.is_empty());
+    assert_eq!(
+        orch.state.retry_attempts["i-1"].continuations as usize,
+        many
+    );
+
+    h.wf.rewrite(json!({"agent": {"max_continuations": 3}}));
+    orch.ctx.workflow.force_reload().unwrap();
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        many,
+        "blocked before another run"
+    );
+    assert!(
+        orch.state.blocked["i-1"]
+            .error
+            .starts_with(&format!("continuation limit reached: {many} runs"))
+    );
+}
+
+/// A run that moves the issue out of the active states releases the claim at its continuation check
+/// without blocking it, even past the limit, and the count goes with the claim: back in an active
+/// state the issue gets the whole limit again. A failed run neither counts nor resets the count.
+#[tokio::test(start_paused = true)]
+async fn leaving_the_active_states_resets_the_continuation_count_and_a_failure_does_not() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut h = Harness::new(
+        json!({"agent": {"max_continuations": 1}}),
+        counted_factory(Arc::clone(&runs), |n| match n {
+            3 => Err(RunError::Other("boom".into())),
+            _ => Ok(()),
+        }),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+
+    // Two runs end normally; the second moves the issue to review before its continuation check.
+    run_until(&mut orch, |o| {
+        o.state
+            .retry_attempts
+            .get("i-1")
+            .is_some_and(|e| e.continuations == 2)
+    })
+    .await;
+    h.memory.set(vec![issue("i-1", "MT-1", "Human Review")]);
+    run_until(&mut orch, |o| !o.state.claimed.contains("i-1")).await;
+    assert!(orch.state.blocked.is_empty());
+    assert!(orch.state.retry_attempts.is_empty());
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+    // Back in an active state, the next poll dispatches it afresh: run 3 ends normally and its
+    // continuation (run 4) fails; the retry (run 5) ends normally, the second normal exit, and that
+    // reaches the limit.
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 5);
+    assert!(
+        orch.state.blocked["i-1"]
+            .error
+            .starts_with("continuation limit reached: 2 runs ended normally")
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1388,6 +1525,53 @@ async fn queued_retries_survive_a_restart_with_their_attempt_and_remaining_delay
     h.memory.set(vec![]);
     run_until(&mut orch, |o| !o.state.retry_attempts.contains_key("i-1")).await;
     assert!(!orch.state.claimed.contains("i-1"));
+    store.flush().await.unwrap();
+    assert!(store.list_retries().await.unwrap().is_empty());
+}
+
+/// The continuation count is kept with the queued retry, so a restart between runs does not start
+/// the limit over.
+#[tokio::test(start_paused = true)]
+async fn the_continuation_count_survives_a_restart_with_its_retry() {
+    let store = Store::open_in_memory().unwrap();
+    let config = json!({"agent": {"max_continuations": 2}});
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    // First process: the first run ends normally and its continuation check is queued.
+    let mut h = Harness::with_store(
+        config.clone(),
+        counted_factory(Arc::clone(&runs), |_| Ok(())),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.dispatch_issue(issue("i-1", "MT-1", "In Progress"), None, None)
+        .await;
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    store.flush().await.unwrap();
+    assert_eq!(store.list_retries().await.unwrap()[0].continuations, 1);
+    drop(orch);
+    drop(workers);
+
+    // Second process: two more runs, not three, reach the limit.
+    let mut h = Harness::with_store(
+        config,
+        counted_factory(Arc::clone(&runs), |_| Ok(())),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.restore_retry_queue().await;
+    assert_eq!(orch.state.retry_attempts["i-1"].continuations, 1);
+    run_until(&mut orch, |o| o.state.blocked.contains_key("i-1")).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert!(
+        orch.state.blocked["i-1"]
+            .error
+            .starts_with("continuation limit reached: 3 runs ended normally")
+    );
     store.flush().await.unwrap();
     assert!(store.list_retries().await.unwrap().is_empty());
 }

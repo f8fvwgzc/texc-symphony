@@ -152,6 +152,8 @@ pub struct RetryRecord {
     pub worker_host: Option<String>,
     /// Workspace directory of the previous attempt, if known.
     pub workspace_path: Option<String>,
+    /// Runs of the issue that ended normally with the issue still active since it was claimed.
+    pub continuations: u32,
 }
 
 /// Arguments for `Store::start_run`.

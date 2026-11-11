@@ -162,6 +162,7 @@ impl Orchestrator<'_> {
                     error: Some(error.clone()),
                     worker_host: entry.worker_host.clone(),
                     workspace_path: entry.workspace_path.clone(),
+                    continuations: entry.continuations,
                 };
                 self.terminate_running_issue(&id, false, &error).await;
                 self.retry_failed_run(&id, next, meta, &issue);

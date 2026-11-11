@@ -1198,16 +1198,20 @@ fn ecto_cast_rules_for_scalars() {
             "server": {"port": "8080", "host": ""},
             "observability": {"dashboard_enabled": "0"},
             "unknown_section": {"x": 1},
-            "agent": {"unknown_key": true, "max_turns": "7", "max_retry_attempts": "3"}
+            "agent": {"unknown_key": true, "max_turns": "7", "max_retry_attempts": "3",
+                      "max_continuations": "4"}
         }),
         &env,
     )
     .unwrap();
     assert_eq!(settings.agent.max_retry_attempts, 3);
+    assert_eq!(settings.agent.max_continuations, Some(4));
+    let defaults = parse(json!({}), &env).unwrap().agent;
     assert_eq!(
-        parse(json!({}), &env).unwrap().agent.max_retry_attempts,
+        defaults.max_retry_attempts,
         symphony_core::config::DEFAULT_MAX_RETRY_ATTEMPTS
     );
+    assert_eq!(defaults.max_continuations, None, "unlimited by default");
     assert_eq!(settings.polling.interval_ms, 5);
     assert_eq!(settings.server.port, Some(8080));
     assert_eq!(settings.server.host, "");
@@ -1260,6 +1264,10 @@ fn ecto_cast_rules_for_scalars() {
     assert_eq!(
         invalid(json!({"agent": {"max_retry_attempts": 0}})),
         "agent.max_retry_attempts must be greater than 0"
+    );
+    assert_eq!(
+        invalid(json!({"agent": {"max_continuations": 0}})),
+        "agent.max_continuations must be greater than 0"
     );
     assert_eq!(
         invalid(json!({"codex": {"command": 12}})),

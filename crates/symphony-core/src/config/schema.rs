@@ -272,6 +272,9 @@ pub struct AgentSettings {
     /// Failed runs in a row that are retried before the issue is blocked (`> 0`, default
     /// [`DEFAULT_MAX_RETRY_ATTEMPTS`]).
     pub max_retry_attempts: u32,
+    /// Continuation runs an issue gets while it stays active before it is blocked (`> 0`; `None`,
+    /// the default, is unlimited).
+    pub max_continuations: Option<u32>,
     /// Delay in ms before re-checking an issue whose run ended normally (`> 0`, default 1 000).
     pub continuation_delay_ms: u64,
     /// Per-state concurrency caps keyed by normalized (trim + lowercase) state name.
@@ -288,6 +291,7 @@ impl Default for AgentSettings {
             max_turns: 20,
             max_retry_backoff_ms: 300_000,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
+            max_continuations: None,
             continuation_delay_ms: 1_000,
             max_concurrent_agents_by_state: BTreeMap::new(),
             backend: super::backend::CODEX_BACKEND.into(),
@@ -797,6 +801,9 @@ fn cast_agent(s: &Section<'_>, errors: &mut Errors) -> AgentSettings {
     if let Some(v) = s.fit("max_retry_attempts", v, errors) {
         out.max_retry_attempts = v;
     }
+    let v = s.integer("max_continuations", errors);
+    let v = s.positive("max_continuations", v, errors);
+    out.max_continuations = s.fit("max_continuations", v, errors);
 
     let v = s.integer("continuation_delay_ms", errors);
     let v = s.positive("continuation_delay_ms", v, errors);

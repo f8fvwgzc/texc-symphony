@@ -81,6 +81,8 @@ pub(crate) struct RunningEntry {
     pub turn_count: u32,
     /// `normalize_retry_attempt(attempt)`: 0 for a first dispatch.
     pub retry_attempt: u32,
+    /// Runs of this claim that ended normally before this one (see [`RetryMeta::continuations`]).
+    pub continuations: u32,
     pub started_at: DateTime<Utc>,
     pub started: Instant,
     pub recorder: RunRecorder,
@@ -119,6 +121,7 @@ pub(crate) struct RetryEntry {
     pub error: Option<String>,
     pub worker_host: Option<String>,
     pub workspace_path: Option<String>,
+    pub continuations: u32,
 }
 
 /// Metadata merged into a retry entry (`schedule_issue_retry/4` metadata map).
@@ -129,6 +132,10 @@ pub(crate) struct RetryMeta {
     pub error: Option<String>,
     pub worker_host: Option<String>,
     pub workspace_path: Option<String>,
+    /// Runs of the issue that ended normally with the issue still active since it was claimed,
+    /// counted against `agent.max_continuations`. It travels with the claim from run to retry and
+    /// back, so it ends with the claim.
+    pub continuations: u32,
 }
 
 impl RetryEntry {
@@ -139,6 +146,7 @@ impl RetryEntry {
             error: self.error.clone(),
             worker_host: self.worker_host.clone(),
             workspace_path: self.workspace_path.clone(),
+            continuations: self.continuations,
         }
     }
 }

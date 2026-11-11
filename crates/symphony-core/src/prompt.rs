@@ -460,6 +460,7 @@ pub fn continuation_prompt(turn_number: u32, max_turns: u32) -> String {
 - Resume from the current workspace and workpad state instead of restarting from scratch.
 - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
 - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
+- When the ticket work is done, move the issue out of the active states before you end the turn; an issue left active starts another agent run.
 "
     )
 }
