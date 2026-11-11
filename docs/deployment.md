@@ -143,6 +143,10 @@ helm install symphony deploy/helm/symphony --set acknowledgeGuardrails=true \
 - Credentials are files under `/var/run/secrets/llm` (Secret `llm-credentials`, keys `api-key`
   and `gateway-token`, both optional). Set `global.llm.apiKeySecretKey=""` for keyless servers.
 - The pod runs as uid 10001 with no capabilities. `make helm-check` lints and renders the chart.
+- The readiness and liveness probes send `Host: localhost`: the server binds `0.0.0.0` in the
+  image and refuses the pod IP a kubelet would send (see the `Host` allow-list above). For the same
+  reason, list the names clients use (the Service's DNS name, an Ingress host) in
+  `server.allowed_hosts` of the workflow; `kubectl port-forward` works without it.
 
 ## Option 4: systemd (Linux server, binary install)
 

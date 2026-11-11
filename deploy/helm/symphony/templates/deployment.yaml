@@ -71,14 +71,23 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # The server answers only loopback names and `server.allowed_hosts`. The kubelet would
+          # send the pod IP as `Host`, which a 0.0.0.0 bind does not make an accepted name (403
+          # host_not_allowed, so the pod would never become ready): probe as localhost.
           readinessProbe:
             httpGet:
               path: /api/v1/health
               port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
           livenessProbe:
             httpGet:
               path: /api/v1/health
               port: http
+              httpHeaders:
+                - name: Host
+                  value: localhost
             initialDelaySeconds: 20
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
