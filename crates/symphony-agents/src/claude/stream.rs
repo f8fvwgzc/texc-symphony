@@ -23,11 +23,26 @@ use crate::events::{Emitter, Usage};
 pub(crate) enum Finished {
     /// `result` with `subtype: success` and `is_error: false`; carries `result`.
     Success(Option<String>),
-    /// `result` reporting an error: `subtype` and the `result` text (if any).
+    /// `result` reporting an error: `subtype`, the `result` text (if any), and whether a provider
+    /// limit ended the turn ([`rate_limited`]).
     Error {
         subtype: String,
         message: Option<String>,
+        rate_limited: bool,
     },
+}
+
+/// Start of the message Claude Code prints for a plan limit ("You've hit your session limit ·
+/// resets 5:10pm (Asia/Tokyo)", "You've hit your weekly limit · resets ..."): seen in real
+/// output, and the first of the CLI's own limit-message prefixes.
+const PLAN_LIMIT_PREFIX: &str = "You've hit your ";
+
+/// Whether an error `result` is a provider limit: `api_error_status` 429 (documented: the HTTP
+/// status of the API error that ended the turn), or, for builds without that field, the result
+/// text starting with [`PLAN_LIMIT_PREFIX`].
+fn rate_limited(line: &Value, text: Option<&str>) -> bool {
+    line.get("api_error_status").and_then(Value::as_u64) == Some(429)
+        || text.is_some_and(|text| text.starts_with(PLAN_LIMIT_PREFIX))
 }
 
 /// A tool call waiting for its result.
@@ -223,6 +238,7 @@ impl<'a> TurnStream<'a> {
             .map(str::to_owned);
         if is_error || subtype != "success" {
             Finished::Error {
+                rate_limited: rate_limited(line, text.as_deref()),
                 subtype,
                 message: text,
             }
@@ -330,7 +346,8 @@ mod tests {
             ),
             Some(Finished::Error {
                 subtype: "error_max_turns".into(),
-                message: None
+                message: None,
+                rate_limited: false,
             })
         );
         let mut stream = TurnStream::new("t", "u");
@@ -347,5 +364,26 @@ mod tests {
             ),
             Some(Finished::Success(Some("hi".into())))
         );
+    }
+
+    #[test]
+    fn rate_limits_by_status_or_plan_limit_message() {
+        let error = |line: Value| {
+            let text = line.get("result").and_then(Value::as_str);
+            rate_limited(&line, text)
+        };
+        assert!(error(
+            json!({"api_error_status": 429, "result": "API Error: 429"})
+        ));
+        assert!(error(
+            json!({"result": "You've hit your weekly limit · resets Nov 1 at 5am (Asia/Tokyo)"})
+        ));
+        assert!(!error(
+            json!({"api_error_status": 529, "result": "overloaded"})
+        ));
+        assert!(!error(
+            json!({"result": "Tests failed. You've hit your session limit · resets 5pm"})
+        ));
+        assert!(!error(json!({"subtype": "error_max_turns"})));
     }
 }

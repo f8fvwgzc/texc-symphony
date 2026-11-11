@@ -164,7 +164,7 @@ impl Orchestrator<'_> {
                     workspace_path: entry.workspace_path.clone(),
                 };
                 self.terminate_running_issue(&id, false, &error).await;
-                self.retry_failed_run(&id, next, meta, &issue);
+                self.retry_failed_run(&id, next, meta, &issue, DelayType::Failure);
             }
         }
     }

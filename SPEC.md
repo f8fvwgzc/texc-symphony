@@ -827,8 +827,16 @@ Retry limit (OPTIONAL extension, finite by default in Symphony):
 - A run that ends normally restarts the count: its continuation retry is attempt `1`.
 - A blocked issue is released when it leaves the active states, becomes unroutable, or disappears;
   it is dispatched again once it is an active candidate.
-- Failures that are not the agent's (a failed tracker refresh before a retry) never block the
-  issue; they still advance the attempt used for the backoff.
+- Failures that are not the agent's never block the issue. A failed tracker refresh before a
+  retry still advances the attempt used for the backoff. A run that its agent backend reports as
+  refused by the model provider's usage or rate limit (an HTTP 429 the backend could not outlast,
+  or a plan-limit message; here the `api` and `claude_code` backends, as `agent_rate_limited`)
+  waits the longest failure delay, `min(10000 * 2^10, agent.max_retry_backoff_ms)`, before its
+  retry. If it processed no tokens it also keeps its attempt (attempt `1` for a first run, as for
+  a continuation, so a limit costs a first run at most one retry): a limit that lasts hours
+  restarts the issue at most once per that delay, never blocks it, and the issue runs again by
+  itself once the limit lifts. A limited run that had processed tokens counts as a failure, so a
+  429 that never lifts cannot re-spend them without end.
 
 Retry handling behavior:
 
@@ -2143,10 +2151,18 @@ on_worker_exit(issue_id, reason, state):
       identifier: running_entry.identifier,
       delay_type: continuation
     })
+  else if reason is a provider limit and running_entry processed no tokens:
+    # Retry limit extension (8.4): waits without counting a failure.
+    state = schedule_retry(state, issue_id, max(running_entry.retry_attempt, 1), {
+      identifier: running_entry.identifier,
+      error: format("worker exited: %reason"),
+      delay_type: provider_limit
+    })
   else:
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
       identifier: running_entry.identifier,
-      error: format("worker exited: %reason")
+      error: format("worker exited: %reason"),
+      delay_type: provider_limit if reason is a provider limit else failure
     })
 
   notify_observers()
@@ -2268,6 +2284,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
 - Abnormal worker exit increments retries with 10s-based exponential backoff
+- With the retry limit extension, a provider limit that ended a run before it processed any
+  tokens keeps the attempt, waits the longest backoff, and never blocks the issue
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry

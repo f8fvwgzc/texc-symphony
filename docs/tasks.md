@@ -60,7 +60,9 @@ waiting / queued / blocked / running ──▶ cancelled   (POST /cancel)
   `next_attempt_at`). Otherwise it ends `failed`, with `error`. The default policy is
   `{"max_attempts": 3, "backoff_ms": 10000, "max_backoff_ms": 300000, "on": ["interrupted"]}`:
   agent failures are not retried, and a task that keeps taking its replica down stops after
-  three tries. Token limits, budgets and refusals (an unknown backend) are never retried.
+  three tries. Token limits, budgets and refusals (an unknown backend) are never retried. A
+  provider's usage or rate limit (`agent_rate_limited`) is an `error` failure for a task, unlike
+  for an issue, which waits it out.
 - `blocked`: the agent needs operator input or approval, or the per-issue budget is used up.
   `unblock` re-queues it; a `message` is appended to the prompt as `Operator reply:`.
   `unblock` also re-queues a `failed` task.

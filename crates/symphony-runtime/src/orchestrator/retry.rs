@@ -75,13 +75,15 @@ impl Orchestrator<'_> {
     /// Retries a failed run of `issue` (`attempt = None`: previous attempt + 1), unless it would be
     /// retry number `agent.max_retry_attempts + 1`: then the issue is blocked like one waiting for an
     /// operator, and released when it leaves the active states or this worker's routing. A run that
-    /// ends normally restarts the count (its continuation is attempt 1).
+    /// ends normally restarts the count (its continuation is attempt 1). `delay_type` is the retry's
+    /// backoff ([`DelayType::ProviderLimit`] for a limited run that spent tokens).
     pub(crate) fn retry_failed_run(
         &mut self,
         issue_id: &str,
         attempt: Option<u32>,
         meta: RetryMeta,
         issue: &Issue,
+        delay_type: DelayType,
     ) {
         let attempt = attempt.unwrap_or_else(|| {
             self.state
@@ -92,7 +94,7 @@ impl Orchestrator<'_> {
         });
         let limit = self.settings().agent.max_retry_attempts;
         if attempt <= limit {
-            self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::Failure);
+            self.schedule_issue_retry(issue_id, Some(attempt), meta, delay_type);
             return;
         }
         let error = format!(

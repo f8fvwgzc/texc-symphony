@@ -567,6 +567,48 @@ async fn busy_responses_are_retried() {
     assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
+/// A 429 that outlasts the retries is a provider limit, which the orchestrator waits out; a 5xx
+/// that does stays an ordinary backend failure (see `key_files_win_and_max_retries_bounds_retries`).
+#[tokio::test]
+async fn a_rate_limit_that_outlasts_the_retries_fails_as_rate_limited() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .set_body_string(format!(
+                    "{{\"type\":\"error\",\"error\":{{\"type\":\"rate_limit_error\",\"message\":\"Rate limit exceeded (key {KEY})\"}}}}"
+                )),
+        )
+        .mount(&server)
+        .await;
+    let env = Env::new();
+    let backend = backend(backend_settings(api(
+        ApiProvider::Anthropic,
+        &server.uri(),
+        false,
+    )));
+    let mut session = backend
+        .start(env.options(env.settings(None)))
+        .await
+        .unwrap();
+    let (events, _rx) = sink();
+    let err = session.run_turn("go", &issue(), &events).await.unwrap_err();
+    let CodexError::RateLimited(message) = &err else {
+        panic!("expected a rate limit, got {err}");
+    };
+    assert!(message.contains("HTTP 429"), "{message}");
+    assert!(message.contains("rate_limit_error"), "{message}");
+    assert!(!message.contains(KEY), "{message}");
+    assert_eq!(err.tag(), "agent_rate_limited");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        4,
+        "one try plus max_retries = 3"
+    );
+}
+
 #[tokio::test]
 async fn client_errors_fail_the_turn_without_leaking_the_key() {
     let server = MockServer::start().await;
@@ -1194,6 +1236,7 @@ async fn key_files_win_and_max_retries_bounds_retries() {
     let (events, _rx) = sink();
     let err = session.run_turn("go", &issue(), &events).await.unwrap_err();
     assert!(err.to_string().contains("HTTP 503"), "{err}");
+    assert_eq!(err.tag(), "agent_backend_failed");
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2, "one try plus max_retries = 1");
     assert_eq!(
