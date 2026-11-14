@@ -16,6 +16,14 @@ impl Orchestrator<'_> {
         }
         self.dispatch_tasks().await;
         let settings = self.settings();
+        // Before the fetch: its result only feeds dispatch, so a full service saves the read.
+        if self.state.available_slots() == 0 {
+            return;
+        }
+        if let Some(stop) = self.state.spend.global_stop(&settings.budget, Utc::now()) {
+            tracing::info!("Not dispatching new work: {}", stop.reason());
+            return;
+        }
         let issues = match self
             .ctx
             .tracker
@@ -28,17 +36,12 @@ impl Orchestrator<'_> {
                 return;
             }
         };
-        if self.state.available_slots() == 0 {
-            return;
-        }
-        if let Some(stop) = self.state.spend.global_stop(&settings.budget, Utc::now()) {
-            tracing::info!("Not dispatching new work: {}", stop.reason());
-            return;
-        }
         let sets = StateSets::from_settings(&settings);
         for issue in sort_issues_for_dispatch(issues) {
             if self.state.should_dispatch(&issue, &settings, &sets) {
                 self.dispatch_issue(issue, None, None).await;
+            } else if !self.wake_parked_retry(&issue, &settings).await {
+                break;
             }
         }
     }
@@ -59,7 +62,7 @@ impl Orchestrator<'_> {
         let Some(issue_id) = issue.id.clone() else {
             return;
         };
-        if !self.take_lease(&issue_id).await {
+        if self.take_lease(&issue_id).await != Ok(true) {
             return;
         }
         if let Revalidation::Ok(refreshed) = self.refresh_issue_for_dispatch(&issue).await {
@@ -230,7 +233,7 @@ impl Orchestrator<'_> {
                 continue;
             }
             let issue = task_issue(&task);
-            if !self.take_lease(&issue_id).await {
+            if self.take_lease(&issue_id).await != Ok(true) {
                 continue;
             }
             let Ok(Some(task)) = self.ctx.store.start_task(task.id).await else {

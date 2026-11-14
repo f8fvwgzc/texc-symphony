@@ -5,6 +5,8 @@
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! use symphony_runtime::{Runtime, RuntimeOptions};
 //! let workflow = symphony_core::WorkflowStore::start(None)?;
+//! // Without the poller a changed budget limit only reaches running agents at the next poll.
+//! let _poller = workflow.spawn_poller(tokio_util::sync::CancellationToken::new());
 //! let deps = symphony_trackers::TrackerDeps::new()?;
 //! let runtime = Runtime::start(RuntimeOptions::new(workflow, deps));
 //! let handle = runtime.handle();

@@ -99,9 +99,13 @@ pub enum TransportError {
     /// The connection was refused.
     #[error("econnrefused")]
     ConnectionRefused,
-    /// The connection was closed before a complete response arrived.
+    /// The connection was closed before a complete response arrived, or reset at any point.
     #[error("closed")]
     Closed,
+    /// The host name did not resolve. Keeps the resolver's message, which tells a mistyped host
+    /// from a resolver that is briefly unreachable.
+    #[error("dns_error: {0}")]
+    Dns(String),
     /// More than the allowed number of redirects.
     #[error("too_many_redirects")]
     TooManyRedirects,
@@ -124,6 +128,7 @@ impl TransportError {
             Self::Timeout => ":timeout".into(),
             Self::ConnectionRefused => ":econnrefused".into(),
             Self::Closed => ":closed".into(),
+            Self::Dns(msg) => format!("{{:dns_error, {}}}", inspect_string(msg)),
             Self::TooManyRedirects => ":too_many_redirects".into(),
             Self::InvalidUrl(url) => format!("{{:invalid_url, {}}}", inspect_string(url)),
             Self::InvalidJson(msg) => format!("{{:invalid_json, {}}}", inspect_string(msg)),
@@ -131,15 +136,19 @@ impl TransportError {
         }
     }
 
-    /// Transient failures that Req retries for safe methods.
+    /// Transient failures, retried for safe methods: Req's, and a failed name lookup (new).
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Timeout | Self::ConnectionRefused | Self::Closed)
+        matches!(
+            self,
+            Self::Timeout | Self::ConnectionRefused | Self::Closed | Self::Dns(_)
+        )
     }
 
     fn scrubbed(self, secrets: &[String]) -> Self {
         match self {
             Self::InvalidUrl(m) => Self::InvalidUrl(scrub_secrets(&m, secrets)),
             Self::InvalidJson(m) => Self::InvalidJson(scrub_secrets(&m, secrets)),
+            Self::Dns(m) => Self::Dns(scrub_secrets(&m, secrets)),
             Self::Other(m) => Self::Other(scrub_secrets(&m, secrets)),
             other => other,
         }
@@ -401,11 +410,14 @@ fn map_reqwest_error(err: reqwest::Error) -> TransportError {
         TransportError::Timeout
     } else if lower.contains("connection refused") {
         TransportError::ConnectionRefused
-    } else if !connect
-        && (lower.contains("connection closed")
-            || lower.contains("incomplete")
-            || lower.contains("connection reset")
-            || lower.contains("broken pipe"))
+    } else if lower.contains("dns error") {
+        TransportError::Dns(chain)
+    } else if lower.contains("connection reset")
+        // A reset is a dropped connection even while connecting (in the TLS handshake).
+        || (!connect
+            && (lower.contains("connection closed")
+                || lower.contains("incomplete")
+                || lower.contains("broken pipe")))
     {
         TransportError::Closed
     } else {
@@ -445,7 +457,8 @@ impl Default for RetryPolicy {
     }
 }
 
-const RETRYABLE_STATUSES: [u16; 6] = [408, 429, 500, 502, 503, 504];
+/// The response statuses worth asking again for.
+pub const RETRYABLE_STATUSES: [u16; 6] = [408, 429, 500, 502, 503, 504];
 
 /// A logical request (before redirects/retries).
 #[derive(Clone)]

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use symphony_core::{Issue, Settings, WorkflowStore};
+use symphony_trackers::transport::RETRYABLE_STATUSES;
 use symphony_trackers::{ToolBinding, Tracker, TrackerDeps, TrackerError, build_tracker};
 
 /// Default bound on one tracker read (Elixir had none; adapters retry and paginate internally).
@@ -20,6 +21,21 @@ pub enum FetchError {
     /// The read exceeded the runtime's tracker timeout (new in the Rust port).
     #[error("tracker_timeout: {0}ms")]
     Timeout(u64),
+}
+
+impl FetchError {
+    /// Whether the same read may work seconds later. A rate limit does not count: it asks for a
+    /// longer wait than a brief retry gives.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Timeout(_) => true,
+            Self::Tracker(TrackerError::ApiRequest { source, .. }) => source.is_transient(),
+            Self::Tracker(TrackerError::ApiStatus { status, .. }) => {
+                *status != 429 && RETRYABLE_STATUSES.contains(status)
+            }
+            Self::Tracker(_) => false,
+        }
+    }
 }
 
 /// Selects the adapter for the current settings (or a fixed override) and bounds every read.

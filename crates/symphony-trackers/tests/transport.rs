@@ -146,6 +146,57 @@ async fn transient_transport_errors_are_retried_for_get() {
 }
 
 #[tokio::test]
+async fn a_reset_during_the_tls_handshake_is_retried_for_get() {
+    // Each connection is dropped once the ClientHello arrives: closing a socket with unread data
+    // sends a reset, so the client sees it while connecting.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(4).flatten() {
+            let _ = stream.peek(&mut [0u8; 1]);
+        }
+    });
+    let transport = ReqwestTransport::new()
+        .unwrap()
+        .with_origin_override(ORIGIN, &format!("https://127.0.0.1:{port}"))
+        .unwrap();
+    let http = HttpClient::new(Arc::new(transport)).with_retry_policy(fast_retry());
+    let (logs, _guard) = capture_logs();
+    assert_eq!(http.send(get("/x")).await, Err(TransportError::Closed));
+    assert_eq!(
+        logs.contents()
+            .matches("retry: got exception :closed")
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn a_failed_name_lookup_is_retried_for_get_and_keeps_the_resolver_message() {
+    // `.invalid` never resolves (RFC 6761), with or without a network.
+    let transport = ReqwestTransport::new()
+        .unwrap()
+        .with_origin_override(ORIGIN, "http://symphony.invalid")
+        .unwrap();
+    let http = HttpClient::new(Arc::new(transport)).with_retry_policy(fast_retry());
+    let (logs, _guard) = capture_logs();
+    let err = http.send(get("/x")).await.unwrap_err();
+    let TransportError::Dns(message) = &err else {
+        panic!("not a DNS error: {err:?}");
+    };
+    assert!(
+        message.contains("failed to lookup address information"),
+        "{message}"
+    );
+    assert_eq!(
+        logs.contents()
+            .matches("retry: got exception {:dns_error, ")
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn receive_timeouts_surface_as_timeout() {
     let server = MockServer::start().await;
     Mock::given(path("/slow"))

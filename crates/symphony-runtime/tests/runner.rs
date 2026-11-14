@@ -17,13 +17,13 @@ use support::{
     sh_quote, write_workflow,
 };
 use symphony_codex::{CodexEvent, CodexEventKind, EventSink};
-use symphony_core::Issue;
+use symphony_core::{Issue, TrackerConfigError};
 use symphony_runtime::runner::continue_with_issue;
 use symphony_runtime::{
     AgentRunner, Continuation, FetchError, IssueFetcher, RunError, RunnerOptions, SshConfig,
     TrackerClient, WorkerContext, WorkspaceError,
 };
-use symphony_trackers::{MemoryIssues, MemoryTracker, TrackerDeps};
+use symphony_trackers::{MemoryIssues, MemoryTracker, Provider, TrackerDeps, TrackerError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -58,6 +58,68 @@ impl IssueFetcher for ScriptedFetcher {
             results.front().cloned().unwrap_or_default()
         })
     }
+}
+
+/// Fails its first `failures` reads with `error`, then returns `issue`; counts calls.
+struct FlakyFetcher {
+    failures: Mutex<usize>,
+    error: FetchError,
+    issue: Issue,
+    calls: Mutex<usize>,
+}
+
+impl FlakyFetcher {
+    fn new(failures: usize, issue: Issue) -> Self {
+        Self {
+            failures: Mutex::new(failures),
+            error: FetchError::Timeout(1),
+            issue,
+            calls: Mutex::new(0),
+        }
+    }
+
+    fn failing_with(self, error: FetchError) -> Self {
+        Self { error, ..self }
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl IssueFetcher for FlakyFetcher {
+    async fn fetch_issues_by_ids(&self, _ids: &[String]) -> Result<Vec<Issue>, FetchError> {
+        *self.calls.lock().unwrap() += 1;
+        let mut failures = self.failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(self.error.clone());
+        }
+        Ok(vec![self.issue.clone()])
+    }
+}
+
+/// Fails every read and reports the first one.
+struct DownFetcher {
+    failed: tokio::sync::Notify,
+    calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl IssueFetcher for DownFetcher {
+    async fn fetch_issues_by_ids(&self, _ids: &[String]) -> Result<Vec<Issue>, FetchError> {
+        *self.calls.lock().unwrap() += 1;
+        self.failed.notify_one();
+        Err(FetchError::Timeout(1))
+    }
+}
+
+fn api_status(status: u16) -> FetchError {
+    FetchError::Tracker(TrackerError::ApiStatus {
+        provider: Provider::Linear,
+        status,
+    })
 }
 
 struct Setup {
@@ -276,6 +338,121 @@ async fn agent_runner_does_not_continue_after_a_required_label_is_removed() {
             .unwrap(),
         Continuation::Done(labeled)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_with_issue_outlasts_a_short_tracker_failure() {
+    let wf = TestWorkflow::new(json!({}));
+    let active = issue("i-1", "MT-1", "In Progress");
+    let fetcher = FlakyFetcher::new(3, active.clone());
+    let began = tokio::time::Instant::now();
+    let result = continue_with_issue(&active, &fetcher, &wf.store.settings())
+        .await
+        .unwrap();
+    assert_eq!(result, Continuation::Continue(active));
+    assert_eq!(fetcher.calls(), 4);
+    assert_eq!(began.elapsed(), Duration::from_secs(7));
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_with_issue_gives_up_on_a_lasting_tracker_failure() {
+    let wf = TestWorkflow::new(json!({}));
+    let active = issue("i-1", "MT-1", "In Progress");
+    let fetcher = FlakyFetcher::new(4, active.clone());
+    let result = continue_with_issue(&active, &fetcher, &wf.store.settings()).await;
+    assert!(matches!(result, Err(FetchError::Timeout(1))));
+    assert_eq!(fetcher.calls(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_with_issue_retries_a_server_error() {
+    let wf = TestWorkflow::new(json!({}));
+    let active = issue("i-1", "MT-1", "In Progress");
+    for status in [408, 503] {
+        let fetcher = FlakyFetcher::new(1, active.clone()).failing_with(api_status(status));
+        let result = continue_with_issue(&active, &fetcher, &wf.store.settings())
+            .await
+            .unwrap();
+        assert_eq!(result, Continuation::Continue(active.clone()));
+        assert_eq!(fetcher.calls(), 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_with_issue_fails_at_once_on_an_error_a_short_wait_cannot_cure() {
+    let wf = TestWorkflow::new(json!({}));
+    let active = issue("i-1", "MT-1", "In Progress");
+    let config = FetchError::Tracker(TrackerConfigError::MissingGithubToken.into());
+    for error in [api_status(401), api_status(429), config] {
+        let fetcher = FlakyFetcher::new(9, active.clone()).failing_with(error.clone());
+        let began = tokio::time::Instant::now();
+        let result = continue_with_issue(&active, &fetcher, &wf.store.settings()).await;
+        assert_eq!(result, Err(error));
+        assert_eq!(fetcher.calls(), 1);
+        assert_eq!(began.elapsed(), Duration::ZERO);
+    }
+}
+
+#[tokio::test]
+async fn a_short_tracker_failure_between_turns_keeps_the_session() {
+    let active = issue("i-1", "MT-1", "In Progress");
+    let fetcher: Arc<dyn IssueFetcher> = Arc::new(FlakyFetcher::new(1, active.clone()));
+    let s = setup(
+        json!({"codex": {"command": codex_command("multi_turn.sh")}, "agent": {"max_turns": 2}}),
+        Some(fetcher),
+        None,
+    );
+    let (ctx, _rx) = context(active);
+    s.runner.run(ctx).await.unwrap();
+    let messages = traced_messages(&s.trace);
+    assert_eq!(methods(&messages, "turn/start").len(), 2);
+    assert_eq!(methods(&messages, "thread/start").len(), 1);
+}
+
+#[tokio::test]
+async fn a_tracker_failure_between_turns_that_does_not_heal_ends_the_run() {
+    let active = issue("i-1", "MT-1", "In Progress");
+    let fetcher = FlakyFetcher::new(9, active.clone()).failing_with(api_status(401));
+    let s = setup(
+        json!({"codex": {"command": codex_command("multi_turn.sh")}, "agent": {"max_turns": 2}}),
+        Some(Arc::new(fetcher)),
+        None,
+    );
+    let (ctx, _rx) = context(active);
+    let result = s.runner.run(ctx).await;
+    assert!(matches!(result, Err(RunError::IssueStateRefresh(_))));
+}
+
+#[tokio::test]
+async fn cancelling_during_the_between_turns_wait_ends_the_run_at_once() {
+    let fetcher = Arc::new(DownFetcher {
+        failed: tokio::sync::Notify::new(),
+        calls: Mutex::new(0),
+    });
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("after_run");
+    let s = setup(
+        json!({
+            "codex": {"command": codex_command("basic.sh")},
+            "hooks": {"after_run": format!("touch '{}'", marker.display())},
+        }),
+        Some(Arc::clone(&fetcher) as Arc<dyn IssueFetcher>),
+        None,
+    );
+    let (mut ctx, _rx) = context(issue("i-1", "MT-1", "In Progress"));
+    let cancel = CancellationToken::new();
+    ctx.cancel = cancel.clone();
+    let runner = s.runner.clone();
+    let run = tokio::spawn(async move { runner.run(ctx).await });
+    fetcher.failed.notified().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let began = std::time::Instant::now();
+    cancel.cancel();
+    let result = run.await.unwrap();
+    assert!(matches!(result, Err(RunError::Cancelled)), "{result:?}");
+    assert!(began.elapsed() < Duration::from_millis(800));
+    assert_eq!(*fetcher.calls.lock().unwrap(), 1);
+    assert!(marker.exists());
 }
 
 #[tokio::test]

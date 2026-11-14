@@ -140,6 +140,9 @@ pub struct RetryRecord {
     pub issue_id: String,
     /// Attempt number the retry will run as.
     pub attempt: u32,
+    /// Tracker reads that failed since the issue last ran: they lengthen the backoff, but are not
+    /// attempts.
+    pub read_failures: u32,
     /// When the retry is due. Stored with millisecond precision.
     pub due_at: DateTime<Utc>,
     /// Human issue identifier.
