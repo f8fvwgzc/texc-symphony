@@ -241,8 +241,9 @@ each section says which keys support this.
 
 ## Settings
 
-The **Reload** column says when a change takes effect: **live** values are read again on every
-use (see [Reloading](#reloading)); **restart** values are read once at startup.
+The **Reload** column says when a change takes effect: **live** values apply to their next use
+once the changed file is loaded, which takes a second at most (see [Reloading](#reloading));
+**restart** values are read once at startup.
 
 ### `tracker`
 
@@ -946,9 +947,14 @@ The adapter tags are listed with each [tracker kind](#tracker-kinds).
 
 ## Reloading
 
-Symphony watches `WORKFLOW.md` by polling: every second, and before each use, it compares the
-file's modification time, size and content hash with the last good load, and reloads when any of
-them changed. There is no need to restart or signal the process.
+Symphony watches `WORKFLOW.md` by polling: it compares the file's modification time, size and
+content hash with the last good load, and reloads when any of them changed. It does so every
+second, at the start of every poll, due retry and status snapshot, and when an agent run starts
+and after each of its turns. There is no need to restart or signal the process.
+
+Between two such checks the orchestrator uses the settings it has loaded. Handling an agent
+event, a worker's message or a worker's exit never reads the file, and neither do the steps of
+one dispatch, so their cost does not depend on the size of `WORKFLOW.md`.
 
 - **Valid change:** the new settings and prompt replace the old ones atomically. Values marked
   **live** apply to their next use: the next poll (interval, states, labels, concurrency), the
@@ -956,6 +962,10 @@ them changed. There is no need to restart or signal the process.
   settings). Running agent sessions are not restarted; each keeps the Codex settings and tracker
   tool credentials it started with. For `tracker.kind: memory`, `provider.issues` is applied
   again.
+- **Budgets:** the `budget` limits in force are checked for an issue with every event of its
+  agent, and the daily limits and the kill switch with every event of any agent. When a changed
+  file is loaded, every running agent is checked against it at once, so a lowered limit also
+  stops an agent that reports nothing in the meantime.
 - **Invalid change:** Symphony keeps running with the **last known good** configuration and logs
 
   ```text

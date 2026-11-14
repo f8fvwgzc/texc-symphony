@@ -1,0 +1,72 @@
+{
+  "host": {
+    "arch": "aarch64",
+    "logical_cpus": 10,
+    "os": "macos"
+  },
+  "recorded_at": "2026-11-09T22:02:32.252450+00:00",
+  "results": [
+    {
+      "backend": "sqlite",
+      "closed_loop": {
+        "busy": 0,
+        "list_runs": {
+          "max_ms": 112.157,
+          "mean_ms": 33.425,
+          "min_ms": 13.139,
+          "n": 118,
+          "p50_ms": 30.786,
+          "p90_ms": 45.415,
+          "p99_ms": 68.302
+        },
+        "renew_leases": {
+          "max_ms": 72.454,
+          "mean_ms": 33.747,
+          "min_ms": 14.071,
+          "n": 36,
+          "p50_ms": 31.892,
+          "p90_ms": 44.266,
+          "p99_ms": 72.454
+        },
+        "write": {
+          "max_ms": 151.79,
+          "mean_ms": 31.124,
+          "min_ms": 0.164,
+          "n": 161022,
+          "p50_ms": 28.82,
+          "p90_ms": 41.253,
+          "p99_ms": 63.799
+        },
+        "writes_per_sec": 16100.0
+      },
+      "flood": {
+        "accepted_per_sec": 12950.0,
+        "drain_ms": 633.378,
+        "get_run": {
+          "max_ms": 994.596,
+          "mean_ms": 544.015,
+          "min_ms": 0.995,
+          "n": 3,
+          "p50_ms": 636.455,
+          "p90_ms": 994.596,
+          "p99_ms": 994.596
+        },
+        "get_run_refused": 86,
+        "offered_per_sec": 648331.0,
+        "refused": 1906172,
+        "refused_fraction": 0.98,
+        "secs": 3.0
+      },
+      "log": {
+        "errors": 0,
+        "other_warnings": {},
+        "recorder_dropped_events": 0,
+        "store_busy": 1906259
+      },
+      "queue_capacity": 8192,
+      "secs": 10,
+      "writers": 500
+    }
+  ],
+  "scenario": "store"
+}

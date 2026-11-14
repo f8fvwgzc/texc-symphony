@@ -250,6 +250,37 @@ fn env_changes_apply_on_the_next_reload_of_a_changed_file() {
     );
 }
 
+#[test]
+fn subscribers_hear_of_every_reload_that_replaced_the_snapshot_and_of_no_other() {
+    let h = Harness::new();
+    let mut reloads = h.store.subscribe();
+    let heard = |reloads: &mut tokio::sync::watch::Receiver<()>| {
+        let changed = reloads.has_changed().unwrap();
+        reloads.mark_unchanged();
+        changed
+    };
+    assert!(!heard(&mut reloads), "the load before subscribing");
+    h.store.poll();
+    assert_eq!(h.store.settings().agent.max_turns, 20);
+    assert!(!heard(&mut reloads), "an unchanged file");
+
+    // Whichever read notices the change, and however many changes went by.
+    write_workflow(&h.path(), &[("max_turns", json!(3))]);
+    assert_eq!(h.store.settings().agent.max_turns, 3);
+    write_workflow(&h.path(), &[("max_turns", json!(4))]);
+    h.store.poll();
+    assert!(heard(&mut reloads));
+    assert!(!heard(&mut reloads));
+
+    // A file that does not load keeps the snapshot: nothing to hear.
+    fs::write(h.path(), "---\ntracker: [\n---\n").unwrap();
+    assert!(h.store.force_reload().is_err());
+    assert!(!heard(&mut reloads));
+    write_workflow(&h.path(), &[("max_turns", json!(5))]);
+    h.store.force_reload().unwrap();
+    assert!(heard(&mut reloads));
+}
+
 #[tokio::test(start_paused = true)]
 async fn poller_reloads_every_second_and_stops_on_cancel() {
     let h = Harness::new();

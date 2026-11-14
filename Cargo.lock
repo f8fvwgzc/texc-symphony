@@ -2660,6 +2660,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "reqwest",
+ "rusqlite",
  "rustix",
  "rustls",
  "serde_json",

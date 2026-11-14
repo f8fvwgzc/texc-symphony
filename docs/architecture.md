@@ -81,8 +81,12 @@ Invariants carried over from the Elixir OTP design:
    runs, whose child processes die with their process groups) and starts a fresh orchestrator,
    which re-runs startup cleanup and re-dispatches from the tracker. More than 3 restarts in 5 s
    ends the process with exit 1.
-4. **Config is pull-based.** Consumers read the last-known-good settings on every operation; the
-   orchestrator force-validates the workflow before each dispatch.
+4. **Config is pull-based.** Consumers read the last-known-good settings on every operation. The
+   file itself is checked for changes every second, and by the orchestrator at the start of each
+   tick, poll cycle (which also validates it before dispatching), due retry and snapshot. An
+   agent event, a worker message and a worker exit use what is loaded and never read the file.
+   A loaded change wakes the orchestrator, which checks every running agent against the new
+   budget.
 5. **Secrets never reach Codex.** Tracker credentials are removed from the child environment and
    `unset` in the login shell; tracker writes go through host-side dynamic tools.
 

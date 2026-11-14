@@ -83,3 +83,10 @@ all = { level = "warn", priority = -1 }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# `cargo bench` (the load harness, docs/performance.md): the release profile with symbols and
+# function-level debug info kept, so CPU profiles can name frames, inlined ones included. The
+# shipped binary is built with `release`.
+[profile.bench]
+debug = "limited"
+strip = false

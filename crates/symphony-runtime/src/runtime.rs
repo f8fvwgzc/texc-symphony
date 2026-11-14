@@ -62,7 +62,8 @@ impl Default for RestartPolicy {
 /// Everything the runtime needs. Fields are public; [`RuntimeOptions::new`] fills the defaults.
 #[derive(Clone)]
 pub struct RuntimeOptions {
-    /// Last-known-good workflow (settings re-read on every tick, cycle and snapshot).
+    /// Last-known-good workflow (the orchestrator re-reads the file at every tick, poll cycle, due
+    /// retry and snapshot, and uses the loaded settings in between).
     pub workflow: Arc<WorkflowStore>,
     /// Tracker access (adapter per `tracker.kind`, or a fixed override; read timeout).
     pub tracker: TrackerClient,
@@ -521,6 +522,77 @@ mod tests {
             }
         };
         assert_eq!(snapshot.tracker.kind.as_deref(), Some("memory"));
+        runtime.shutdown().await.unwrap();
+    }
+
+    /// A restarted orchestrator works from the `WORKFLOW.md` on disk and without the runs of the
+    /// one before it: the events of the runs it starts find their entries, and their usage is
+    /// checked against the budget in the file as it is now.
+    #[tokio::test]
+    async fn a_restarted_orchestrator_checks_agent_events_against_the_workflow_it_loaded() {
+        let wf = TestWorkflow::new(json!({}));
+        let memory = MemoryIssues::new();
+        memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&started);
+        // Every run reports 60 tokens, then runs until it is cancelled.
+        let factory = FnWorkerFactory(move |ctx: WorkerContext| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let payload = json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage":
+                    {"total": {"inputTokens": 40, "outputTokens": 20, "totalTokens": 60}}}});
+                ctx.events.emit(symphony_codex::CodexEvent::new(
+                    symphony_codex::CodexEventData::Notification(symphony_codex::StreamMessage {
+                        raw: payload.to_string(),
+                        payload,
+                    }),
+                    None,
+                    None,
+                ));
+                ctx.cancel.cancelled().await;
+                Err(RunError::Cancelled)
+            }
+        });
+        let runtime = Runtime::start(options(&wf, &memory, Arc::new(factory)));
+        let handle = runtime.handle();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+        // No budget yet: the first orchestrator integrates the usage and the agent keeps running.
+        loop {
+            let snapshot = handle.snapshot().await.unwrap();
+            if snapshot
+                .running
+                .first()
+                .is_some_and(|run| run.codex_total_tokens == 60)
+            {
+                assert!(snapshot.blocked.is_empty());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "usage not integrated");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The edit stays on disk until the restart: no poll, retry or snapshot is due before it.
+        wf.rewrite(json!({"budget": {"max_tokens_per_issue": 50}}));
+        crash(&handle).await;
+        let snapshot = loop {
+            if let Ok(snapshot) = handle
+                .snapshot_with_timeout(Duration::from_millis(500))
+                .await
+                && !snapshot.blocked.is_empty()
+            {
+                break snapshot;
+            }
+            assert!(std::time::Instant::now() < deadline, "issue not blocked");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(started.load(Ordering::SeqCst), 2, "dispatched again");
+        assert_eq!(
+            snapshot.blocked[0].error,
+            "issue token budget exhausted: 60 of 50 tokens used"
+        );
+        assert_eq!(snapshot.spend.max_tokens_per_issue, Some(50));
+        assert!(snapshot.running.is_empty());
         runtime.shutdown().await.unwrap();
     }
 

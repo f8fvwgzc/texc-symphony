@@ -27,10 +27,11 @@ use std::time::Duration;
 use chrono::Utc;
 use futures::StreamExt;
 use symphony_codex::{CodexEvent, EventSink};
+use symphony_core::config::BudgetSettings;
 use symphony_core::{ConfigError, Issue, ProcessEnv, Settings, TrackerConfigError, error_chain};
 use symphony_store::{NewRun, RetryRecord, RunStatus, TaskFailure, TaskRecord, TaskStatus};
 use symphony_trackers::TrackerError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinError;
 use tokio::time::Instant;
 use tokio_stream::StreamMap;
@@ -253,6 +254,10 @@ pub(crate) struct Orchestrator<'w> {
     /// Shared with [`run_lease_watchdog`]: each running issue's lease deadline and worker-cancel
     /// token, so a run is stopped near expiry even when the actor loop is parked.
     lease_watch: LeaseWatchMap,
+    /// Notified when the workflow store loaded a changed `WORKFLOW.md`, whoever read the file.
+    /// The actor then checks every running agent against the new limits
+    /// ([`Self::enforce_spend`]), also when no agent sends an event.
+    workflow_reloads: watch::Receiver<()>,
 }
 
 /// A task status change for the store.
@@ -350,6 +355,8 @@ impl<'w> Orchestrator<'w> {
         shutdown: CancellationToken,
     ) -> Self {
         let settings = ctx.workflow.settings();
+        // After the load above: nothing runs yet that it would have to be applied to.
+        let workflow_reloads = ctx.workflow.subscribe();
         let ctx_store = ctx.store.clone();
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         let task_writes = spawn_task_writer(ctx_store, timer_tx.clone(), ctx.replica_id.clone());
@@ -372,10 +379,25 @@ impl<'w> Orchestrator<'w> {
             pause_writes,
             pause_in_flight,
             lease_watch: Arc::new(Mutex::new(HashMap::new())),
+            workflow_reloads,
         }
     }
 
+    /// The settings in force: the workflow store's last good load. This does not touch the
+    /// file, so it costs the same for every `WORKFLOW.md` and is cheap enough to call for every
+    /// agent event. The file itself is re-read by [`Self::reload_settings`] and by the store's
+    /// own poller ([`symphony_core::WorkflowStore::spawn_poller`], every second in the binary).
     pub(crate) fn settings(&self) -> Arc<Settings> {
+        Arc::clone(&self.ctx.workflow.last_good().settings)
+    }
+
+    /// Re-reads `WORKFLOW.md` if it changed (a file stat, read and hash) and returns the settings
+    /// then in force; an invalid file keeps the last good ones. Called once at the start of the
+    /// handlers that plan work or report it: a tick, a poll cycle (which reads the file once more
+    /// for its dispatch preflight), a due retry and a snapshot. Everything else uses
+    /// [`Self::settings`], in particular the handlers of agent events, worker messages and worker
+    /// exits.
+    pub(crate) fn reload_settings(&self) -> Arc<Settings> {
         self.ctx.workflow.settings()
     }
 
@@ -568,9 +590,16 @@ impl<'w> Orchestrator<'w> {
                 self.handle_worker_message(message);
                 true
             }
-            Some((run_id, event)) = self.codex_streams.next(), if !self.codex_streams.is_empty() => {
-                self.handle_codex_event(run_id, event);
+            // Ahead of the agent events, so a reload is applied to every running agent as soon as
+            // the current step ends, however many events are waiting.
+            Ok(()) = self.workflow_reloads.changed() => {
                 self.enforce_spend().await;
+                true
+            }
+            Some((run_id, event)) = self.codex_streams.next(), if !self.codex_streams.is_empty() => {
+                if let Some(issue_id) = self.handle_codex_event(run_id, event) {
+                    self.enforce_spend_after_event(&issue_id).await;
+                }
                 true
             }
             Some(joined) = self.workers.set.join_next_with_id(), if !self.workers.set.is_empty() => {
@@ -910,7 +939,7 @@ impl<'w> Orchestrator<'w> {
         {
             return;
         }
-        let settings = self.settings();
+        let settings = self.reload_settings();
         self.state.refresh_runtime_config(&settings);
         self.state.poll_check_in_progress = true;
         self.state.next_poll_due = None;
@@ -923,7 +952,7 @@ impl<'w> Orchestrator<'w> {
 
     /// `handle_info(:run_poll_cycle)`.
     pub(crate) async fn run_poll_cycle(&mut self) {
-        let settings = self.settings();
+        let settings = self.reload_settings();
         self.state.refresh_runtime_config(&settings);
         self.maybe_dispatch().await;
         let interval = Duration::from_millis(self.state.poll_interval_ms);
@@ -1008,62 +1037,76 @@ impl<'w> Orchestrator<'w> {
         }
     }
 
-    /// Stops what spending rules no longer allow: everything while paused or when today's
-    /// budget is used up (claims released, so they run again later), and each run whose issue
-    /// used up its budget (blocked).
+    /// Stops what spending rules no longer allow, for every running agent: everything while
+    /// paused or when today's budget is used up (claims released, so they run again later), and
+    /// each run whose issue used up its budget (blocked) or whose task used up its token limit
+    /// (failed). Runs after whatever can change the limits or the kill switch: a reloaded
+    /// `WORKFLOW.md`, a command, a poll cycle, and a lease renewal that synced the kill switch.
     pub(crate) async fn enforce_spend(&mut self) {
-        if self.state.running.is_empty() {
-            return;
-        }
         let settings = self.settings();
-        let now = Utc::now();
-        if let Some(stop) = self.state.spend.global_stop(&settings.budget, now) {
-            let ids: Vec<String> = self.state.running.keys().cloned().collect();
-            tracing::warn!("Stopping {} running agents: {}", ids.len(), stop.reason());
-            for issue_id in ids {
-                self.terminate_running_issue(&issue_id, false, stop.reason())
-                    .await;
-            }
-            self.notify();
+        if self.state.running.is_empty() || self.enforce_global_stop(&settings.budget).await {
             return;
         }
-        let over: Vec<(String, String)> = self
-            .state
-            .running
-            .keys()
-            .filter_map(|issue_id| {
-                self.state
-                    .spend
-                    .issue_stop(issue_id, &settings.budget)
-                    .map(|stop| (issue_id.clone(), stop.reason().to_owned()))
-            })
-            .collect();
-        for (issue_id, reason) in over {
-            self.stop_and_block(&issue_id, reason).await;
+        let ids: Vec<String> = self.state.running.keys().cloned().collect();
+        for issue_id in ids {
+            self.enforce_issue_spend(&issue_id, &settings.budget).await;
         }
-        let over_task_limit: Vec<(String, i64, String)> = self
-            .state
-            .running
-            .iter()
-            .filter_map(|(issue_id, entry)| {
-                let task = entry.task.as_ref()?;
-                let limit = task.max_tokens?;
-                let used = self.state.spend.issue(issue_id).tokens;
-                (used >= limit).then(|| {
-                    (
-                        issue_id.clone(),
-                        task.id,
-                        format!("task token limit exhausted: {used} of {limit} tokens used"),
-                    )
-                })
-            })
-            .collect();
-        for (issue_id, task, reason) in over_task_limit {
-            tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
-            self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()), None);
-            self.terminate_running_issue(&issue_id, false, &reason)
+    }
+
+    /// [`Self::enforce_spend`] after one agent event was integrated into the run of `issue_id`.
+    /// The event added usage to that issue and to today, so only the global stops and that
+    /// issue's own limits can have been reached by it: the cost does not grow with the number of
+    /// running agents. Every other issue was checked when its own usage last changed, and all of
+    /// them when the limits last changed (see [`Self::enforce_spend`]).
+    pub(crate) async fn enforce_spend_after_event(&mut self, issue_id: &str) {
+        let settings = self.settings();
+        if !self.enforce_global_stop(&settings.budget).await {
+            self.enforce_issue_spend(issue_id, &settings.budget).await;
+        }
+    }
+
+    /// Stops every running agent while the kill switch is engaged or today's budget is used up.
+    /// Returns whether such a stop applies.
+    async fn enforce_global_stop(&mut self, budget: &BudgetSettings) -> bool {
+        let Some(stop) = self.state.spend.global_stop(budget, Utc::now()) else {
+            return false;
+        };
+        let ids: Vec<String> = self.state.running.keys().cloned().collect();
+        tracing::warn!("Stopping {} running agents: {}", ids.len(), stop.reason());
+        for issue_id in ids {
+            self.terminate_running_issue(&issue_id, false, stop.reason())
                 .await;
         }
+        self.notify();
+        true
+    }
+
+    /// Stops the run of `issue_id` if its issue used up its budget (the issue is blocked) or,
+    /// for a task run, if the task used up its own token limit (the task fails).
+    async fn enforce_issue_spend(&mut self, issue_id: &str, budget: &BudgetSettings) {
+        if let Some(stop) = self.state.spend.issue_stop(issue_id, budget) {
+            self.stop_and_block(issue_id, stop.reason().to_owned())
+                .await;
+            return;
+        }
+        let Some(task) = self
+            .state
+            .running
+            .get(issue_id)
+            .and_then(|entry| entry.task.as_ref())
+        else {
+            return;
+        };
+        let Some(reason) = task
+            .max_tokens
+            .and_then(|limit| self.state.spend.task_stop(issue_id, limit))
+        else {
+            return;
+        };
+        let task = task.id;
+        tracing::warn!("Stopping task run issue_id={issue_id}: {reason}");
+        self.task_finish(task, TaskStatus::Failed, None, Some(reason.clone()), None);
+        self.terminate_running_issue(issue_id, false, &reason).await;
     }
 
     /// Stops a running agent and blocks its issue with `error`.
@@ -1108,7 +1151,7 @@ impl<'w> Orchestrator<'w> {
 
     /// `handle_call(:snapshot)` (refreshes and keeps the runtime config first).
     pub(crate) fn snapshot(&mut self) -> Snapshot {
-        let settings = self.settings();
+        let settings = self.reload_settings();
         self.state.refresh_runtime_config(&settings);
         let now = Instant::now();
         let now_utc = Utc::now();

@@ -253,6 +253,13 @@ impl Spend {
         None
     }
 
+    /// Why a task run of `issue_id` may not go on, if it used up the task's own token `limit`.
+    pub(crate) fn task_stop(&self, issue_id: &str, limit: u64) -> Option<String> {
+        let used = self.issue(issue_id).tokens;
+        (used >= limit)
+            .then(|| format!("task token limit exhausted: {used} of {limit} tokens used"))
+    }
+
     /// Whatever stops `issue_id` from running now (global first).
     pub(crate) fn stop_for(
         &mut self,
@@ -336,6 +343,21 @@ mod tests {
         );
         spend.forget_issue("i-1");
         assert!(!spend.knows_issue("i-1"));
+    }
+
+    #[test]
+    fn a_task_limit_stops_at_the_limit_and_counts_only_its_own_issue() {
+        let now = Utc::now();
+        let mut spend = Spend::default();
+        spend.record("task:1", 49, 0, now);
+        spend.record("task:2", 500, 0, now);
+        assert_eq!(spend.task_stop("task:1", 50), None);
+        spend.record("task:1", 1, 0, now);
+        assert_eq!(
+            spend.task_stop("task:1", 50).as_deref(),
+            Some("task token limit exhausted: 50 of 50 tokens used")
+        );
+        assert_eq!(spend.task_stop("task:3", 50), None);
     }
 
     #[test]

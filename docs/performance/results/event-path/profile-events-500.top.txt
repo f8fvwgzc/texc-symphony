@@ -1,0 +1,85 @@
+On-CPU samples: 51.36 s (the kernel's thread counters say 54.21 s)
+
+Self time (the function itself, callees excluded)
+ 22.12 %  fsync
+ 15.07 %  pwrite
+  5.16 %  __psynch_cvsignal
+  4.37 %  pread
+  4.01 %  __fcntl
+  3.47 %  mach_absolute_time
+  2.11 %  _platform_memmove
+  2.08 %  <tokio::sync::mpsc::list::Rx<symphony_codex::event::CodexEvent>>::pop
+  1.96 %  <symphony_runtime::orchestrator::Orchestrator>::run::{closure#0}
+  1.44 %  __psynch_mutexdrop
+  1.17 %  walChecksumBytes
+  1.15 %  <std::sys::pal::unix::sync::mutex::Mutex>::lock
+  0.83 %  <tokio::sync::task::atomic_waker::AtomicWaker>::register_by_ref
+  0.77 %  _platform_memcmp
+  0.74 %  0x300e0
+  0.74 %  tokio::runtime::task::waker::wake_by_val
+  0.73 %  0x30124
+  0.70 %  <alloc::string::String as core::fmt::Write>::write_str
+  0.67 %  0x2b4fc
+  0.64 %  core::sync::atomic::atomic_add::<usize, usize>
+  0.62 %  _platform_memset
+  0.59 %  pthread_mutex_unlock
+  0.58 %  sqlite3VdbeExec
+  0.58 %  <load::world::World>::run_worker::{closure#0}
+  0.54 %  <&mut serde_json::ser::Serializer<&mut <serde_json::value::Value as core::fmt::Display>::fmt::WriterFormatter> as serde_core::ser::Serializer>::serialize_str
+  0.52 %  pthread_mutex_lock
+  0.51 %  <alloc::collections::btree::map::IntoIter<alloc::string::String, serde_json::value::Value>>::dying_next
+  0.50 %  <tokio::sync::notify::NotifiedProject>::poll_notified
+  0.40 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::maintenance
+  0.36 %  <symphony_runtime::orchestrator::Orchestrator>::handle_codex_event
+  0.36 %  <alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::insert
+  0.34 %  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+  0.33 %  <tokio::sync::notify::NotifyGuard>::notify_waiters
+  0.30 %  <alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value> as core::ops::drop::Drop>::drop
+  0.30 %  sqlite3BtreeTableMoveto
+  0.29 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  0.29 %  0x2ffec
+  0.28 %  <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree::<alloc::string::String, serde_json::value::Value, alloc::alloc::Global>
+  0.27 %  <&mut serde_json::ser::Serializer<&mut alloc::vec::Vec<u8>> as serde_core::ser::Serializer>::serialize_str
+  0.26 %  0x2ff9c
+
+Inclusive time (the function and everything it calls)
+ 99.67 %  <std::sys::thread::unix::Thread>::new::thread_start
+ 99.67 %  _pthread_start
+ 55.14 %  <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 55.14 %  <std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+ 55.14 %  <symphony_store::store::Store>::spawn::<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}
+ 55.14 %  <tokio::sync::mpsc::bounded::Receiver<alloc::boxed::Box<dyn for<'a> core::ops::function::FnOnce<(&'a mut dyn symphony_store::db::Db + 'a,), Output = ()> + core::marker::Send>>>::blocking_recv
+ 55.14 %  std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 55.14 %  std::panicking::catch_unwind::<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>>
+ 55.14 %  std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 55.14 %  std::sys::backtrace::__rust_begin_short_backtrace::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>
+ 55.14 %  std::thread::lifecycle::spawn_unchecked::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}
+ 55.14 %  std::thread::lifecycle::spawn_unchecked::<<symphony_store::store::Store>::spawn<<symphony_store::store::Store>::open<&std::path::PathBuf>::{closure#4}>::{closure#0}, ()>::{closure#1}::{closure#0}
+ 55.14 %  symphony-store
+ 51.49 %  sqlite3_step
+ 44.53 %  <core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 44.53 %  <std::sync::poison::condvar::Condvar>::wait_timeout::<tokio::runtime::blocking::pool::LockedInner>
+ 44.53 %  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+ 44.53 %  <tokio::runtime::blocking::pool::Inner>::run
+ 44.53 %  <tokio::runtime::blocking::pool::InnerImpl>::run_worker
+ 44.53 %  <tokio::runtime::blocking::pool::LockedImpl>::run_worker
+ 44.53 %  <tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}
+ 44.53 %  std::panic::catch_unwind::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 44.53 %  std::panicking::catch_unwind::<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>>
+ 44.53 %  std::panicking::catch_unwind::do_call::<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}>, ()>
+ 44.53 %  std::sys::backtrace::__rust_begin_short_backtrace::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>
+ 44.53 %  std::thread::lifecycle::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}
+ 44.53 %  std::thread::lifecycle::spawn_unchecked::<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure#0}, ()>::{closure#1}::{closure#0}
+ 44.53 %  symphony
+ 44.22 %  <<symphony_store::store::Store>::submit<i64, <symphony_store::store::Store>::append_event<alloc::string::String>::{closure#1}, <symphony_store::store::Store>::append_event<alloc::string::String>::{closure#0}>::{closure#0} as core::ops::function::FnOnce<(&mut dyn symphony_store::db::Db,)>>::call_once::{shim:vtable#0}
+ 44.20 %  <core::panic::unwind_safe::AssertUnwindSafe<tokio::runtime::task::harness::poll_future<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>::{closure#0}> as core::ops::function::FnOnce<()>>::call_once
+ 44.20 %  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::try_with::<tokio::runtime::context::set_scheduler<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>::{closure#0}, ()>
+ 44.20 %  <std::thread::local::LocalKey<tokio::runtime::context::Context>>::with::<tokio::runtime::context::set_scheduler<(), tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}>::{closure#0}, ()>
+ 44.20 %  <tokio::loom::std::unsafe_cell::UnsafeCell<tokio::runtime::task::core::Stage<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>>>>::with_mut::<core::task::poll::Poll<()>, <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll::{closure#0}>
+ 44.20 %  <tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}> as core::future::future::Future>::poll
+ 44.20 %  <tokio::runtime::context::scoped::Scoped<tokio::runtime::scheduler::Context>>::set::<tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}, ()>
+ 44.20 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::maintenance
+ 44.20 %  <tokio::runtime::scheduler::multi_thread::worker::Context>::run
+ 44.20 %  <tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}
+ 44.20 %  <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll
+ 44.20 %  <tokio::runtime::task::core::Core<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure#0}>, tokio::runtime::blocking::schedule::BlockingSchedule>>::poll::{closure#0}

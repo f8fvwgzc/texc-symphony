@@ -1,0 +1,26 @@
+{
+  "host": {
+    "arch": "aarch64",
+    "logical_cpus": 10,
+    "os": "macos"
+  },
+  "recorded_at": "2026-11-09T21:50:56.644189+00:00",
+  "results": [
+    {
+      "agents": 10,
+      "arrivals": 30,
+      "eligible_to_start": {
+        "max_ms": 30020.481,
+        "mean_ms": 14971.066,
+        "min_ms": 1121.342,
+        "n": 30,
+        "p50_ms": 13235.138,
+        "p90_ms": 26722.294,
+        "p99_ms": 30020.481
+      },
+      "events_per_agent_per_sec": 10.0,
+      "poll_interval_ms": 30000
+    }
+  ],
+  "scenario": "dispatch-arrivals"
+}

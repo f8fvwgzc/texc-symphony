@@ -194,6 +194,9 @@ validates. Repository-local Codex skills live in [`.codex/skills/`](.codex/skill
   `workspace before-remove` subcommand.
 - [`docs/deployment.md`](docs/deployment.md): release binaries, Docker, systemd, reverse proxies,
   backups and upgrades.
+- [`docs/performance.md`](docs/performance.md): measured dispatch latency, event and store
+  throughput, snapshot and SSE latency at 10, 100 and 500 agents, CPU profiles, and the load
+  harness that produced them.
 
 ## Rewritten from Elixir to Rust
 

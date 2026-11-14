@@ -7,6 +7,8 @@
 //!   `Failed to reload workflow path=... reason=...; keeping last known good configuration`; only
 //!   [`WorkflowStore::force_reload`] (Elixir `Config.validate!/0`) surfaces the error.
 //! - [`WorkflowStore::spawn_poller`] re-checks every second.
+//! - [`WorkflowStore::subscribe`] tells a consumer that a changed file was loaded, whoever
+//!   triggered the reload.
 
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -16,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -144,6 +147,8 @@ pub struct WorkflowStore {
     path_override: RwLock<Option<PathBuf>>,
     state: Mutex<ReloadState>,
     snapshot: ArcSwap<WorkflowSnapshot>,
+    /// Notified after every reload that replaced `snapshot`.
+    reloaded: watch::Sender<()>,
     error_log: Mutex<ErrorLog>,
 }
 
@@ -175,6 +180,7 @@ impl WorkflowStore {
                 stamp,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
+            reloaded: watch::Sender::new(()),
             error_log: Mutex::new(ErrorLog::default()),
         }))
     }
@@ -222,6 +228,13 @@ impl WorkflowStore {
     /// The last good snapshot without touching the file system.
     pub fn last_good(&self) -> Arc<WorkflowSnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Subscribes to reloads: the receiver's `changed()` resolves after every later reload that
+    /// replaced the last good snapshot, whichever read or poll triggered it. A failed reload
+    /// keeps the snapshot and notifies nobody. Reloads between two looks count as one change.
+    pub fn subscribe(&self) -> watch::Receiver<()> {
+        self.reloaded.subscribe()
     }
 
     /// `WorkflowStore.current/0`: reload-if-changed, then the last good workflow.
@@ -312,6 +325,7 @@ impl WorkflowStore {
                 state.path = path;
                 state.stamp = stamp;
                 self.snapshot.store(Arc::new(snapshot));
+                self.reloaded.send_replace(());
                 lock(&self.error_log).last = None;
                 Ok(())
             }
