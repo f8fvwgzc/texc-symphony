@@ -125,11 +125,13 @@ sequenceDiagram
 
 Retry delay after a failure is `min(10 s · 2^(attempt-1), agent.max_retry_backoff_ms)`. A tracker
 read that fails before a retry doubles the delay too, but keeps the attempt, which counts runs only
-(`agent.max_retry_attempts`). A normal exit schedules a 1 s continuation that either dispatches the
-issue again, releases the claim (the issue is inactive or gone), or cleans the workspace (the issue
-is terminal). A release with a slot free runs the next poll at once. A retry with no free slot keeps
-its attempt and waits for a poll, which offers free slots to waiting retries and new issues in
-dispatch order, after queued tasks.
+(`agent.max_retry_attempts`). A run that a provider's usage or rate limit refused before it
+processed any tokens (`agent_rate_limited`) is not counted as a failure either: it waits
+`agent.max_retry_backoff_ms` at the same attempt, so a long limit never blocks the issue. A normal
+exit schedules a 1 s continuation that either dispatches the issue again, releases the claim (the
+issue is inactive or gone), or cleans the workspace (the issue is terminal). A release with a slot
+free runs the next poll at once. A retry with no free slot keeps its attempt and waits for a poll,
+which offers free slots to waiting retries and new issues in dispatch order, after queued tasks.
 
 ## Live monitoring
 

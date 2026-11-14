@@ -139,6 +139,11 @@ pub enum CodexError {
     /// A backend limit stopped the turn (for example `max_steps` of the API agent loop).
     #[error("agent_limit_exceeded: {0}")]
     LimitExceeded(String),
+    /// The model provider refused the turn for a usage or rate limit (HTTP 429, or a plan-limit
+    /// message) that the backend could not wait out. The orchestrator waits before the next run,
+    /// and does not count it as a failure when the run had processed no tokens.
+    #[error("agent_rate_limited: {0}")]
+    RateLimited(String),
     /// The backend cannot run with this configuration (for example on an SSH worker).
     #[error("agent_backend_unsupported: {0}")]
     Unsupported(String),
@@ -166,6 +171,7 @@ impl CodexError {
             Self::ApprovalRequired(_) => "approval_required",
             Self::Backend(_) => "agent_backend_failed",
             Self::LimitExceeded(_) => "agent_limit_exceeded",
+            Self::RateLimited(_) => "agent_rate_limited",
             Self::Unsupported(_) => "agent_backend_unsupported",
         }
     }

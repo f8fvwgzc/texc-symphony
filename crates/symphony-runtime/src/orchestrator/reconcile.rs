@@ -168,7 +168,7 @@ impl Orchestrator<'_> {
                     read_failures: 0,
                 };
                 self.terminate_running_issue(&id, false, &error).await;
-                self.retry_failed_run(&id, next, meta, &issue);
+                self.retry_failed_run(&id, next, meta, &issue, DelayType::Failure);
             }
         }
     }

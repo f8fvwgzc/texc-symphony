@@ -86,6 +86,9 @@ Each turn sends the prompt and loops: model call (streamed unless `stream: false
 results, until the model answers without tools (the turn's result) or `max_steps` model calls
 were made (`agent_limit_exceeded`). The conversation persists across the turns of one run. 429,
 5xx and connection errors are retried three times (1, 2, 4 s; `retry-after` wins, at most 30 s).
+A 429 left after that fails the run as `agent_rate_limited`. An issue run refused before it
+processed any tokens does not count toward `agent.max_retry_attempts`: it waits
+`agent.max_retry_backoff_ms` and runs again ([configuration](configuration.md#agent)).
 
 | Key | Default | Notes |
 |---|---|---|
@@ -155,7 +158,10 @@ bash -lc 'exec <command> -p --output-format stream-json --verbose [--model M]
   [--resume <session>] [extra_args...]'
 ```
 
-with the prompt on stdin. The first turn starts a session; later turns resume it.
+with the prompt on stdin. The first turn starts a session; later turns resume it. A turn whose
+`result` reports `api_error_status: 429` (a rate limit, or a plan limit such as "You've hit your
+session limit · resets 5:10pm"), or whose error text starts with "You've hit your " on builds
+without that field, fails the run as `agent_rate_limited`, treated as for the `api` backend.
 
 | Key | Default | Notes |
 |---|---|---|

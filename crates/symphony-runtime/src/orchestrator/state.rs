@@ -164,16 +164,21 @@ pub enum DelayType {
     /// the slowest failure backoff. It releases an issue that left the active states, and starts
     /// one if a slot happens to be free.
     NoSlots,
+    /// A provider usage or rate limit ended the run: the attempt is kept, so the delay cannot
+    /// grow with it. The slowest failure backoff instead, so a limit that lasts hours costs one
+    /// start per `max_retry_backoff_ms`.
+    ProviderLimit,
 }
 
 /// `retry_delay/2`: continuation attempt 1 → `agent.continuation_delay_ms` (1 s by default);
 /// otherwise `min(10_000 · 2^min(attempt − 1, 10), max_retry_backoff_ms)`, at any attempt the
-/// longest of those for [`DelayType::NoSlots`]. No jitter, no maximum count.
+/// longest of those for [`DelayType::NoSlots`] and [`DelayType::ProviderLimit`]. No jitter, no
+/// maximum count.
 pub fn retry_delay(attempt: u32, delay_type: DelayType, agent: &AgentSettings) -> Duration {
     if delay_type == DelayType::Continuation && attempt == 1 {
         return Duration::from_millis(agent.continuation_delay_ms);
     }
-    if delay_type == DelayType::NoSlots {
+    if matches!(delay_type, DelayType::NoSlots | DelayType::ProviderLimit) {
         return retry_delay(u32::MAX, DelayType::Failure, agent);
     }
     let power = attempt.saturating_sub(1).min(10);
@@ -690,6 +695,7 @@ mod tests {
         assert_eq!(ms(6, DelayType::Failure), 300_000);
         assert_eq!(ms(500, DelayType::Failure), 300_000);
         assert_eq!(ms(1, DelayType::NoSlots), 300_000);
+        assert_eq!(ms(1, DelayType::ProviderLimit), 300_000);
         let uncapped = AgentSettings {
             max_retry_backoff_ms: u64::MAX,
             continuation_delay_ms: 15_000,
@@ -706,6 +712,10 @@ mod tests {
         assert_eq!(
             retry_delay(1, DelayType::Continuation, &uncapped).as_millis(),
             15_000
+        );
+        assert_eq!(
+            retry_delay(1, DelayType::ProviderLimit, &uncapped).as_millis(),
+            10_240_000
         );
     }
 

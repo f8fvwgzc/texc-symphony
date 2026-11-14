@@ -13,7 +13,8 @@
 //! the turn, so the next turn starts from a consistent history).
 //!
 //! Requests are retried on HTTP 429 and 5xx and on connection failures, up to three times with
-//! 1 s / 2 s / 4 s backoff (`retry-after` seconds win, capped at 30 s). Wire formats:
+//! 1 s / 2 s / 4 s backoff (`retry-after` seconds win, capped at 30 s); a 429 left after that
+//! fails the turn as `agent_rate_limited`, which the orchestrator waits out. Wire formats:
 //! [`anthropic`] and [`openai`]. Before each model call, a conversation estimated above
 //! `compact_after_tokens` has its older tool results cut ([`compact`]).
 
@@ -315,11 +316,17 @@ impl ApiSession {
                 attempt += 1;
                 continue;
             }
-            return Err(self.backend_error(format!(
-                "HTTP {}: {}",
+            let message = format!(
+                "{} API: HTTP {}: {}",
+                self.wire.label(),
                 status.as_u16(),
                 excerpt(&text, self.key.as_deref(), ERROR_EXCERPT_CHARS)
-            )));
+            );
+            if status.as_u16() == 429 {
+                // A limit the retries above did not outlast: the orchestrator waits longer.
+                return Err(CodexError::RateLimited(message));
+            }
+            return Err(CodexError::Backend(message));
         }
     }
 

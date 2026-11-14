@@ -230,6 +230,7 @@ impl Redactor {
             | CodexError::ApprovalRequired(value) => self.redact_value(value),
             CodexError::Backend(text)
             | CodexError::LimitExceeded(text)
+            | CodexError::RateLimited(text)
             | CodexError::Unsupported(text)
             | CodexError::SpawnFailed(text)
             | CodexError::RemoteLauncherMissing(text) => {

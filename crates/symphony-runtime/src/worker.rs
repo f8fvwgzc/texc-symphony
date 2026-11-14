@@ -194,6 +194,12 @@ impl RunError {
             _ => None,
         }
     }
+
+    /// `true` when a model provider's usage or rate limit ended the run: the retry waits the
+    /// longest backoff, and does not count toward the retry limit if no tokens were processed.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, Self::Codex(CodexError::RateLimited(_)))
+    }
 }
 
 /// The result of a worker future.
