@@ -187,9 +187,10 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   default is now the equivalent `{granular: {sandbox_approval: false, rules: false,
   mcp_elicitations: false}}`: Codex renamed the variant and inverted the booleans.
 - **The retry queue survives a restart (new).** With the run-history database enabled, every queued
-  retry is also written to its `retry_queue` table (issue, attempt, due time and metadata, and in
-  `retry_read_failures` its failed tracker reads) and removed when it fires or is released. Startup re-claims those issues and re-arms their timers
-  with what is left of the delay, so a failing issue continues its backoff instead of starting
+  retry is also written to its `retry_queue` table (issue, attempt, due time and metadata; in
+  `retry_read_failures` its failed tracker reads and in `retry_continuations` its count of normal
+  exits) and removed when it fires or is released. Startup re-claims those issues and re-arms their
+  timers with what is left of the delay, so a failing issue continues its backoff instead of starting
   again at attempt 0. A restored retry takes the normal path when it fires: the issue is fetched
   from the tracker first, and one that was closed or removed meanwhile is released. Runs that were
   in flight when Symphony stopped are not restored; the next poll dispatches them as new runs.

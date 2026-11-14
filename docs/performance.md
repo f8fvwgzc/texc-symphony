@@ -20,7 +20,9 @@ reads `WORKFLOW.md` after an agent event: it re-reads the file at each tick, pol
 and snapshot, and uses the loaded settings in between
 ([Reloading](configuration.md#reloading)). An event finds its run through an index by run id,
 and after it only the kill switch, the daily budget and the limits of that event's issue are
-checked. The rest of this page still describes `f877d3a`.
+checked. Since then a retry that releases its issue while a slot is free also runs a poll at once
+([`polling.interval_ms`](configuration.md)), so the freed-slot half of bottleneck 1 no longer holds;
+this harness has not measured that change. The rest of this page still describes `f877d3a`.
 
 `cargo bench -p symphony --bench load -- events --agents 10,100,500`, one run on the same
 machine:

@@ -827,7 +827,8 @@ The runtime counts issues by their current tracked state in the `running` map.
 Retry entry creation:
 
 - Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, the continuation count, and new timer handle.
+- Store `attempt`, `identifier`, `error`, `due_at_ms`, the failed-read count, the continuation count,
+  and new timer handle.
 
 Backoff formula:
 
@@ -2201,6 +2202,7 @@ on_worker_exit(issue_id, reason, state):
     state.completed.add(issue_id)  # bookkeeping only
     state = schedule_retry(state, issue_id, 1, {
       identifier: running_entry.identifier,
+      continuations: running_entry.continuations + 1,  # 8.4 continuation limit
       delay_type: continuation
     })
   else if reason is a provider limit and running_entry processed no tokens:
@@ -2250,6 +2252,9 @@ function handle_retry(issue_id, retry_entry, state):
     state.claimed.remove(issue_id)
     return state
 
+  if agent.max_continuations is set and retry_entry.continuations > agent.max_continuations:
+    return block_issue(state, issue, "continuation limit reached")  # 8.4: stays claimed
+
   if no_available_slots(state):
     return schedule_retry(state, issue_id, retry_entry.attempt, {
       identifier: issue.identifier,
@@ -2257,7 +2262,8 @@ function handle_retry(issue_id, retry_entry, state):
       delay_type: no_slots
     })
 
-  return dispatch_issue(issue, state, attempt=retry_entry.attempt)
+  return dispatch_issue(issue, state, attempt=retry_entry.attempt,
+                        continuations=retry_entry.continuations)
 ```
 
 ## 17. Test and Validation Matrix
@@ -2352,6 +2358,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Slot exhaustion requeues retries with explicit error reason, keeping the attempt
 - If the retry limit is implemented, failed tracker reads before a retry lengthen its backoff but
   keep its attempt, so the next run is not blocked by them
+- If the continuation limit is implemented, an issue still active after more than
+  `agent.max_continuations` runs that ended normally is blocked, not dispatched
 - A retry that keeps its issue does not bring a poll tick forward
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
