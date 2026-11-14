@@ -674,13 +674,14 @@ async fn one_failed_read_stops_the_wake_for_the_rest_of_the_poll() {
     tracker.fail_by_id.store(true, Ordering::SeqCst);
     orch.maybe_dispatch().await;
     assert_eq!(tracker.by_id_fetches.load(Ordering::SeqCst), 1);
-    let charged = orch
+    let backed_off = orch
         .state
         .retry_attempts
         .values()
-        .filter(|entry| entry.attempt > 1)
+        .filter(|entry| entry.read_failures > 0)
         .count();
-    assert_eq!(charged, 1);
+    assert_eq!(backed_off, 1);
+    assert!(orch.state.retry_attempts.values().all(|e| e.attempt == 1));
 }
 
 #[tokio::test(start_paused = true)]
@@ -691,6 +692,7 @@ async fn a_parked_retry_behind_a_dead_replicas_lease_keeps_its_attempt() {
         .save_retry(RetryRecord {
             issue_id: "i-1".into(),
             attempt: 7,
+            read_failures: 0,
             due_at: Utc::now() + chrono::Duration::seconds(300),
             identifier: "MT-1".into(),
             issue_url: None,
@@ -740,7 +742,7 @@ async fn a_lapsed_lease_is_not_trusted_once_a_peer_took_it() {
     h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
     let mut workers = WorkerSet::default();
     let mut orch = h.orchestrator(&mut workers);
-    assert!(orch.take_lease("i-1").await);
+    assert_eq!(orch.take_lease("i-1").await, Ok(true));
     orch.schedule_issue_retry("i-1", Some(1), parked_meta(), DelayType::NoSlots);
     // The actor stalls for a whole TTL, so the renewal never ran, and a peer takes the issue.
     tokio::time::advance(LEASE_TTL + ms(1)).await;
@@ -769,7 +771,7 @@ async fn a_store_outage_does_not_cost_a_retry_its_claim() {
     h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
     let mut workers = WorkerSet::default();
     let mut orch = h.orchestrator(&mut workers);
-    assert!(orch.take_lease("i-1").await);
+    assert_eq!(orch.take_lease("i-1").await, Ok(true));
     orch.schedule_issue_retry(
         "i-1",
         Some(4),
@@ -791,6 +793,63 @@ async fn a_store_outage_does_not_cost_a_retry_its_claim() {
         started.lock().unwrap().first().map(|run| run.1),
         Some(Some(4))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tracker_outage_lengthens_the_backoff_but_never_blocks_the_issue() {
+    let tracker = Arc::new(CountingTracker::default());
+    tracker
+        .inner
+        .issues()
+        .set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let fixed: Arc<dyn Tracker> = tracker.clone();
+    let store = Store::open_in_memory().unwrap();
+    let shared = store.clone();
+    let mut h = Harness::build(
+        json!({"agent": {"max_retry_attempts": 2}}),
+        result_factory(|| Err(RunError::Other("boom".into()))),
+        |options| options.with_tracker(fixed).with_store(shared),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    // A failed run: its retry is attempt 1 of 2.
+    orch.retry_failed_run(
+        "i-1",
+        None,
+        RetryMeta {
+            error: Some("agent exited: boom".into()),
+            ..RetryMeta::default()
+        },
+        &issue("i-1", "MT-1", "In Progress"),
+    );
+    // More failed reads than the limit allows retries.
+    tracker.fail_by_id.store(true, Ordering::SeqCst);
+    for _ in 0..4 {
+        let token = orch.state.retry_attempts["i-1"].token;
+        orch.handle_retry_due("i-1", token).await;
+    }
+    let entry = &orch.state.retry_attempts["i-1"];
+    assert_eq!((entry.attempt, entry.read_failures), (1, 4));
+    // Each read still lengthens the backoff: 10 s * 2^(1 + 4 - 1).
+    assert_eq!(entry.due_at.duration_since(Instant::now()), ms(160_000));
+    // A restart keeps both counts.
+    store.flush().await.unwrap();
+    let mut restarted = Harness::with_store(json!({}), result_factory(|| Ok(())), store.clone());
+    let mut restarted_workers = WorkerSet::default();
+    let mut after_restart = restarted.orchestrator(&mut restarted_workers);
+    after_restart.restore_retry_queue().await;
+    let restored = &after_restart.state.retry_attempts["i-1"];
+    assert_eq!((restored.attempt, restored.read_failures), (1, 4));
+
+    // The tracker answers again: the issue runs as attempt 1, and its failure is retry 2 of 2.
+    tracker.fail_by_id.store(false, Ordering::SeqCst);
+    let token = orch.state.retry_attempts["i-1"].token;
+    orch.handle_retry_due("i-1", token).await;
+    assert_eq!(orch.state.running["i-1"].retry_attempt, 1);
+    run_until(&mut orch, |o| o.state.retry_attempts.contains_key("i-1")).await;
+    assert!(orch.state.blocked.is_empty());
+    let entry = &orch.state.retry_attempts["i-1"];
+    assert_eq!((entry.attempt, entry.read_failures), (2, 0));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2210,7 +2269,7 @@ async fn shared_store_renew_cycle_releases_a_spend_stopped_run_completely() {
         .await;
     assert!(orch.state.running.contains_key("i-1"));
     // A held dispatch lease, as a shared-store run always has.
-    assert!(orch.take_lease("i-1").await);
+    assert_eq!(orch.take_lease("i-1").await, Ok(true));
     assert!(orch.state.leases.contains_key("i-1"));
 
     // Engage the kill switch and persist it, so `sync_kill_switch` (which runs first in the block)
@@ -3212,6 +3271,57 @@ async fn a_replica_drops_a_restored_retry_that_another_replica_holds() {
     assert!(orch.state.running.is_empty());
     assert!(orch.state.retry_attempts.is_empty());
     assert!(started.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_error_parks_a_restored_retry_at_its_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("symphony.db");
+    let store = Store::open(&path).unwrap();
+    store
+        .save_retry(RetryRecord {
+            issue_id: "i-1".into(),
+            attempt: 7,
+            read_failures: 0,
+            due_at: Utc::now(),
+            identifier: "MT-1".into(),
+            issue_url: None,
+            error: Some("agent exited: boom".into()),
+            worker_host: None,
+            workspace_path: None,
+        })
+        .await
+        .unwrap();
+    let started: Started = Arc::default();
+    // A cap this high tells the wait for a slot (10 s * 2^10) from attempt 7's failure backoff.
+    let mut h = Harness::with_store(
+        json!({"agent": {"max_retry_backoff_ms": 100_000_000}}),
+        blocking_factory(Arc::clone(&started)),
+        store.clone(),
+    );
+    h.memory.set(vec![issue("i-1", "MT-1", "In Progress")]);
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    orch.restore_retry_queue().await;
+    // Another connection holds the write lock: taking the lease fails, and nobody refused it.
+    let lock = rusqlite::Connection::open(&path).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let token = orch.state.retry_attempts["i-1"].token;
+    orch.handle_retry_due("i-1", token).await;
+    drop(lock);
+    let parked = &orch.state.retry_attempts["i-1"];
+    assert_eq!(parked.attempt, 7);
+    assert_eq!(parked.error.as_deref(), Some(retry::NO_SLOTS));
+    assert_eq!(parked.due_at.duration_since(Instant::now()), ms(10_240_000));
+    assert!(orch.state.claimed.contains("i-1"));
+    assert!(started.lock().unwrap().is_empty());
+    // With the store back, the next poll offers it a slot, and it goes on at the same attempt.
+    orch.maybe_dispatch().await;
+    assert_eq!(
+        started.lock().unwrap().first().map(|run| run.1),
+        Some(Some(7))
+    );
+    orch.terminate_running_issue("i-1", false, "test").await;
 }
 
 #[tokio::test(start_paused = true)]

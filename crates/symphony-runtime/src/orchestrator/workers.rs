@@ -240,6 +240,7 @@ impl Orchestrator<'_> {
             error: None,
             worker_host: entry.worker_host.clone(),
             workspace_path: entry.workspace_path.clone(),
+            read_failures: 0,
         };
         match result {
             Ok(()) => {

@@ -507,28 +507,36 @@ fn encode_payload(payload: &serde_json::Value) -> Result<String> {
     Ok(serde_json::json!({"truncated": true, "original_bytes": text.len()}).to_string())
 }
 
-/// Queues (or replaces) the retry of `retry.issue_id`.
+/// Queues (or replaces) the retry of `retry.issue_id`, with its failed reads (kept in
+/// `retry_read_failures`, migration 0009).
 pub(crate) fn save_retry(db: &mut dyn Db, retry: &RetryRecord) -> Result<()> {
-    db.execute(
-        "INSERT INTO retry_queue \
-         (issue_id, attempt, due_at, identifier, issue_url, error, worker_host, workspace_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-         ON CONFLICT (issue_id) DO UPDATE SET attempt = excluded.attempt, \
-         due_at = excluded.due_at, identifier = excluded.identifier, \
-         issue_url = excluded.issue_url, error = excluded.error, \
-         worker_host = excluded.worker_host, workspace_path = excluded.workspace_path",
-        &vals![
-            retry.issue_id.as_str(),
-            retry.attempt,
-            retry.due_at.timestamp_millis(),
-            retry.identifier.as_str(),
-            retry.issue_url.as_deref(),
-            retry.error.as_deref(),
-            retry.worker_host.as_deref(),
-            retry.workspace_path.as_deref(),
-        ],
-    )?;
-    Ok(())
+    in_transaction(db, |db| {
+        db.execute(
+            "INSERT INTO retry_queue \
+             (issue_id, attempt, due_at, identifier, issue_url, error, worker_host, workspace_path) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT (issue_id) DO UPDATE SET attempt = excluded.attempt, \
+             due_at = excluded.due_at, identifier = excluded.identifier, \
+             issue_url = excluded.issue_url, error = excluded.error, \
+             worker_host = excluded.worker_host, workspace_path = excluded.workspace_path",
+            &vals![
+                retry.issue_id.as_str(),
+                retry.attempt,
+                retry.due_at.timestamp_millis(),
+                retry.identifier.as_str(),
+                retry.issue_url.as_deref(),
+                retry.error.as_deref(),
+                retry.worker_host.as_deref(),
+                retry.workspace_path.as_deref(),
+            ],
+        )?;
+        db.execute(
+            "INSERT INTO retry_read_failures (issue_id, read_failures) VALUES (?1, ?2) \
+             ON CONFLICT (issue_id) DO UPDATE SET read_failures = excluded.read_failures",
+            &vals![retry.issue_id.as_str(), retry.read_failures],
+        )?;
+        Ok(())
+    })
 }
 
 /// Removes the queued retry of `issue_id`, if any.
@@ -543,8 +551,10 @@ pub(crate) fn delete_retry(db: &mut dyn Db, issue_id: &str) -> Result<()> {
 /// Every queued retry, soonest first.
 pub(crate) fn list_retries(db: &mut dyn Db) -> Result<Vec<RetryRecord>> {
     db.query(
-        "SELECT issue_id, attempt, due_at, identifier, issue_url, error, worker_host, \
-         workspace_path FROM retry_queue ORDER BY due_at, issue_id",
+        "SELECT retry_queue.issue_id, attempt, due_at, identifier, issue_url, error, worker_host, \
+         workspace_path, COALESCE(read_failures, 0) FROM retry_queue \
+         LEFT JOIN retry_read_failures ON retry_read_failures.issue_id = retry_queue.issue_id \
+         ORDER BY due_at, retry_queue.issue_id",
         &[],
     )?
     .iter()
@@ -553,6 +563,7 @@ pub(crate) fn list_retries(db: &mut dyn Db) -> Result<Vec<RetryRecord>> {
         Ok(RetryRecord {
             issue_id: row.text(0)?,
             attempt: clamp_u32(row.int(1)?),
+            read_failures: clamp_u32(row.int(8)?),
             due_at: DateTime::from_timestamp_millis(due_ms)
                 .ok_or_else(|| StoreError::CorruptRow(format!("invalid retry due_at {due_ms}")))?,
             identifier: row.text(3)?,

@@ -111,6 +111,8 @@ pub(crate) struct BlockedEntry {
 #[derive(Debug)]
 pub(crate) struct RetryEntry {
     pub attempt: u32,
+    /// See [`RetryMeta::read_failures`].
+    pub read_failures: u32,
     pub token: u64,
     pub timer: Option<AbortHandle>,
     pub due_at: Instant,
@@ -129,6 +131,10 @@ pub(crate) struct RetryMeta {
     pub error: Option<String>,
     pub worker_host: Option<String>,
     pub workspace_path: Option<String>,
+    /// Tracker reads that failed since the issue last ran. They lengthen the backoff like failed
+    /// runs, but the attempt counts runs only, so an outage never brings the retry limit closer.
+    /// Not merged: a run's outcome starts again at 0.
+    pub read_failures: u32,
 }
 
 impl RetryEntry {
@@ -139,6 +145,7 @@ impl RetryEntry {
             error: self.error.clone(),
             worker_host: self.worker_host.clone(),
             workspace_path: self.workspace_path.clone(),
+            read_failures: self.read_failures,
         }
     }
 }

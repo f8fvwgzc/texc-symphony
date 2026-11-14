@@ -647,9 +647,13 @@ impl<'w> Orchestrator<'w> {
 
     // ----- dispatch leases -------------------------------------------------------------------
 
-    /// Takes the dispatch lease of `issue_id` (kept while the issue is claimed). `false` when
-    /// another live replica holds it or the store cannot be reached (dispatch then waits).
-    pub(crate) async fn take_lease(&mut self, issue_id: &str) -> bool {
+    /// Takes the dispatch lease of `issue_id` (kept while the issue is claimed). `Ok(false)` when
+    /// another live replica holds it, an error when the store cannot be reached: either way
+    /// dispatch waits, but only a refusal says the issue is someone else's.
+    pub(crate) async fn take_lease(
+        &mut self,
+        issue_id: &str,
+    ) -> Result<bool, symphony_store::StoreError> {
         // A lapsed lease may be a peer's by now, so a shared store decides, and renews it if not.
         // Without peers it stays ours: a failing store must not cost a retry its claim.
         let now = Instant::now();
@@ -660,31 +664,29 @@ impl<'w> Orchestrator<'w> {
             .get(issue_id)
             .is_some_and(|due| *due > now || !shared)
         {
-            return true;
+            return Ok(true);
         }
         // The deadline counts from before the request: the stored expiry is no earlier.
         let asked = Instant::now();
-        match self
+        let taken = self
             .ctx
             .store
             .acquire_lease(issue_id, self.ctx.replica_id.clone(), LEASE_TTL)
-            .await
-        {
+            .await;
+        match &taken {
             Ok(true) => {
                 self.state
                     .leases
                     .insert(issue_id.to_owned(), asked + LEASE_TTL);
-                true
             }
             Ok(false) => {
                 tracing::debug!("Not dispatching issue_id={issue_id}: another replica holds it");
-                false
             }
             Err(err) => {
                 tracing::warn!("Not dispatching issue_id={issue_id}: lease failed: {err}");
-                false
             }
         }
+        taken
     }
 
     /// Registers `issue_id`'s run with the lease watchdog (shared stores only, once the lease

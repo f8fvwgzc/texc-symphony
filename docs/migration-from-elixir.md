@@ -186,8 +186,8 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   default is now the equivalent `{granular: {sandbox_approval: false, rules: false,
   mcp_elicitations: false}}`: Codex renamed the variant and inverted the booleans.
 - **The retry queue survives a restart (new).** With the run-history database enabled, every queued
-  retry is also written to its `retry_queue` table (issue, attempt, due time and metadata) and
-  removed when it fires or is released. Startup re-claims those issues and re-arms their timers
+  retry is also written to its `retry_queue` table (issue, attempt, due time and metadata, and in
+  `retry_read_failures` its failed tracker reads) and removed when it fires or is released. Startup re-claims those issues and re-arms their timers
   with what is left of the delay, so a failing issue continues its backoff instead of starting
   again at attempt 0. A restored retry takes the normal path when it fires: the issue is fetched
   from the tracker first, and one that was closed or removed meanwhile is released. Runs that were
@@ -311,6 +311,12 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   `Retry-After`. A server-supplied `Retry-After` is now capped at 60 s
   (`RetryPolicy::max_delay`), so one bad header cannot stall a poll for an hour. The transport still
   never retries POST (Linear, Jira search/bulkfetch) or any non-GET tool call.
+- **Two more transient failures.** Req retried neither of these, and a blip of either ended a live
+  run at the between-turns read. A connection reset while connecting, such as during the TLS
+  handshake, is now `closed`, like a reset later on. A failed host name lookup is now `dns_error`,
+  which keeps the resolver's message (`failed to lookup address information: ...`) so a mistyped
+  `api_url` stays easy to diagnose. Both are retried like the failures above, so such a GET now
+  takes at most 7 s longer to fail.
 - **Redirects.** Redirects are followed manually: at most 10 hops, then `too_many_redirects`.
   - On a scheme, host or port change, `Authorization`, `Private-Token`, `Cookie` and
     `Proxy-Authorization` are dropped. They stay dropped for the rest of the chain, including a
@@ -438,6 +444,12 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
 - **Between-turns read.** A transient failure of the issue read between turns is retried after 1 s,
   2 s and 4 s, within 8 s, because a failed read costs the live session. Elixir ended the run at
   once. A read that already spent that long, in the transport or on a timeout, is not repeated.
+- **Failed reads before a retry are not attempts.** Elixir added 1 to the attempt when the read
+  before a retry failed, and the run then started with that attempt. With a retry limit that let a
+  tracker outage block the issue at its next real failure, so the attempt now stays and a separate
+  count of failed reads lengthens the backoff by the same doubling. Retry rows an older build
+  counted up keep that attempt. A store error while taking a restored retry's dispatch lease no
+  longer drops the retry as if another replica held it: it waits for a slot at the same attempt.
 - **Actor instead of GenServer.** The orchestrator is one tokio task that owns all scheduling state
   and handles one event at a time from a biased `select!`: commands (snapshot, refresh), timer
   events (tick, poll cycle, retry), worker runtime info, per-run Codex event streams, and worker

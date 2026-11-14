@@ -62,7 +62,7 @@ impl Orchestrator<'_> {
         let Some(issue_id) = issue.id.clone() else {
             return;
         };
-        if !self.take_lease(&issue_id).await {
+        if self.take_lease(&issue_id).await != Ok(true) {
             return;
         }
         if let Revalidation::Ok(refreshed) = self.refresh_issue_for_dispatch(&issue).await {
@@ -233,7 +233,7 @@ impl Orchestrator<'_> {
                 continue;
             }
             let issue = task_issue(&task);
-            if !self.take_lease(&issue_id).await {
+            if self.take_lease(&issue_id).await != Ok(true) {
                 continue;
             }
             let Ok(Some(task)) = self.ctx.store.start_task(task.id).await else {

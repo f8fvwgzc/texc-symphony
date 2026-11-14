@@ -53,6 +53,7 @@ impl Orchestrator<'_> {
                 retry.issue_id,
                 RetryEntry {
                     attempt: retry.attempt,
+                    read_failures: retry.read_failures,
                     token,
                     timer: Some(timer),
                     due_at: Instant::now() + delay,
@@ -139,7 +140,9 @@ impl Orchestrator<'_> {
         let next_attempt =
             attempt.unwrap_or_else(|| previous.as_ref().map_or(0, |p| p.attempt) + 1);
         let settings = self.settings();
-        let delay = retry_delay(next_attempt, delay_type, &settings.agent);
+        let read_failures = meta.read_failures;
+        let backoff = next_attempt.saturating_add(read_failures);
+        let delay = retry_delay(backoff, delay_type, &settings.agent);
         let token = self.tokens.next();
         let pick = |new: Option<String>, old: Option<&Option<String>>| {
             new.or_else(|| old.and_then(Clone::clone))
@@ -180,6 +183,7 @@ impl Orchestrator<'_> {
             .save_retry(RetryRecord {
                 issue_id: issue_id.to_owned(),
                 attempt: next_attempt,
+                read_failures,
                 due_at: due,
                 identifier: identifier.clone(),
                 issue_url: issue_url.clone(),
@@ -193,6 +197,7 @@ impl Orchestrator<'_> {
             issue_id.to_owned(),
             RetryEntry {
                 attempt: next_attempt,
+                read_failures,
                 token,
                 timer: Some(timer),
                 due_at: Instant::now() + delay,
@@ -243,9 +248,9 @@ impl Orchestrator<'_> {
             || self.state.available_slots() == 0
             || !self.state.state_slots_available(issue, settings)
             || self.state.select_worker_host(settings, preferred) == HostChoice::NoCapacity
-            // A peer's lease may be a crashed process's: leave the retry, its row and its attempt
-            // alone, and let its own timer decide.
-            || !self.take_lease(issue_id).await
+            // A peer's lease may be a crashed process's, and a store error says nothing: leave the
+            // retry, its row and its attempt alone, and let its own timer decide.
+            || self.take_lease(issue_id).await != Ok(true)
         {
             return true;
         }
@@ -273,11 +278,14 @@ impl Orchestrator<'_> {
                     "Retry poll failed for issue_id={issue_id} issue_identifier={}: {err}",
                     meta.identifier.as_deref().unwrap_or(issue_id)
                 );
+                // The tracker failed, not the agent: the backoff grows, the attempt stays.
+                let read_failures = meta.read_failures.saturating_add(1);
                 self.schedule_issue_retry(
                     issue_id,
-                    Some(attempt + 1),
+                    Some(attempt),
                     RetryMeta {
                         error: Some(format!("retry poll failed: {err}")),
+                        read_failures,
                         ..meta
                     },
                     DelayType::Failure,
@@ -387,14 +395,24 @@ impl Orchestrator<'_> {
             self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::NoSlots);
             return;
         }
-        if !self.take_lease(issue_id).await {
-            // Another replica took the issue over (a shared store restored the same retry).
-            tracing::info!(
-                "Dropping the retry of {}: another replica holds it",
-                issue_context(&issue)
-            );
-            self.release_issue_claim(issue_id);
-            return;
+        match self.take_lease(issue_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Another replica took the issue over (a shared store restored the same retry).
+                tracing::info!(
+                    "Dropping the retry of {}: another replica holds it",
+                    issue_context(&issue)
+                );
+                self.release_issue_claim(issue_id);
+                return;
+            }
+            Err(_) => {
+                // The store is down, which says nothing about the issue: it waits like one without
+                // a slot, so the next poll offers it one, at the same attempt.
+                let meta = no_slots(meta, &issue);
+                self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::NoSlots);
+                return;
+            }
         }
         match self.refresh_issue_for_dispatch(&issue).await {
             Revalidation::Ok(refreshed) => {
@@ -418,9 +436,10 @@ impl Orchestrator<'_> {
                         "retry dispatch refresh failed: {}",
                         error_chain(&err)
                     )),
+                    read_failures: meta.read_failures.saturating_add(1),
                     ..meta
                 };
-                self.schedule_issue_retry(issue_id, Some(attempt + 1), meta, DelayType::Failure);
+                self.schedule_issue_retry(issue_id, Some(attempt), meta, DelayType::Failure);
             }
         }
     }

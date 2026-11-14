@@ -839,8 +839,12 @@ Retry limit (OPTIONAL extension, finite by default in Symphony):
 - A run that ends normally restarts the count: its continuation retry is attempt `1`.
 - A blocked issue is released when it leaves the active states, becomes unroutable, or disappears;
   it is dispatched again once it is an active candidate.
-- Failures that are not the agent's (a failed tracker refresh before a retry) never block the
-  issue; they still advance the attempt used for the backoff.
+- Failures that are not the agent's never count toward the limit. A failed tracker read before a
+  retry keeps the attempt (the one the next run gets and the limit counts) and adds one to a
+  separate count of failed reads since the issue last ran. The backoff uses their sum,
+  `min(10000 * 2^(attempt + read_failures - 1), agent.max_retry_backoff_ms)`, so an outage still
+  slows the retries down. A run's outcome starts the count again at 0, and a retry kept across a
+  restart keeps both counts.
 
 Retry handling behavior:
 
@@ -848,7 +852,10 @@ Retry handling behavior:
 2. If not found, release claim.
 3. If found in a terminal state, clean its workspace and release claim.
 4. If found and still active and routable:
-   - Dispatch if slots are available.
+   - Dispatch if slots are available. Where dispatch leases are kept in a database (13.8), a
+     retry whose lease another replica holds is released: that replica runs the issue. A database
+     that cannot be reached says nothing about the issue, so its retry waits like one without a
+     slot (below).
    - Otherwise requeue with error `no available orchestrator slots`, keeping the attempt: waiting
      is not a failure and never counts toward the retry limit. A global dispatch stop requeues the
      same way, and status surfaces SHOULD show its reason on such a retry. A tick offers free slots
@@ -2191,10 +2198,11 @@ on_retry_timer(issue_id, state):
 
 function handle_retry(issue_id, retry_entry, state):
   refreshed = tracker.fetch_issues_by_ids([issue_id])
-  if fetch failed:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
+  if fetch failed:  # 8.4: lengthens the backoff, keeps the attempt
+    return schedule_retry(state, issue_id, retry_entry.attempt, {
       identifier: retry_entry.identifier,
-      error: "retry refresh failed"
+      error: "retry refresh failed",
+      read_failures: retry_entry.read_failures + 1
     })
 
   issue = find_by_id(refreshed, issue_id)
@@ -2304,6 +2312,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Slot exhaustion requeues retries with explicit error reason, keeping the attempt
+- If the retry limit is implemented, failed tracker reads before a retry lengthen its backoff but
+  keep its attempt, so the next run is not blocked by them
 - A retry that keeps its issue does not bring a poll tick forward
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits

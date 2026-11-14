@@ -689,6 +689,7 @@ fn retry(issue_id: &str, attempt: u32, due_in_ms: i64) -> RetryRecord {
     RetryRecord {
         issue_id: issue_id.into(),
         attempt,
+        read_failures: 0,
         due_at,
         identifier: format!("MT-{issue_id}"),
         issue_url: Some(format!("https://example.org/{issue_id}")),
@@ -702,12 +703,27 @@ fn retry(issue_id: &str, attempt: u32, due_in_ms: i64) -> RetryRecord {
 async fn the_retry_queue_survives_a_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("symphony.db");
-    let (late, soon) = (retry("a", 3, 60_000), retry("b", 1, 1_000));
+    let late = RetryRecord {
+        read_failures: 4,
+        ..retry("a", 3, 60_000)
+    };
+    let soon = retry("b", 1, 1_000);
     {
         let store = Store::open(&path).unwrap();
-        store.save_retry(retry("a", 2, 30_000)).detach();
-        // One retry per issue: the newer one replaces the older.
+        store
+            .save_retry(RetryRecord {
+                read_failures: 9,
+                ..retry("a", 2, 30_000)
+            })
+            .detach();
+        // One retry per issue: the newer one replaces the older, failed reads included.
         store.save_retry(late.clone()).detach();
+        store
+            .save_retry(RetryRecord {
+                read_failures: 9,
+                ..soon.clone()
+            })
+            .detach();
         store.save_retry(soon.clone()).detach();
         store.save_retry(retry("gone", 1, 0)).detach();
         store.delete_retry("gone").detach();
