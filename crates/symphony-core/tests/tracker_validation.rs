@@ -241,10 +241,11 @@ fn github_settings_resolution() {
             "MY_TOKEN"
         ])
     );
-    // Settings add the HTTP API token variable and the LLM contract's secrets to the tracker's
-    // names.
+    // Settings add the HTTP API token variable, the store's connection string and the LLM
+    // contract's secrets to the tracker's names.
     let mut expected = secret_environment_names(&s.tracker);
     expected.push("SYMPHONY_API_TOKEN".into());
+    expected.push("SYMPHONY_DATABASE_URL".into());
     expected.extend(symphony_core::config::llm::LLM_SECRET_ENV_NAMES.map(str::to_owned));
     assert_eq!(s.secret_environment_names(), expected);
 

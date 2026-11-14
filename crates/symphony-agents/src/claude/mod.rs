@@ -576,21 +576,23 @@ fn stderr_suffix(tail: &Mutex<VecDeque<String>>) -> String {
 }
 
 async fn collect_stderr<R: AsyncRead + Unpin>(stderr: R, tail: Arc<Mutex<VecDeque<String>>>) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    // Capped like stdout: a stderr line that never ends must not be buffered whole.
+    let mut lines = LineReader::new(stderr);
+    while let Some(line) = lines.next_line().await {
+        let line = line.trim_end_matches('\r');
         if line.trim().is_empty() {
             continue;
         }
-        tracing::debug!("claude stderr: {}", truncate(&line, STDERR_LINE_CHARS));
+        tracing::debug!("claude stderr: {}", truncate(line, STDERR_LINE_CHARS));
         let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
         if tail.len() == STDERR_TAIL_LINES {
             tail.pop_front();
         }
-        tail.push_back(truncate(&line, STDERR_LINE_CHARS));
+        tail.push_back(truncate(line, STDERR_LINE_CHARS));
     }
 }
 
-/// Newline-delimited stdout with a per-line size cap ([`MAX_LINE_BYTES`]).
+/// Newline-delimited child output (stdout, stderr) with a per-line size cap ([`MAX_LINE_BYTES`]).
 struct LineReader<R> {
     reader: BufReader<R>,
     buf: Vec<u8>,

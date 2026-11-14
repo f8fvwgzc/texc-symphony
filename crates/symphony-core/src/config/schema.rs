@@ -32,6 +32,33 @@ pub const DEFAULT_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WORKSPACE_DIR_NAME: &str = "symphony_workspaces";
 /// Env var holding the HTTP API token when `server.api_token` is not set.
 pub const ENV_API_TOKEN: &str = "SYMPHONY_API_TOKEN";
+/// Env var with the PostgreSQL connection string of the run-history store (read by
+/// `symphony-store`). It carries the database password.
+pub const ENV_DATABASE_URL: &str = "SYMPHONY_DATABASE_URL";
+/// Env var naming the run-history database (read by `symphony-store`): a file path, or a
+/// PostgreSQL connection string like [`ENV_DATABASE_URL`].
+pub const ENV_DB_PATH: &str = "SYMPHONY_DB_PATH";
+
+/// `true` for a `postgres://` or `postgresql://` connection string (the scheme in any case).
+pub fn is_postgres_url(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    lower.starts_with("postgres://") || lower.starts_with("postgresql://")
+}
+
+/// The env vars that hold the run-history store's connection string in `env`, and so the
+/// database password: [`ENV_DATABASE_URL`] always, [`ENV_DB_PATH`] only while it holds a
+/// PostgreSQL URL (a database file's path is no secret, and treating it as one would redact that
+/// path from run history).
+fn store_secret_environment_names(env: &dyn EnvSource) -> Vec<String> {
+    let mut names = vec![ENV_DATABASE_URL.to_owned()];
+    if env
+        .var(ENV_DB_PATH)
+        .is_some_and(|path| is_postgres_url(&path))
+    {
+        names.push(ENV_DB_PATH.to_owned());
+    }
+    names
+}
 
 /// A value that is either a string or a map (Elixir `Schema.StringOrMap`), used by
 /// `codex.approval_policy`.
@@ -410,7 +437,9 @@ pub struct ServerSettings {
     /// Bearer token the HTTP API requires (`server.api_token`, `$VAR` resolved, else
     /// [`ENV_API_TOKEN`]). `None` leaves the API open, which the server only allows on loopback.
     pub api_token: Option<String>,
-    /// Env var names that may hold the token (computed; stripped from agent environments).
+    /// Env var names that hold Symphony's own secrets: those that may hold the token, and those
+    /// with the run-history store's connection string (computed; stripped from agent
+    /// environments).
     pub secret_environment_names: Vec<String>,
     /// Extra `Host` header names accepted besides loopback and the bind host (`*` accepts any).
     pub allowed_hosts: Vec<String>,
@@ -1203,6 +1232,7 @@ fn finalize(mut settings: Settings, env: &dyn EnvSource) -> Settings {
     server.api_token = env::resolve_secret_setting(raw_token.as_ref(), env.var(ENV_API_TOKEN), env);
     let mut names = vec![ENV_API_TOKEN.to_owned()];
     names.extend(env::env_reference_names([raw_token.as_ref()]));
+    names.extend(store_secret_environment_names(env));
     server.secret_environment_names = env::uniq(names);
 
     let default_root = default_workspace_root(env);

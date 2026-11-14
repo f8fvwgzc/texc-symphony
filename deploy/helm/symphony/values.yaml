@@ -17,6 +17,9 @@ workflow: |
     kind: none
   server:
     port: 4000
+    # The names clients use for this server (its Service or Ingress host). Without them only
+    # loopback names are answered (`kubectl port-forward` works); the pod IP never is.
+    # allowed_hosts: ["symphony.example.com", "symphony.default.svc"]
   budget:
     max_tokens_per_day: 20000000
   ---

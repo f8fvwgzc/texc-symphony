@@ -142,9 +142,10 @@ impl Orchestrator<'_> {
                     "Issue stalled: issue_id={id} issue_identifier={identifier} session_id={session_id} elapsed_ms={elapsed_ms}; restarting with backoff"
                 );
                 let error = format!("stalled for {elapsed_ms}ms without codex activity");
-                if let Some(task) = task_id(&id) {
+                if let Some((task, attempt)) = entry.task.as_ref().map(|t| (t.id, t.attempt)) {
                     self.task_finish(
                         task,
+                        attempt,
                         TaskStatus::Failed,
                         None,
                         Some(error.clone()),

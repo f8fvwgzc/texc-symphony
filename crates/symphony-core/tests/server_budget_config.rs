@@ -23,9 +23,14 @@ fn api_token_resolves_env_references_and_the_default_variable() {
     let env = MapEnv::new().with("MY_TOKEN", "from-ref");
     let settings = parse(json!({"server": {"api_token": "$MY_TOKEN"}}), &env).unwrap();
     assert_eq!(settings.server.api_token.as_deref(), Some("from-ref"));
+    // The token's variables first, then the store's connection string.
     assert_eq!(
         settings.server.secret_environment_names,
-        vec!["SYMPHONY_API_TOKEN".to_owned(), "MY_TOKEN".to_owned()]
+        vec![
+            "SYMPHONY_API_TOKEN".to_owned(),
+            "MY_TOKEN".to_owned(),
+            "SYMPHONY_DATABASE_URL".to_owned()
+        ]
     );
 
     let env = MapEnv::new().with("SYMPHONY_API_TOKEN", "fallback");
@@ -49,6 +54,30 @@ fn the_api_token_is_stripped_from_agent_environments_and_redacted_in_debug() {
     let debug = format!("{:?}", settings.server);
     assert!(!debug.contains("s3cret-value"), "{debug}");
     assert!(debug.contains("<redacted>"), "{debug}");
+}
+
+/// The run-history store's connection string carries the database password, and agents (and
+/// hooks) run with the orchestrator's environment minus these names.
+#[test]
+fn the_store_connection_string_is_stripped_from_agent_environments() {
+    let has = |env: &MapEnv, name: &str| {
+        let names = parse(json!({}), env).unwrap().secret_environment_names();
+        names.iter().any(|n| n == name)
+    };
+    // Always the dedicated variable, set or not (a reload must not depend on it).
+    assert!(has(&MapEnv::new(), "SYMPHONY_DATABASE_URL"));
+    // `SYMPHONY_DB_PATH` only while it holds a connection string: a database file's path is no
+    // secret, and listing it would redact that path from run history.
+    assert!(!has(&MapEnv::new(), "SYMPHONY_DB_PATH"));
+    let file = MapEnv::new().with("SYMPHONY_DB_PATH", "/data/symphony.db");
+    assert!(!has(&file, "SYMPHONY_DB_PATH"));
+    for url in [
+        "postgres://symphony:pw@db/symphony",
+        " PostgreSQL://symphony:pw@db/symphony",
+    ] {
+        let env = MapEnv::new().with("SYMPHONY_DB_PATH", url);
+        assert!(has(&env, "SYMPHONY_DB_PATH"), "{url}");
+    }
 }
 
 #[test]

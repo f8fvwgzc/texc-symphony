@@ -1,10 +1,13 @@
 //! The app-server child process: spawn, stdout line framing, stderr capture, deterministic shutdown.
 //!
-//! - stdout: newline-delimited frames, accumulated without a length cap (Elixir concatenated 1 MiB
-//!   `noeol` fragments without limit), decoded as lossy UTF-8. A trailing fragment without `\n` at EOF
-//!   is dropped, like the BEAM's final `noeol` chunk followed by `exit_status`.
-//! - stderr: kept separate (SPEC; Elixir merged it into stdout). Each line is logged with the same
-//!   rules as non-JSON stdout lines and kept in a small tail buffer for diagnostics.
+//! - stdout: newline-delimited frames, decoded as lossy UTF-8. A line longer than
+//!   [`MAX_LINE_BYTES`] is skipped with a warning (Elixir concatenated 1 MiB `noeol` fragments
+//!   without limit, so one runaway line could exhaust memory), and the lines waiting for the session
+//!   are bounded by count and by bytes. A trailing fragment without `\n` at EOF is dropped, like the
+//!   BEAM's final `noeol` chunk followed by `exit_status`.
+//! - stderr: kept separate (SPEC; Elixir merged it into stdout), with the same line cap. Each line is
+//!   logged with the same rules as non-JSON stdout lines and kept in a small tail buffer for
+//!   diagnostics.
 //! - The child runs in its own process group (`process_group(0)`) with `kill_on_drop(true)`; shutdown
 //!   closes stdin, waits a grace period, then `SIGKILL`s the whole group (Elixir only closed the port).
 
@@ -14,9 +17,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -26,8 +29,19 @@ use crate::error::CodexError;
 pub const MAX_STREAM_LOG_CHARS: usize = 1_000;
 /// Number of stderr lines kept for [`crate::AppServerSession::stderr_tail`].
 pub const STDERR_TAIL_LINES: usize = 50;
+/// Longest stdout or stderr line kept, without its `\n` (SPEC 10.1 recommends 10 MB); a longer
+/// one is skipped.
+pub const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 /// Buffered stdout lines between the reader task and the session (backpressure beyond this).
 const LINE_CHANNEL_CAPACITY: usize = 1_024;
+/// Bytes of buffered stdout lines between the reader task and the session (backpressure beyond
+/// this): [`LINE_CHANNEL_CAPACITY`] alone would let that many lines of [`MAX_LINE_BYTES`] wait.
+const LINE_BUFFER_BYTES: usize = 4 * MAX_LINE_BYTES;
+/// Longest decoded line: lossy UTF-8 decoding replaces each invalid byte with a 3-byte U+FFFD.
+const MAX_DECODED_LINE_BYTES: usize = 3 * MAX_LINE_BYTES;
+// A decoded line must fit the byte budget, or its reader would wait for room forever.
+const _: () =
+    assert!(MAX_DECODED_LINE_BYTES <= LINE_BUFFER_BYTES && LINE_BUFFER_BYTES <= u32::MAX as usize);
 /// How long shutdown waits for the reader tasks to drain after the process group is gone.
 const READER_DRAIN: Duration = Duration::from_secs(1);
 /// Upper bound for reaping the child after `SIGKILL`.
@@ -115,40 +129,109 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(-1)
 }
 
-/// Newline framing over a byte stream with an unbounded line buffer.
+/// Newline framing over a byte stream with a per-line size cap.
 struct FrameReader<R> {
     reader: BufReader<R>,
     buf: Vec<u8>,
+    max_line_bytes: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
+    /// Frames of at most [`MAX_LINE_BYTES`].
     fn new(stream: R) -> Self {
+        Self::with_limit(stream, MAX_LINE_BYTES)
+    }
+
+    fn with_limit(stream: R, max_line_bytes: usize) -> Self {
         Self {
             reader: BufReader::new(stream),
             buf: Vec::new(),
+            max_line_bytes,
         }
     }
 
-    /// The next complete line without its `\n`, or `None` at EOF / on a read error.
+    /// The next complete line without its `\n`, or `None` at EOF / on a read error. A line over
+    /// the cap is skipped (its bytes are read and dropped, never buffered).
     async fn next_line(&mut self) -> Option<String> {
-        self.buf.clear();
-        match self.reader.read_until(b'\n', &mut self.buf).await {
-            Ok(0) => None,
-            Ok(_) if self.buf.last() == Some(&b'\n') => {
-                self.buf.pop();
-                Some(String::from_utf8_lossy(&self.buf).into_owned())
+        loop {
+            self.buf.clear();
+            // The line and its `\n`; one byte more than that without a `\n` is over the cap.
+            let limit = self.max_line_bytes as u64 + 1;
+            let read = (&mut self.reader)
+                .take(limit)
+                .read_until(b'\n', &mut self.buf)
+                .await;
+            match read {
+                Ok(0) => return None,
+                Ok(_) if self.buf.last() == Some(&b'\n') => {
+                    self.buf.pop();
+                    return Some(String::from_utf8_lossy(&self.buf).into_owned());
+                }
+                Ok(read) if read as u64 == limit => {
+                    tracing::warn!(
+                        "Skipping a Codex output line over {} bytes",
+                        self.max_line_bytes
+                    );
+                    // Do not keep a cap-sized buffer around for the rest of the session.
+                    self.buf = Vec::new();
+                    if !self.skip_rest_of_line().await {
+                        return None;
+                    }
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        bytes = self.buf.len(),
+                        "Codex stream ended with an unterminated line; dropping it"
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    tracing::debug!("Codex stream read failed: {err}");
+                    return None;
+                }
             }
-            Ok(_) => {
-                tracing::debug!(
-                    bytes = self.buf.len(),
-                    "Codex stream ended with an unterminated line; dropping it"
-                );
-                None
+        }
+    }
+
+    /// Discards up to and including the next `\n`; `false` at EOF or on a read error.
+    async fn skip_rest_of_line(&mut self) -> bool {
+        loop {
+            let available = match self.reader.fill_buf().await {
+                Ok([]) | Err(_) => return false,
+                Ok(bytes) => bytes,
+            };
+            if let Some(at) = available.iter().position(|b| *b == b'\n') {
+                self.reader.consume(at + 1);
+                return true;
             }
-            Err(err) => {
-                tracing::debug!("Codex stream read failed: {err}");
-                None
-            }
+            let len = available.len();
+            self.reader.consume(len);
+        }
+    }
+}
+
+/// A stdout line on its way to the session, with its share of the byte budget (given back when
+/// the session takes the line).
+type BufferedLine = (String, OwnedSemaphorePermit);
+
+/// Forwards complete lines to the session until EOF, or until the session is gone. Backpressure:
+/// while the session is not reading (between turns), at most [`LINE_CHANNEL_CAPACITY`] lines and
+/// `budget` bytes wait here; then the pipe fills up and the server blocks, instead of this process
+/// buffering without bound.
+async fn pump_lines<R: AsyncRead + Unpin>(
+    mut frames: FrameReader<R>,
+    lines: mpsc::Sender<BufferedLine>,
+    budget: Arc<Semaphore>,
+) {
+    while let Some(line) = frames.next_line().await {
+        // A decoded line is at most `MAX_DECODED_LINE_BYTES` long, which fits both `u32` and the
+        // budget (checked at compile time above).
+        let bytes = u32::try_from(line.len()).unwrap_or(u32::MAX);
+        let Ok(permit) = Arc::clone(&budget).acquire_many_owned(bytes).await else {
+            break;
+        };
+        if lines.send((line, permit)).await.is_err() {
+            break;
         }
     }
 }
@@ -158,7 +241,7 @@ pub(crate) struct Transport {
     child: Child,
     pid: Option<u32>,
     stdin: Option<ChildStdin>,
-    lines: mpsc::Receiver<String>,
+    lines: mpsc::Receiver<BufferedLine>,
     stdout_closed: bool,
     exit_status: Option<i32>,
     stdout_task: Option<JoinHandle<()>>,
@@ -205,16 +288,11 @@ impl Transport {
         };
 
         let (tx, lines) = mpsc::channel(LINE_CHANNEL_CAPACITY);
-        let stdout_task = tokio::spawn(async move {
-            let mut frames = FrameReader::new(stdout);
-            while let Some(line) = frames.next_line().await {
-                // Backpressure: when the session is not reading (between turns) the pipe fills up and the
-                // server blocks, instead of this process buffering without bound.
-                if tx.send(line).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let stdout_task = tokio::spawn(pump_lines(
+            FrameReader::new(stdout),
+            tx,
+            Arc::new(Semaphore::new(LINE_BUFFER_BYTES)),
+        ));
 
         let label = Arc::new(AtomicU8::new(StreamLabel::Response as u8));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
@@ -296,7 +374,8 @@ impl Transport {
         if !self.stdout_closed {
             match timeout_at(deadline, self.lines.recv()).await {
                 Err(_) => return Incoming::Timeout,
-                Ok(Some(line)) => return Incoming::Line(line),
+                // The line's share of the byte budget is given back here.
+                Ok(Some((line, _budget))) => return Incoming::Line(line),
                 Ok(None) => self.stdout_closed = true,
             }
         }
@@ -355,7 +434,7 @@ impl Transport {
             }
         }
 
-        self.lines.close();
+        close_lines(&mut self.lines);
         for task in [self.stdout_task.take(), self.stderr_task.take()]
             .into_iter()
             .flatten()
@@ -366,6 +445,14 @@ impl Transport {
             }
         }
     }
+}
+
+/// Closes the line channel and drops the lines still in it. Their share of the byte budget is
+/// given back with them, so a reader waiting for room wakes up, finds the channel closed and ends
+/// (a closed channel alone would leave it waiting on the budget).
+fn close_lines(lines: &mut mpsc::Receiver<BufferedLine>) {
+    lines.close();
+    while lines.try_recv().is_ok() {}
 }
 
 impl Drop for Transport {
@@ -389,6 +476,88 @@ mod tests {
         assert!(!has_log_keyword("errors happen"));
         assert!(!has_log_keyword("warned_about"));
         assert!(!has_log_keyword("all good"));
+    }
+
+    /// One runaway line (no `\n` for megabytes) must not be buffered: it is skipped, and the
+    /// lines around it still arrive.
+    #[tokio::test]
+    async fn a_line_over_the_cap_is_skipped_and_the_stream_goes_on() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"before\n");
+        stream.extend_from_slice(b"12345678\n"); // exactly the cap: kept
+        stream.extend_from_slice(&[b'x'; 9]); // one byte over
+        stream.extend_from_slice(b"\n");
+        stream.extend_from_slice(&vec![b'y'; 100_000]); // far over, across many reads
+        stream.extend_from_slice(b"\nafter\nunterminated");
+        let mut frames = FrameReader::with_limit(stream.as_slice(), 8);
+        let mut lines = Vec::new();
+        while let Some(line) = frames.next_line().await {
+            lines.push(line);
+        }
+        assert_eq!(lines, ["before", "12345678", "after"]);
+        assert!(
+            frames.buf.capacity() <= 64,
+            "the skipped line was buffered ({} bytes)",
+            frames.buf.capacity()
+        );
+
+        // An over-long line that never ends: nothing is returned and nothing is kept.
+        let endless = vec![b'z'; 100_000];
+        let mut frames = FrameReader::with_limit(endless.as_slice(), 8);
+        assert_eq!(frames.next_line().await, None);
+        assert!(frames.buf.capacity() <= 64);
+    }
+
+    /// Lines the session has not taken yet are bounded in bytes, not only in number: the reader
+    /// waits for room instead of buffering more.
+    #[tokio::test]
+    async fn waiting_lines_are_bounded_by_the_byte_budget() {
+        let stream = b"aaaaaaaaaa\nbbbbbbbbbb\ncc\n".to_vec();
+        let (tx, mut rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
+        let budget = Arc::new(Semaphore::new(16));
+        let pump = tokio::spawn(pump_lines(
+            FrameReader::new(std::io::Cursor::new(stream)),
+            tx,
+            Arc::clone(&budget),
+        ));
+        // The first line (10 of 16 bytes) is through; the second (10 more) has to wait.
+        let (first, first_share) = rx.recv().await.unwrap();
+        assert_eq!(first, "aaaaaaaaaa");
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the second line did not wait");
+        // The session takes the first line: its bytes are free again and the rest follows.
+        drop(first_share);
+        let (second, second_share) = rx.recv().await.unwrap();
+        assert_eq!(second, "bbbbbbbbbb");
+        drop(second_share);
+        assert_eq!(rx.recv().await.unwrap().0, "cc");
+        assert!(rx.recv().await.is_none());
+        pump.await.unwrap();
+        assert_eq!(budget.available_permits(), 16);
+    }
+
+    /// Shutdown must not wait for a reader that is waiting for room in the byte budget.
+    #[tokio::test]
+    async fn closing_the_lines_ends_a_reader_that_waits_for_room() {
+        let stream = b"aaaaaaaaaa\nbbbbbbbbbb\n".to_vec();
+        let (tx, mut rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
+        let pump = tokio::spawn(pump_lines(
+            FrameReader::new(std::io::Cursor::new(stream)),
+            tx,
+            Arc::new(Semaphore::new(16)),
+        ));
+        // The first line is buffered (10 of 16 bytes); the reader waits for room for the second.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!pump.is_finished());
+        close_lines(&mut rx);
+        timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("the reader ended")
+            .unwrap();
     }
 
     #[test]

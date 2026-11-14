@@ -56,6 +56,6 @@ pub use store::{Pending, STORE_QUEUE_CAPACITY, Store};
 pub use tasks::{
     DEFAULT_TASK_BACKOFF_MS, DEFAULT_TASK_LIMIT, DEFAULT_TASK_MAX_ATTEMPTS,
     DEFAULT_TASK_MAX_BACKOFF_MS, MAX_TASK_ATTEMPTS, MAX_TASK_DEPENDENCIES, MAX_TASK_LIMIT,
-    MAX_TASK_PROMPT_BYTES, MAX_TASK_RESULT_BYTES, NewTask, TaskFailure, TaskLimits, TaskPage,
-    TaskQuery, TaskRecord, TaskRetry, TaskStatus, task_identifier,
+    MAX_TASK_PROMPT_BYTES, MAX_TASK_RESULT_BYTES, NewTask, TaskFailure, TaskFence, TaskLimits,
+    TaskPage, TaskQuery, TaskRecord, TaskRetry, TaskStatus, task_identifier,
 };

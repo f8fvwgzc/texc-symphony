@@ -79,8 +79,12 @@ async fn a_lost_postgres_connection_is_reopened() {
     .unwrap();
     // The first operation may meet the dead connection and fail, or the driver may notice the
     // close first and the store reconnect before it runs. Only the former marks it degraded.
-    if store.list_runs(RunQuery::default()).await.is_err() {
+    if let Err(err) = store.list_runs(RunQuery::default()).await {
         assert!(store.is_degraded(), "a failed op marks the store degraded");
+        assert!(
+            matches!(err, StoreError::ConnectionLost(_)) && err.is_transient(),
+            "the op that met the dead connection says so: {err}"
+        );
     }
     // Either way the store recovers and serves the same schema, no longer degraded.
     let page = store.list_runs(RunQuery::default()).await.unwrap();
@@ -1348,29 +1352,34 @@ fn retrying(prompt: &str, retry: symphony_store::TaskRetry) -> symphony_store::N
     }
 }
 
-/// Starts `id` as `owner` would: the dispatch lease first, then the claim.
-async fn start_as(store: &Store, id: i64, owner: &str) {
+/// Starts `id` as `owner` would (the dispatch lease first, then the claim) and returns the fence
+/// of that run.
+async fn start_as(store: &Store, id: i64, owner: &str) -> symphony_store::TaskFence {
     assert!(
         store
             .acquire_lease(format!("task:{id}"), owner, Duration::from_secs(60))
             .await
             .unwrap()
     );
-    store.start_task(id).await.unwrap().unwrap();
+    let started = store.start_task(id).await.unwrap().unwrap();
+    symphony_store::TaskFence {
+        owner: owner.to_owned(),
+        attempt: started.attempts,
+    }
 }
 
 #[tokio::test]
 async fn failed_runs_are_retried_by_the_task_policy() {
-    use symphony_store::{TaskFailure, TaskRetry, TaskStatus};
+    use symphony_store::{TaskFailure, TaskFence, TaskRetry, TaskStatus};
     let store = memory();
-    let fail = |id: i64, failure: TaskFailure| {
+    let fail = |id: i64, failure: TaskFailure, run: TaskFence| {
         store.finish_task_run(
             id,
             TaskStatus::Failed,
             None,
             Some("agent exited: boom".into()),
             Some(failure),
-            "a".into(),
+            run,
         )
     };
     // A long backoff: queued again, but not dispatched before it is over.
@@ -1386,8 +1395,11 @@ async fn failed_runs_are_retried_by_the_task_policy() {
         ))
         .await
         .unwrap();
-    start_as(&store, slow.id, "a").await;
-    let queued = fail(slow.id, TaskFailure::Error).await.unwrap().unwrap();
+    let run = start_as(&store, slow.id, "a").await;
+    let queued = fail(slow.id, TaskFailure::Error, run)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(queued.status, TaskStatus::Queued);
     assert_eq!(queued.failed_attempts, 1);
     assert_eq!(queued.error.as_deref(), Some("agent exited: boom"));
@@ -1412,15 +1424,21 @@ async fn failed_runs_are_retried_by_the_task_policy() {
         quick.retry.on,
         vec![TaskFailure::Error, TaskFailure::Timeout]
     );
-    start_as(&store, quick.id, "a").await;
-    let again = fail(quick.id, TaskFailure::Timeout).await.unwrap().unwrap();
+    let run = start_as(&store, quick.id, "a").await;
+    let again = fail(quick.id, TaskFailure::Timeout, run)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (again.status, again.next_attempt_at),
         (TaskStatus::Queued, None)
     );
     assert_eq!(store.queued_tasks(10).await.unwrap()[0].id, quick.id);
-    start_as(&store, quick.id, "a").await;
-    let failed = fail(quick.id, TaskFailure::Error).await.unwrap().unwrap();
+    let run = start_as(&store, quick.id, "a").await;
+    let failed = fail(quick.id, TaskFailure::Error, run)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(failed.status, TaskStatus::Failed);
     assert_eq!(failed.failed_attempts, 2);
     assert_eq!(failed.attempts, 2);
@@ -1435,8 +1453,11 @@ async fn failed_runs_are_retried_by_the_task_policy() {
     // A kind the policy does not retry (the default retries interruptions only) ends the task.
     let plain = store.create_task(task("plain")).await.unwrap();
     assert_eq!(plain.retry, TaskRetry::default());
-    start_as(&store, plain.id, "a").await;
-    let ended = fail(plain.id, TaskFailure::Error).await.unwrap().unwrap();
+    let run = start_as(&store, plain.id, "a").await;
+    let ended = fail(plain.id, TaskFailure::Error, run)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ended.status, TaskStatus::Failed);
     assert!(matches!(
         store
@@ -1454,11 +1475,15 @@ async fn failed_runs_are_retried_by_the_task_policy() {
 
 #[tokio::test]
 async fn a_replica_that_lost_the_lease_cannot_write_the_task() {
-    use symphony_store::TaskStatus;
+    use symphony_store::{TaskFence, TaskStatus};
     let store = memory();
     let task_a = store.create_task(task("taken over")).await.unwrap();
-    start_as(&store, task_a.id, "replica-b").await;
+    let holder = start_as(&store, task_a.id, "replica-b").await;
     // Replica a's late finish and release are refused: b holds the lease.
+    let stale = TaskFence {
+        owner: "replica-a".into(),
+        attempt: holder.attempt,
+    };
     assert_eq!(
         store
             .finish_task_run(
@@ -1467,14 +1492,14 @@ async fn a_replica_that_lost_the_lease_cannot_write_the_task() {
                 Some("stale".into()),
                 None,
                 None,
-                "replica-a".into(),
+                stale.clone(),
             )
             .await
             .unwrap(),
         None
     );
     let unchanged = store
-        .release_task(task_a.id, "stale", Some("replica-a".into()))
+        .release_task(task_a.id, "stale", Some(stale))
         .await
         .unwrap()
         .unwrap();
@@ -1487,12 +1512,75 @@ async fn a_replica_that_lost_the_lease_cannot_write_the_task() {
             Some("fresh".into()),
             None,
             None,
-            "replica-b".into(),
+            holder,
         )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(done.result.as_deref(), Some("fresh"));
+}
+
+/// The same replica runs a task twice (a failure its policy retries). A finish or release of the
+/// first run that is repeated after the second started (a write retried after a store error whose
+/// first try had in fact been applied) must not touch the second run.
+#[tokio::test]
+async fn a_write_repeated_after_the_task_started_again_is_refused() {
+    use symphony_store::{TaskFailure, TaskFence, TaskRetry, TaskStatus};
+    let store = memory();
+    let created = store
+        .create_task(retrying(
+            "again",
+            TaskRetry {
+                max_attempts: 3,
+                backoff_ms: 0,
+                max_backoff_ms: 0,
+                on: vec![TaskFailure::Error],
+            },
+        ))
+        .await
+        .unwrap();
+    let fail = |run: TaskFence| {
+        store.finish_task_run(
+            created.id,
+            TaskStatus::Failed,
+            None,
+            Some("agent exited: boom".into()),
+            Some(TaskFailure::Error),
+            run,
+        )
+    };
+    let first = start_as(&store, created.id, "a").await;
+    let queued = fail(first.clone()).await.unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::Queued);
+    let second = start_as(&store, created.id, "a").await;
+    assert_eq!((first.attempt, second.attempt), (1, 2));
+
+    // The first run's writes arrive again while "a" holds the lease for the second run.
+    assert_eq!(fail(first.clone()).await.unwrap(), None);
+    let unchanged = store
+        .release_task(created.id, "stale", Some(first))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (unchanged.status, unchanged.failed_attempts),
+        (TaskStatus::Running, 1),
+        "the second run is untouched and no failure was counted twice"
+    );
+    // The second run's own finish lands.
+    let done = store
+        .finish_task_run(
+            created.id,
+            TaskStatus::Succeeded,
+            Some("ok".into()),
+            None,
+            None,
+            second,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Succeeded);
 }
 
 #[tokio::test]

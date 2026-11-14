@@ -107,6 +107,40 @@ async fn api_routes_require_the_token_but_health_contract_and_assets_do_not() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// What the Helm chart's probes rely on: a server bound to `0.0.0.0` answers the health check for
+/// a loopback `Host` without a token, and refuses the pod IP a kubelet sends by default.
+#[tokio::test]
+async fn a_wildcard_bind_answers_health_for_localhost_but_not_for_the_pod_ip() {
+    let harness = Harness::with(
+        StaticControlPlane::new(Ok(static_snapshot())),
+        Store::open_in_memory().unwrap(),
+        ServerConfig {
+            auth: Auth::token(TOKEN),
+            ..ServerConfig::new("0.0.0.0", 0)
+        },
+    );
+    for host in ["localhost", "localhost:4000"] {
+        let (status, _, _) = status_and_json(
+            &harness,
+            request(Method::GET, "/api/v1/health", &[("host", host)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{host}");
+    }
+    for host in ["10.1.2.3:4000", "0.0.0.0:4000"] {
+        let (status, _, body) = status_and_json(
+            &harness,
+            request(Method::GET, "/api/v1/health", &[("host", host)]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{host}");
+        assert_eq!(
+            body,
+            envelope("host_not_allowed", "Host header is not allowed")
+        );
+    }
+}
+
 #[tokio::test]
 async fn foreign_host_headers_are_refused_even_with_a_token() {
     let harness = secured();

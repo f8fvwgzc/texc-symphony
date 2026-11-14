@@ -32,7 +32,7 @@ path defaults to `./WORKFLOW.md`. Flags win over environment variables, which wi
 | `SYMPHONY_PORT` | unset (no HTTP server) | HTTP port; same as `--port` or `server.port` in `WORKFLOW.md`; `0` picks a free port |
 | `SYMPHONY_LOGS_ROOT` | current directory | log root; the rotating files are `<root>/log/symphony.log*` |
 | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run history; `off` disables it (same as `--no-db`); a `postgres://` URL selects PostgreSQL |
-| `SYMPHONY_DATABASE_URL` | unset | PostgreSQL connection string (wins over `SYMPHONY_DB_PATH`), see [PostgreSQL and replicas](#postgresql-and-replicas) |
+| `SYMPHONY_DATABASE_URL` | unset | PostgreSQL connection string (wins over `SYMPHONY_DB_PATH`), see [PostgreSQL and replicas](#postgresql-and-replicas); kept out of agent and hook environments |
 | `SYMPHONY_REPLICA_ID` | `local` (SQLite), `<host>-<pid>-<random>` (PostgreSQL) | this process in dispatch leases; a stable id (StatefulSet pod name) lets a restarted replica recover its work at once |
 | `SYMPHONY_DB_RETENTION_DAYS` | `30` | days of finished runs to keep; `0` keeps everything |
 | `SYMPHONY_DB_PAYLOAD_RETENTION_DAYS` | `7` | days to keep raw event payloads (agent messages, command output); `0` keeps them as long as the run |
@@ -143,6 +143,10 @@ helm install symphony deploy/helm/symphony --set acknowledgeGuardrails=true \
 - Credentials are files under `/var/run/secrets/llm` (Secret `llm-credentials`, keys `api-key`
   and `gateway-token`, both optional). Set `global.llm.apiKeySecretKey=""` for keyless servers.
 - The pod runs as uid 10001 with no capabilities. `make helm-check` lints and renders the chart.
+- The readiness and liveness probes send `Host: localhost`: the server binds `0.0.0.0` in the
+  image and refuses the pod IP a kubelet would send (see the `Host` allow-list above). For the same
+  reason, list the names clients use (the Service's DNS name, an Ingress host) in
+  `server.allowed_hosts` of the workflow; `kubectl port-forward` works without it.
 
 ## Option 4: systemd (Linux server, binary install)
 
@@ -258,10 +262,15 @@ export SYMPHONY_DATABASE_URL='postgres://symphony:secret@db.internal:5432/sympho
   network drops the connection after 30 s (`tcp_user_timeout`, keepalives), and each session sets
   `statement_timeout`/`lock_timeout` to 30 s, so no single query can pin the store thread. A lost
   connection (a database restart or failover) is reopened by the next operation, retried with a
-  short backoff; the operation that met it fails, and `GET /api/v1/health` reports
-  `status: degraded` (and `store: postgres`) in the body until it reconnects (the status code
-  stays 200), so operators can alert on it. The password never appears in logs (userinfo or
-  `password=`).
+  short backoff; the operation that met it fails (`store_connection_lost`), and
+  `GET /api/v1/health` reports `status: degraded` (and `store: postgres`) in the body until it
+  reconnects (the status code stays 200), so operators can alert on it. A task's status change
+  that fails this way is repeated for up to 60 s (the life of the run's lease), so a short outage
+  does not lose a finished task's result; after a longer one the task is recovered as
+  `interrupted`. The password never appears in logs (userinfo or `password=`), and the connection
+  string is removed from the environment of agents and hooks (also from `SYMPHONY_DB_PATH` when
+  that holds the URL). Pass it in the environment, not as `--db-path`: command-line arguments are
+  visible to every process on the host.
 - **Several replicas** may share one database. Each dispatch takes a lease on the issue (or
   `task:<id>`) in the `leases` table: a replica skips issues and tasks another live replica
   holds, renews its leases every 15 s (a renewal waits at most 7 s) and releases them with the

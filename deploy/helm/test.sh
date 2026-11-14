@@ -73,6 +73,12 @@ has "$out" "defaultMode: 256" "the App key is readable by its owner only (0400)"
 has "$out" "mountPath: /var/run/secrets/github-app" "extra volume mount"
 helm lint "$chart" -f "$values" >/dev/null
 
+# Both probes carry a Host the server answers; the pod IP the kubelet sends otherwise is refused.
+out=$(helm template t "$chart")
+[ "$(grep -cF -- "path: /api/v1/health" <<<"$out")" = 2 ] || fail "two health probes expected"
+[ "$(grep -cF -- "- name: Host" <<<"$out")" = 2 ] || fail "both probes must set the Host header"
+[ "$(grep -cF -- "value: localhost" <<<"$out")" = 2 ] || fail "both probes must probe as localhost"
+
 out=$(helm template t "$chart")
 has "$out" "fieldPath: metadata.name" "replica id"
 has "$out" "kind: PersistentVolumeClaim" "one replica keeps volumes"
