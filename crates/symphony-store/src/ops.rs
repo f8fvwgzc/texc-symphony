@@ -508,7 +508,8 @@ fn encode_payload(payload: &serde_json::Value) -> Result<String> {
 }
 
 /// Queues (or replaces) the retry of `retry.issue_id`, with its failed reads (kept in
-/// `retry_read_failures`, migration 0009).
+/// `retry_read_failures`, migration 0009) and its continuation count (`retry_continuations`,
+/// migration 0010).
 pub(crate) fn save_retry(db: &mut dyn Db, retry: &RetryRecord) -> Result<()> {
     in_transaction(db, |db| {
         db.execute(
@@ -535,6 +536,18 @@ pub(crate) fn save_retry(db: &mut dyn Db, retry: &RetryRecord) -> Result<()> {
              ON CONFLICT (issue_id) DO UPDATE SET read_failures = excluded.read_failures",
             &vals![retry.issue_id.as_str(), retry.read_failures],
         )?;
+        if retry.continuations == 0 {
+            db.execute(
+                "DELETE FROM retry_continuations WHERE issue_id = ?1",
+                &vals![retry.issue_id.as_str()],
+            )?;
+        } else {
+            db.execute(
+                "INSERT INTO retry_continuations (issue_id, continuations) VALUES (?1, ?2) \
+                 ON CONFLICT (issue_id) DO UPDATE SET continuations = excluded.continuations",
+                &vals![retry.issue_id.as_str(), retry.continuations],
+            )?;
+        }
         Ok(())
     })
 }
@@ -551,10 +564,12 @@ pub(crate) fn delete_retry(db: &mut dyn Db, issue_id: &str) -> Result<()> {
 /// Every queued retry, soonest first.
 pub(crate) fn list_retries(db: &mut dyn Db) -> Result<Vec<RetryRecord>> {
     db.query(
-        "SELECT retry_queue.issue_id, attempt, due_at, identifier, issue_url, error, worker_host, \
-         workspace_path, COALESCE(read_failures, 0) FROM retry_queue \
-         LEFT JOIN retry_read_failures ON retry_read_failures.issue_id = retry_queue.issue_id \
-         ORDER BY due_at, retry_queue.issue_id",
+        "SELECT q.issue_id, q.attempt, q.due_at, q.identifier, q.issue_url, q.error, \
+         q.worker_host, q.workspace_path, COALESCE(f.read_failures, 0), \
+         COALESCE(c.continuations, 0) FROM retry_queue q \
+         LEFT JOIN retry_read_failures f ON f.issue_id = q.issue_id \
+         LEFT JOIN retry_continuations c ON c.issue_id = q.issue_id \
+         ORDER BY q.due_at, q.issue_id",
         &[],
     )?
     .iter()
@@ -571,6 +586,7 @@ pub(crate) fn list_retries(db: &mut dyn Db) -> Result<Vec<RetryRecord>> {
             error: row.opt_text(5)?,
             worker_host: row.opt_text(6)?,
             workspace_path: row.opt_text(7)?,
+            continuations: clamp_u32(row.int(9)?),
         })
     })
     .collect()

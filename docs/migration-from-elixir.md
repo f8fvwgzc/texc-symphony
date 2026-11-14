@@ -83,7 +83,8 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   - `template_parse_error: <msg> template="<template>"` (same prefix and shape as Elixir);
   - `template_render_error: …` (Elixir raised `Solid.RenderError` unwrapped).
 - **Continuation prompt.** `prompt::continuation_prompt` reproduces the agent runner's fixed turn
-  2+ guidance byte for byte.
+  2+ guidance byte for byte, plus one new last line telling the agent to move the issue out of the
+  active states once its work is done.
 - **Reference sections (new).** A prompt can mark situational sections with
   `<!-- reference NAME: WHEN -->` ... `<!-- /reference -->`. They are cut from the turn-1 prompt and
   served by a `workflow_reference` dynamic tool, so the turn-1 prompt is rendered before the

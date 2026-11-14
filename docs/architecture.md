@@ -129,9 +129,11 @@ read that fails before a retry doubles the delay too, but keeps the attempt, whi
 processed any tokens (`agent_rate_limited`) is not counted as a failure either: it waits
 `agent.max_retry_backoff_ms` at the same attempt, so a long limit never blocks the issue. A normal
 exit schedules a 1 s continuation that either dispatches the issue again, releases the claim (the
-issue is inactive or gone), or cleans the workspace (the issue is terminal). A release with a slot
-free runs the next poll at once. A retry with no free slot keeps its attempt and waits for a poll,
-which offers free slots to waiting retries and new issues in dispatch order, after queued tasks.
+issue is inactive or gone), or cleans the workspace (the issue is terminal). With
+`agent.max_continuations` set, an issue still active after that many continuations is blocked
+instead of dispatched again. A release with a slot free runs the next poll at once. A retry with
+no free slot keeps its attempt and waits for a poll, which offers free slots to waiting retries
+and new issues in dispatch order, after queued tasks.
 
 ## Live monitoring
 

@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0007_task_dependencies.sql"),
     include_str!("migrations/0008_task_retry.sql"),
     include_str!("migrations/0009_retry_read_failures.sql"),
+    include_str!("migrations/0010_retry_continuations.sql"),
 ];
 
 /// PostgreSQL migrations (their own numbering; v1 is the SQLite schema up to 0005, later ones
@@ -31,6 +32,7 @@ const POSTGRES_MIGRATIONS: &[&str] = &[
     include_str!("migrations/postgres/0003_task_dependencies.sql"),
     include_str!("migrations/postgres/0004_task_retry.sql"),
     include_str!("migrations/postgres/0005_retry_read_failures.sql"),
+    include_str!("migrations/postgres/0006_retry_continuations.sql"),
 ];
 
 /// Schema version a fresh PostgreSQL database is migrated to.
@@ -173,6 +175,40 @@ mod tests {
         // Every migration is also safe to re-run by itself.
         for sql in MIGRATIONS {
             conn.execute_batch(sql).unwrap();
+        }
+    }
+
+    /// Migrations 0009 and 0010 were both numbered 0009 on their branches before they were
+    /// merged. A database that a build of either branch brought to version 9 has only that
+    /// branch's table; after migrating with this build it must have both.
+    #[test]
+    fn a_database_at_version_9_from_either_branch_ends_up_with_both_retry_tables() {
+        let has = |conn: &Connection, table: &str| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        for missing in ["retry_read_failures", "retry_continuations"] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure(&conn, false).unwrap();
+            migrate(&mut conn).unwrap();
+            // As that branch's build left it: its own table, version 9, the other table unknown.
+            conn.execute_batch(&format!("DROP TABLE {missing}; PRAGMA user_version = 9"))
+                .unwrap();
+            assert!(!has(&conn, missing));
+            assert_eq!(migrate(&mut conn).unwrap(), SCHEMA_VERSION - 9);
+            assert!(
+                has(&conn, "retry_read_failures"),
+                "after {missing} was missing"
+            );
+            assert!(
+                has(&conn, "retry_continuations"),
+                "after {missing} was missing"
+            );
         }
     }
 

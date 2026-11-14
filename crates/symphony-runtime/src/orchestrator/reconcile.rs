@@ -166,6 +166,7 @@ impl Orchestrator<'_> {
                     worker_host: entry.worker_host.clone(),
                     workspace_path: entry.workspace_path.clone(),
                     read_failures: 0,
+                    continuations: entry.continuations,
                 };
                 self.terminate_running_issue(&id, false, &error).await;
                 self.retry_failed_run(&id, next, meta, &issue, DelayType::Failure);
