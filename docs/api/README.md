@@ -298,7 +298,7 @@ curl -s $SYMPHONY/api/v1/totals | jq
 
 ```sh
 curl -s $SYMPHONY/api/v1/health
-# {"status":"ok","version":"0.1.0","uptime_seconds":3725,"store":"sqlite","auth_required":true}
+# {"status":"ok","version":"0.0.1","uptime_seconds":3725,"store":"sqlite","auth_required":true}
 
 curl -s $SYMPHONY/api/openapi.json | jq '.paths | keys'
 ```

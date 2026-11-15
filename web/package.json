@@ -1,6 +1,6 @@
 {
   "name": "symphony-web",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Symphony observability dashboard (Preact + Vite + Tailwind CSS), embedded by the symphony-server crate.",
   "license": "Apache-2.0",

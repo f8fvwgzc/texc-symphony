@@ -75,7 +75,7 @@ Release assets are raw executables plus checksums, named
 are static (musl) and run on any distribution.
 
 ```sh
-version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/f8fvwgzc/texc-symphony/releases/latest | sed 's|.*/||')   # or a tag, e.g. v0.1.0
+version=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/f8fvwgzc/texc-symphony/releases/latest | sed 's|.*/||')   # or a tag, e.g. v0.0.1
 target=linux_x86_64                          # or linux_arm64, macos_arm64, macos_x86_64
 base=https://github.com/f8fvwgzc/texc-symphony/releases/download/$version
 curl -fL -O "$base/symphony-$version-$target" -O "$base/symphony-$version-$target.sha256"

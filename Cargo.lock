@@ -2654,7 +2654,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symphony"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -2683,7 +2683,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-agents"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-codex"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2722,7 +2722,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "postgres",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-tasks-client"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "futures",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "symphony-trackers"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "regex",
  "tempfile",
