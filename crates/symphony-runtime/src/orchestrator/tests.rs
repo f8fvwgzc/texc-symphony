@@ -3257,6 +3257,128 @@ async fn a_failed_task_is_retried_by_its_policy() {
     assert_eq!((task.attempts, task.failed_attempts), (2, 1));
 }
 
+const SESSION_LIMIT: &str = "claude reported success: You've hit your session limit";
+
+/// A task with one dependant, the dependant's id.
+async fn dependant_of(store: &Store, id: i64) -> i64 {
+    store
+        .create_task(symphony_store::NewTask {
+            prompt: "after".into(),
+            depends_on: vec![id],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// A provider limit that refused a task's run before any work is not a failed attempt, even under
+/// the default policy (which retries no agent failure): the task is queued again after the
+/// provider-limit delay (`agent.max_retry_backoff_ms`, not the task's own `max_backoff_ms`), and
+/// its dependant keeps waiting.
+#[tokio::test(start_paused = true)]
+async fn a_task_refused_by_a_provider_limit_waits_without_counting_an_attempt() {
+    use symphony_store::TaskStatus;
+    fn limited() -> WorkerResult {
+        Err(RunError::Codex(CodexError::RateLimited(
+            SESSION_LIMIT.into(),
+        )))
+    }
+    let (store, id) = task_store().await;
+    let dependant = dependant_of(&store, id).await;
+    let seen: SeenTasks = Arc::default();
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}, "agent": {"max_retry_backoff_ms": 600_000}}),
+        task_factory(Arc::clone(&seen), limited),
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let before = Utc::now();
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let task = task_status(&store, id, TaskStatus::Queued).await;
+    assert_eq!((task.attempts, task.failed_attempts), (1, 0));
+    assert_eq!(
+        task.error,
+        Some(format!("agent exited: agent_rate_limited: {SESSION_LIMIT}"))
+    );
+    let wait = (task.next_attempt_at.unwrap() - before).num_milliseconds();
+    assert!((600_000..610_000).contains(&wait), "{wait}");
+    assert_eq!(
+        store.get_task(dependant).await.unwrap().unwrap().status,
+        TaskStatus::Waiting
+    );
+    assert!(!orch.state.claimed.contains(&format!("task:{id}")));
+    assert!(orch.state.retry_attempts.is_empty());
+    // Not dispatched again before the wait is over.
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.is_empty());
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// The limited run keeps its clone and, once the wait is over, the task runs again; a limited run
+/// that had processed tokens is an `error` failure as before (under the default policy it ends the
+/// task, and so its dependant).
+#[tokio::test(start_paused = true)]
+async fn a_limited_task_runs_again_and_a_limited_run_that_spent_tokens_counts() {
+    use symphony_store::TaskStatus;
+    let (store, id) = task_store().await;
+    let dependant = dependant_of(&store, id).await;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let factory: Arc<dyn WorkerFactory> = Arc::new(FnWorkerFactory({
+        let runs = Arc::clone(&runs);
+        move |ctx: WorkerContext| {
+            let spends = runs.fetch_add(1, Ordering::SeqCst) > 0;
+            async move {
+                if spends {
+                    ctx.events.emit(usage_event(900, 100));
+                }
+                Err(RunError::Codex(CodexError::RateLimited(
+                    SESSION_LIMIT.into(),
+                )))
+            }
+        }
+    }));
+    let mut h = Harness::with_store(
+        json!({"tracker": {"kind": "none"}, "agent": {"max_retry_backoff_ms": 1}}),
+        factory,
+        store.clone(),
+    );
+    let mut workers = WorkerSet::default();
+    let mut orch = h.orchestrator(&mut workers);
+    let workspace = orch.task_workspace(id);
+    std::fs::create_dir_all(workspace.join("clone")).unwrap();
+    orch.maybe_dispatch().await;
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    let queued = task_status(&store, id, TaskStatus::Queued).await;
+    assert_eq!(queued.failed_attempts, 0);
+    for _ in 0..50 {
+        tokio::time::sleep(ms(5)).await;
+    }
+    assert!(
+        workspace.exists(),
+        "the limited run did no work: its clone is kept"
+    );
+    // The store's clock is the wall clock: once the 1 ms wait is over, the next dispatch pass (a
+    // poll) runs the task again.
+    while Utc::now() < queued.next_attempt_at.unwrap() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    orch.maybe_dispatch().await;
+    assert!(orch.state.running.contains_key(&format!("task:{id}")));
+    run_until(&mut orch, |o| o.state.running.is_empty()).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    let failed = task_status(&store, id, TaskStatus::Failed).await;
+    assert_eq!((failed.attempts, failed.failed_attempts), (2, 1));
+    assert_eq!(
+        failed.error,
+        Some(format!("agent exited: agent_rate_limited: {SESSION_LIMIT}"))
+    );
+    let dependant = task_status(&store, dependant, TaskStatus::Failed).await;
+    assert_eq!(dependant.attempts, 0, "it never ran");
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_tasks_and_unknown_backends_end_failed() {
     use symphony_store::TaskStatus;

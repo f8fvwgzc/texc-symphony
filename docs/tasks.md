@@ -61,9 +61,13 @@ waiting / queued / blocked / running ──▶ cancelled   (POST /cancel)
   `next_attempt_at`). Otherwise it ends `failed`, with `error`. The default policy is
   `{"max_attempts": 3, "backoff_ms": 10000, "max_backoff_ms": 300000, "on": ["interrupted"]}`:
   agent failures are not retried, and a task that keeps taking its replica down stops after
-  three tries. Token limits, budgets and refusals (an unknown backend) are never retried. A
-  provider's usage or rate limit (`agent_rate_limited`) is an `error` failure for a task, unlike
-  for an issue, which waits it out.
+  three tries. Token limits, budgets and refusals (an unknown backend) are never retried. A run
+  that a provider's usage or rate limit (`agent_rate_limited`) refused before it processed any
+  tokens is not a failure, whatever the policy: the task goes back to `queued` without using up
+  an attempt and waits `agent.max_retry_backoff_ms` (at most 10 s · 2^10, as an issue does;
+  `next_attempt_at`; its workspace is kept), so its dependants keep waiting and it runs again
+  once the limit lifts (cancel it to stop waiting). A limited run that had processed tokens is
+  an `error` failure.
 - `blocked`: the agent needs operator input or approval, or the per-issue budget is used up.
   `unblock` re-queues it; a `message` is appended to the prompt as `Operator reply:`.
   `unblock` also re-queues a `failed` task.

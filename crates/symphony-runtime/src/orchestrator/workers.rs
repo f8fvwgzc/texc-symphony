@@ -193,21 +193,44 @@ impl Orchestrator<'_> {
                     }),
                 ),
             };
-            tracing::info!(
-                "Task run finished for issue_id={issue_id} session_id={session_id} status={task_status}"
-            );
             entry.recorder.finish(run_status, error.clone());
-            self.task_finish(
-                task.id,
-                task.attempt,
-                task_status,
-                task.result,
-                error,
-                failure,
-            );
+            match (&result, error) {
+                // A provider limit that refused the run before any work is not the task's failure
+                // (the issue rule below): queued again without counting an attempt, after the
+                // delay an issue waits, so a limit that lasts hours costs one start per
+                // `agent.max_retry_backoff_ms` and its dependants keep waiting. A limited run that
+                // spent tokens is an `error` failure like any other.
+                (Err(err), Some(error))
+                    if err.is_rate_limited() && entry.tokens.totals.processed() == 0 =>
+                {
+                    let delay = retry_delay(1, DelayType::ProviderLimit, &self.settings().agent);
+                    tracing::warn!(
+                        "Task run hit a provider limit for issue_id={issue_id} issue_identifier={} session_id={session_id} reason={error}; queued again in {}ms without counting an attempt",
+                        entry.identifier,
+                        delay.as_millis()
+                    );
+                    // The run did no work: its clone stays for the next one, as a released or
+                    // blocked task's does.
+                    self.task_release(task.id, task.attempt, &error, delay);
+                }
+                (_, error) => {
+                    tracing::info!(
+                        "Task run finished for issue_id={issue_id} session_id={session_id} status={task_status}"
+                    );
+                    self.task_finish(
+                        task.id,
+                        task.attempt,
+                        task_status,
+                        task.result,
+                        error,
+                        failure,
+                    );
+                    // Final: the clone is not needed any more (unblocking a failed task clones
+                    // again).
+                    self.remove_task_workspace(task.id);
+                }
+            }
             self.release_issue_claim(issue_id);
-            // Final: the clone is not needed any more (unblocking a failed task clones again).
-            self.remove_task_workspace(task.id);
             return;
         }
         if blocked {
@@ -408,7 +431,7 @@ impl Orchestrator<'_> {
         if let Some(task) = entry.task.as_ref().filter(|_| release_task) {
             // Stopped from outside (kill switch, daily budget): queued again. A task that was
             // finished first (cancel, failure) is not running any more and stays as it is.
-            self.task_release(task.id, task.attempt, reason);
+            self.task_release(task.id, task.attempt, reason, Duration::ZERO);
         }
         if cleanup {
             self.cleanup_issue_workspace(
@@ -454,7 +477,7 @@ impl Orchestrator<'_> {
         // A hand-off, not a failure: queued again without using up an attempt (before the
         // lease drops below, through the same ordered writer).
         for (task, attempt) in tasks {
-            self.task_release(task, attempt, "shutdown; queued again");
+            self.task_release(task, attempt, "shutdown; queued again", Duration::ZERO);
         }
         // Another replica may take the work over now instead of after the lease TTL.
         let held: Vec<String> = self.state.leases.keys().cloned().collect();

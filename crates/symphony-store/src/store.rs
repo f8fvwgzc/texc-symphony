@@ -601,11 +601,13 @@ impl Store {
     }
 
     /// A running task whose run was stopped for an outside reason goes back to `queued` (the
-    /// attempt does not count). With `fence`, only while the task is still on that run.
+    /// attempt does not count), dispatched again no sooner than `delay` from now. With `fence`,
+    /// only while the task is still on that run.
     pub fn release_task(
         &self,
         id: i64,
         reason: impl Into<String>,
+        delay: Duration,
         fence: Option<TaskFence>,
     ) -> Pending<Option<TaskRecord>> {
         let now = Utc::now();
@@ -613,7 +615,7 @@ impl Store {
         self.submit(
             "release_task",
             || None,
-            move |conn| tasks::release_task(conn, id, &reason, fence.as_ref(), now),
+            move |conn| tasks::release_task(conn, id, &reason, delay, fence.as_ref(), now),
         )
     }
 

@@ -198,7 +198,8 @@ pub struct Task {
     /// Failed attempts counted against `retry.max_attempts` (since creation or the last unblock).
     #[serde(default)]
     pub failed_attempts: u32,
-    /// When a retried task may run again (`None`: as soon as a slot is free).
+    /// When a retried task, or one waiting out a provider limit, may run again (`None`: as soon
+    /// as a slot is free).
     #[serde(default)]
     pub next_attempt_at: Option<DateTime<Utc>>,
     /// Creation time.
