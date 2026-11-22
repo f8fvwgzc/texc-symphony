@@ -38,7 +38,7 @@ pub enum ServerError {
     Task(String),
     /// A non-loopback address was requested without API authentication.
     #[error(
-        "auth_required: refusing to serve the API on {addr} without authentication; configure server.tutela (Tutela tokens for aud=symphony; during the transition server.api_token with server.legacy_api_token also works), or bind 127.0.0.1 for the local single-user mode"
+        "auth_required: refusing to serve the API on {addr} without authentication; set server.api_token (or SYMPHONY_API_TOKEN), or bind 127.0.0.1 for the local single-user mode"
     )]
     AuthRequired {
         /// The requested address.

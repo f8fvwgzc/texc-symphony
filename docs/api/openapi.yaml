@@ -34,13 +34,9 @@ info:
 
     * **Authentication.** Every `/api/*` request except `GET /api/v1/health` and
       `GET /api/openapi.json` needs `Authorization: Bearer <token>`, or answers `401`
-      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. The token is a Tutela
-      access token issued for exactly one audience, `symphony`, by an issuer of `server.tutela`
-      for a tenant it may speak for (a service-account key or `client_credentials` token).
-      Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B. During the
-      transition the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) is accepted too
-      while `server.legacy_api_token` is on (deprecated; off by default from the next release).
-      Without either the API is open, the local single-user mode, and Symphony refuses to bind
+      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. The token is the configured
+      `server.api_token` (`SYMPHONY_API_TOKEN`). Without one the API is open, the local
+      single-user mode, and Symphony refuses to bind
       anything but a loopback address (`auth_required` at startup). The dashboard shell and its
       assets are public; the dashboard asks for a token.
     * **Stream tickets.** A browser `EventSource` cannot send headers, and no credential is ever
@@ -783,8 +779,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: JWT
-      description: A Tutela access token for exactly `aud=symphony` from an issuer and tenant of `server.tutela`; during the transition also the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) while `server.legacy_api_token` is on. Not required in the local single-user mode (no credentials configured, loopback only).
+      description: The configured `server.api_token` (`SYMPHONY_API_TOKEN`). Not required in the local single-user mode (no token configured, loopback only).
 
   parameters:
     TaskId:

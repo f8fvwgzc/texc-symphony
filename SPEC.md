@@ -1603,18 +1603,11 @@ Enablement (extension):
 
 Authentication (Symphony):
 
-- API callers are Tutela-verified (Tutela `docs/INTEGRATION.md` §2): a bearer access token for
-  exactly one audience, `symphony`, from a configured issuer (Keycloak in Tutela's Phases A and
-  B), for a tenant that issuer may speak for, checked offline by `tutela-sdk`'s axum layer. A
-  refused token is `401` and says nothing about why.
-- Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B turns on delegation;
-  Symphony must then never forward such a token, and obtains a new token per downstream
-  audience.
+- API callers present a bearer token (`Authorization: Bearer <token>`): the configured
+  `server.api_token`, compared in constant time. A refused token is `401` and says nothing about
+  why. An implementation MAY support other credential schemes behind the same header.
 - With no credentials configured the API is open, the local single-user mode, allowed only on a
-  loopback address; any other listen address requires tokens.
-- The legacy static API token stays accepted next to Tutela tokens for one release window behind
-  a flag (on in the release that adds Tutela, off by default in the next, removed in the one
-  after), with a deprecation warning.
+  loopback address; any other listen address requires a token.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 

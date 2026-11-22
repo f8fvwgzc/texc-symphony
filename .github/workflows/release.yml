@@ -46,11 +46,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
 
-      - name: Tutela read access
-        uses: ./.github/actions/tutela-ssh
-        with:
-          key: ${{ secrets.TUTELA_READ_KEY }}
-
       - name: Install Rust 1.99.0
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
 
@@ -140,11 +135,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
-
-      - name: Tutela read access
-        uses: ./.github/actions/tutela-ssh
-        with:
-          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Install Rust 1.99.0 (${{ matrix.triple }})
         uses: dtolnay/rust-toolchain@1.99.0 # branch pinned to the toolchain in rust-toolchain.toml
@@ -330,11 +320,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7 # v7.0.1
-
-      - name: Tutela read access
-        uses: ./.github/actions/tutela-ssh
-        with:
-          key: ${{ secrets.TUTELA_READ_KEY }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4 # v4.4.0

@@ -7,9 +7,8 @@ the agent's final message as the result. Coding is optional: without a repositor
 starts empty.
 
 The task API needs the run-history store (it is on by default; `503 store_disabled` with
-`--no-db`). It is part of the HTTP API, so it needs `server.port` and, off loopback, a Tutela
-access token for `aud=symphony` ([configuration](configuration.md#tutela-authentication); during
-the transition the legacy API token works too). The contract is in [`api/openapi.yaml`](api/openapi.yaml) (tag `tasks`).
+`--no-db`). It is part of the HTTP API, so it needs `server.port` and, off loopback, the bearer
+token `server.api_token` ([configuration](configuration.md#server)). The contract is in [`api/openapi.yaml`](api/openapi.yaml) (tag `tasks`).
 
 A workflow that only serves tasks sets `tracker.kind: none`:
 
