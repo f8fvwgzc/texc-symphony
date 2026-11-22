@@ -236,7 +236,6 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64
-          ssh: default
           load: true
           tags: symphony:test
           cache-from: type=gha,scope=symphony-image
@@ -250,7 +249,6 @@ jobs:
           context: .
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
-          ssh: default
           push: ${{ env.PUSH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
