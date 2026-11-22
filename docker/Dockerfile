@@ -138,7 +138,7 @@ FROM codex-${INSTALL_CODEX} AS codex
 # ---------------------------------------------------------------------------------------------
 # (c) Runtime.
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
-ARG VERSION=0.1.0
+ARG VERSION=0.0.1
 ARG REVISION=unknown
 ARG CREATED=""
 ARG CODEX_VERSION

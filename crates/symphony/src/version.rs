@@ -15,7 +15,7 @@ pub const VERSION_SUFFIX: &str = match option_env!("SYMPHONY_VERSION_SUFFIX") {
 static VERSION: LazyLock<String> =
     LazyLock::new(|| format!("{}{}", env!("CARGO_PKG_VERSION"), VERSION_SUFFIX));
 
-/// `CARGO_PKG_VERSION` + [`VERSION_SUFFIX`], e.g. `0.1.0` or `0.1.0-nightly`.
+/// `CARGO_PKG_VERSION` + [`VERSION_SUFFIX`], e.g. `0.0.1` or `0.0.1-nightly`.
 pub fn version() -> &'static str {
     VERSION.as_str()
 }

@@ -28,7 +28,7 @@ service or in Docker see [`deployment.md`](deployment.md); for the HTTP API see
 | `--host <addr>` | `SYMPHONY_HOST` | `server.host`, else `127.0.0.1` | Bind address for the HTTP server: an IP literal or a DNS name. |
 | `--db-path <path>` | `SYMPHONY_DB_PATH` | `./data/symphony.db` | SQLite run-history database. `:memory:` keeps history in memory only. |
 | `--no-db` | `SYMPHONY_DB_PATH=off` | | Disables run history; the history endpoints then answer `503 store_disabled`. Conflicts with `--db-path`. |
-| `--version`, `-V` | | | Prints `symphony <version>` (for example `symphony 0.1.0`, or `symphony 0.1.0-nightly` for nightly builds) and exits 0. |
+| `--version`, `-V` | | | Prints `symphony <version>` (for example `symphony 0.0.1`, or `symphony 0.0.1-nightly` for nightly builds) and exits 0. |
 | `--help`, `-h` | | | Prints help and exits 0. |
 
 Precedence: **a flag always wins over its environment variable, and the environment variable wins

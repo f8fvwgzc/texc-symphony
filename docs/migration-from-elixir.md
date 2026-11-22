@@ -583,7 +583,7 @@ Per-crate notes on parity decisions and new capabilities in the Rust port.
   [path-to-WORKFLOW.md]` followed by a second line `Run \`symphony --help\` for all options.`
   (the Rust CLI has more options than that line lists) and exit 1 instead of clap's 2.
 - **Superset of the CLI.** `--host`, `--db-path`/`--no-db`, `--help`, `--version` (crate version
-  plus the build-time `SYMPHONY_VERSION_SUFFIX`, e.g. `0.1.0-nightly`), environment fallbacks
+  plus the build-time `SYMPHONY_VERSION_SUFFIX`, e.g. `0.0.1-nightly`), environment fallbacks
   (`SYMPHONY_WORKFLOW`, `SYMPHONY_HOST`, `SYMPHONY_PORT`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_DB_PATH`,
   `SYMPHONY_DB_RETENTION_DAYS`, `SYMPHONY_LOG_FORMAT`; a flag always wins, the variable wins over
   `WORKFLOW.md`), and the `workspace before-remove` and `workflow audit` subcommands. A workflow

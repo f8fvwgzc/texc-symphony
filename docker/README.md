@@ -241,7 +241,7 @@ docker buildx build -f docker/Dockerfile --platform linux/amd64 -t symphony:dev-
 docker buildx create --name symphony-builder --driver docker-container --use   # once
 docker buildx build -f docker/Dockerfile \
   --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=0.1.0 --build-arg REVISION="$(git rev-parse HEAD)" \
+  --build-arg VERSION=0.0.1 --build-arg REVISION="$(git rev-parse HEAD)" \
   -t ghcr.io/<owner>/<repo>:dev --push .
 ```
 
