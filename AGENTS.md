@@ -8,8 +8,8 @@ dashboard and JSON API.
 
 - Rust `1.99.0` (pinned in `rust-toolchain.toml`; `rustup` installs it automatically).
 - Node.js 22 + pnpm (version pinned in `web/package.json` `packageManager`) for the web dashboard.
-- SSH read access to the private `f8fvwgzc/tutela` repository: cargo fetches the `tutela-sdk` git
-  dependency over SSH with the git CLI (`.cargo/config.toml`).
+- Every dependency comes from crates.io: a clone builds with no credentials (no private
+  repositories, no SSH keys).
 - Main quality gate: `make all` (Rust fmt check, clippy `-D warnings`, tests, web typecheck/lint/test/build).
 - Rust guidance for coding agents comes from Symposium: `cargo install symposium --locked`, then
   `cargo agents init --add-agent claude`.

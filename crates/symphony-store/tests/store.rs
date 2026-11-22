@@ -1542,11 +1542,14 @@ async fn a_replica_that_lost_the_lease_cannot_write_the_task() {
         None
     );
     let unchanged = store
-        .release_task(task_a.id, "stale", Some(stale))
+        .release_task(task_a.id, "stale", Duration::from_secs(600), Some(stale))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(unchanged.status, TaskStatus::Running);
+    assert_eq!(
+        (unchanged.status, unchanged.next_attempt_at),
+        (TaskStatus::Running, None)
+    );
     // The holder's write lands.
     let done = store
         .finish_task_run(
@@ -1601,7 +1604,7 @@ async fn a_write_repeated_after_the_task_started_again_is_refused() {
     // The first run's writes arrive again while "a" holds the lease for the second run.
     assert_eq!(fail(first.clone()).await.unwrap(), None);
     let unchanged = store
-        .release_task(created.id, "stale", Some(first))
+        .release_task(created.id, "stale", Duration::ZERO, Some(first))
         .await
         .unwrap()
         .unwrap();
@@ -1634,13 +1637,46 @@ async fn interrupted_runs_use_up_attempts_and_hand_offs_do_not() {
     // A hand-off (kill switch, shutdown) is not an attempt that failed.
     store.start_task(interrupted.id).await.unwrap();
     let handed = store
-        .release_task(interrupted.id, "shutdown; queued again", None)
+        .release_task(
+            interrupted.id,
+            "shutdown; queued again",
+            Duration::ZERO,
+            None,
+        )
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        (handed.status, handed.failed_attempts),
+        (
+            handed.status,
+            handed.failed_attempts,
+            handed.next_attempt_at
+        ),
+        (TaskStatus::Queued, 0, None)
+    );
+    // A hand-off with a delay (a provider limit) is not dispatched before it is over.
+    let limited = store.create_task(task("limited")).await.unwrap();
+    store.start_task(limited.id).await.unwrap().unwrap();
+    let waiting = store
+        .release_task(
+            limited.id,
+            "agent_rate_limited",
+            Duration::from_secs(600),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (waiting.status, waiting.failed_attempts),
         (TaskStatus::Queued, 0)
+    );
+    let due = waiting.next_attempt_at.unwrap() - Utc::now();
+    assert!(due > ChronoDuration::seconds(590), "{due}");
+    let queued = store.queued_tasks(10).await.unwrap();
+    assert_eq!(
+        queued.iter().map(|t| t.id).collect::<Vec<_>>(),
+        [interrupted.id]
     );
     // The default policy allows three attempts; the third interruption fails the task.
     for round in 1..=3u32 {

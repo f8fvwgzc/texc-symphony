@@ -59,7 +59,6 @@ mod server;
 mod sse;
 mod tasks;
 pub mod testing;
-pub mod tutela;
 pub mod view;
 
 pub use api::OPENAPI_JSON;

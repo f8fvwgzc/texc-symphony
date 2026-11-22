@@ -86,9 +86,10 @@ Each turn sends the prompt and loops: model call (streamed unless `stream: false
 results, until the model answers without tools (the turn's result) or `max_steps` model calls
 were made (`agent_limit_exceeded`). The conversation persists across the turns of one run. 429,
 5xx and connection errors are retried three times (1, 2, 4 s; `retry-after` wins, at most 30 s).
-A 429 left after that fails the run as `agent_rate_limited`. An issue run refused before it
-processed any tokens does not count toward `agent.max_retry_attempts`: it waits
-`agent.max_retry_backoff_ms` and runs again ([configuration](configuration.md#agent)).
+A 429 left after that fails the run as `agent_rate_limited`. An issue or task run refused before
+it processed any tokens does not count as a failure (toward `agent.max_retry_attempts`, or a
+task's `retry.max_attempts`): it waits `agent.max_retry_backoff_ms` and runs again
+([configuration](configuration.md#agent), [tasks](tasks.md)).
 
 | Key | Default | Notes |
 |---|---|---|

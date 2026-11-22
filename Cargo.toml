@@ -56,13 +56,9 @@ wiremock = "0.6.5"
 # GitHub App JWTs (RS256) for task credentials (symphony-runtime); the same aws-lc-rs build
 # rustls already uses, so no second crypto stack.
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
-# rustls with the one crypto provider the binary installs at startup (Tutela's JWKS client and
-# reqwest share it).
+# rustls with the one crypto provider the binary installs at startup (reqwest and the PostgreSQL
+# client share it).
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-# Tutela (identity and permissions): bearer-token verification for the HTTP API, pinned to a
-# release tag of the private repository (fetched over SSH, see .cargo/config.toml).
-tutela-sdk = { git = "ssh://git@github.com/f8fvwgzc/tutela.git", tag = "v0.1.0" }
-tutela-contracts = { git = "ssh://git@github.com/f8fvwgzc/tutela.git", tag = "v0.1.0" }
 # HTTP server stack (symphony-server)
 axum = "0.8.9"
 tower = "0.5.3"

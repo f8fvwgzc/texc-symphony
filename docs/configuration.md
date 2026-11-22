@@ -298,8 +298,8 @@ there through `bash -lc`.
 | `agent.max_concurrent_agents` | integer | `10` | `> 0`. Global cap on running agents. | live |
 | `agent.max_concurrent_agents_by_state` | map of state to integer | `{}` | Per-state caps; keys are compared after trim + lowercase. Every key must be non-blank (`state names must not be blank`) and every value a positive YAML integer (`limits must be positive integers`; `"2"` is rejected here). One bad entry rejects the whole file. A state without an entry uses `max_concurrent_agents`. | live |
 | `agent.max_turns` | integer | `20` | `> 0`. Maximum back-to-back Codex turns in one agent run while the issue stays active. | live |
-| `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. Each tracker read that fails before a retry doubles the next delay as one more attempt would, without counting as one. A run that ends normally is re-checked after 1 s instead. A run that a provider limit ended always waits the cap (at most 10 s * 2^10). A retry that finds no free slot, or fires while dispatch is stopped, is offered a slot at each poll, in dispatch order with new issues and after queued tasks. Until a poll starts it, it re-checks its issue at the longest failure backoff (this cap, or about 2 h 50 min if lower), so if its issue drops out of the candidate list, that is how long it takes to notice. | live |
-| `agent.max_retry_attempts` | integer | `10` | `> 0`. Failed runs in a row that are retried (about half an hour with the default backoff). The next failure **blocks** the issue (`retry limit reached: ...`) instead of retrying it forever; move it out of the active states (or off this worker) to release it. A run that ends normally restarts the count, so this limit never stops an issue whose runs keep ending normally (see `max_continuations`). Waiting for a slot does not count. A tracker error while retrying never counts, so an outage of any length cannot bring the block closer (it still lengthens the backoff); neither does a run-history database that cannot be reached. Neither does a provider's usage or rate limit (`agent_rate_limited`: an `api` backend's HTTP 429 after its own retries, or Claude Code's report of a 429 or a plan limit) that refused a run before it processed any tokens: the run keeps its attempt (a first run's retry is attempt 1, as after a normal exit) and is retried every `max_retry_backoff_ms` until the limit lifts. A limited run that had processed tokens counts as a failure. Codex usage limits and tasks are not covered: they count as failures. | live |
+| `agent.max_retry_backoff_ms` | integer | `300000` | `> 0`. Cap for the retry delay after a failed run: `min(10 s * 2^(attempt-1), max_retry_backoff_ms)`. Each tracker read that fails before a retry doubles the next delay as one more attempt would, without counting as one. A run that ends normally is re-checked after 1 s instead. An issue run that a provider limit ended always waits the cap (at most 10 s * 2^10), and so does a task run that a provider limit refused before it processed any tokens. A retry that finds no free slot, or fires while dispatch is stopped, is offered a slot at each poll, in dispatch order with new issues and after queued tasks. Until a poll starts it, it re-checks its issue at the longest failure backoff (this cap, or about 2 h 50 min if lower), so if its issue drops out of the candidate list, that is how long it takes to notice. | live |
+| `agent.max_retry_attempts` | integer | `10` | `> 0`. Failed runs in a row that are retried (about half an hour with the default backoff). The next failure **blocks** the issue (`retry limit reached: ...`) instead of retrying it forever; move it out of the active states (or off this worker) to release it. A run that ends normally restarts the count, so this limit never stops an issue whose runs keep ending normally (see `max_continuations`). Waiting for a slot does not count. A tracker error while retrying never counts, so an outage of any length cannot bring the block closer (it still lengthens the backoff); neither does a run-history database that cannot be reached. Neither does a provider's usage or rate limit (`agent_rate_limited`: an `api` backend's HTTP 429 after its own retries, or Claude Code's report of a 429 or a plan limit) that refused a run before it processed any tokens: the run keeps its attempt (a first run's retry is attempt 1, as after a normal exit) and is retried every `max_retry_backoff_ms` until the limit lifts. A limited run that had processed tokens counts as a failure. A task's limited run waits the same way without using up its `retry.max_attempts` ([tasks](tasks.md)). Codex usage limits are not covered: they count as failures. | live |
 | `agent.max_continuations` | integer | unlimited | `> 0`. Opt-in cap on runs that end normally while the issue stays active. Each such run is followed by another one (a continuation), so an agent that ends its runs without moving the issue keeps spending without limit. With a cap, once the issue is still active after `max_continuations + 1` runs that ended normally, the next check **blocks** it (`continuation limit reached: ...`) instead of running it again; move it out of the active states (or off this worker) to release it. A failed run neither counts nor resets the count, and neither does a move between two active states; an issue that leaves the active states starts over when it comes back. The count is kept with a queued retry across a restart, but a restart during a run starts it over, like the retry count. | live |
 | `agent.continuation_delay_ms` | integer | `1000` | `> 0`. How long to wait after a run ends normally before checking whether the issue is still active (and running it again if so). Raise it when something outside the agent moves the issue to a terminal state after the run, for example an orchestrating service. | live |
 | `agent.backend` | string | `codex` | The `backends` entry that runs tracker issues and tasks without their own backend (`agent.backend must name an entry of backends`). | new runs |
@@ -462,14 +462,12 @@ The HTTP server serves the web dashboard, the JSON API and the event stream
 | Key | Type | Default | Validation and notes | Reload |
 |---|---|---|---|---|
 | `server.port` | integer | none: no HTTP server | `0..65535` (`must be greater than or equal to 0`, `must be less than or equal to 65535`). `0` binds a free port. `--port` and `SYMPHONY_PORT` override it. | restart |
-| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. A non-loopback address needs authentication (`server.tutela`, or during the transition `server.api_token`): without it Symphony refuses to start (`auth_required`). | restart |
-| `server.tutela` | map | none | Tutela-verified callers ([below](#tutela-authentication)): every `/api/*` request (except `GET /api/v1/health` and `GET /api/openapi.json`) needs a Tutela access token for exactly `aud=symphony`. | restart |
-| `server.api_token` | string | `$SYMPHONY_API_TOKEN` | **Deprecated** legacy bearer token, accepted while `server.legacy_api_token` is on. Write `$NAME`; the value is compared in constant time, never logged, and removed from agent environments together with `SYMPHONY_API_TOKEN`. | restart |
-| `server.legacy_api_token` | boolean | `true` (`false` from the next release) | Keeps `server.api_token` working next to Tutela tokens during the transition; each process logs a deprecation warning. `false` with a token set and no `server.tutela` is refused at startup (the API would be open). | restart |
+| `server.host` | string | `127.0.0.1` | IP literal or DNS name. `--host` and `SYMPHONY_HOST` override it. A non-loopback address needs authentication (`server.api_token`): without it Symphony refuses to start (`auth_required`). | restart |
+| `server.api_token` | string | `$SYMPHONY_API_TOKEN` | The bearer token every `/api/*` request (except `GET /api/v1/health` and `GET /api/openapi.json`) must send as `Authorization: Bearer <token>`. Write `$NAME`; the value is compared in constant time, never logged, and removed from agent environments together with `SYMPHONY_API_TOKEN`. Use a long random string (`openssl rand -hex 32`). | restart |
 | `server.allowed_hosts` | list of strings | `[]` | Extra `Host` names the server answers besides `localhost`, `*.localhost`, `127.0.0.1`, `[::1]` and `server.host`. Other hosts get `403 host_not_allowed`, which stops DNS-rebinding pages from reading the API. `*` turns the check off. Names are lowercased. | restart |
 | `server.allowed_origins` | list of strings | `[]` | Origins (`https://dash.example.com`, `*`) allowed for CORS and for browser writes from another origin. Browser `POST`s from any other origin get `403 origin_not_allowed`. `is invalid` unless every entry is `*` or an `http(s)://` URL. | restart |
 
-Without `server.tutela` and `server.api_token` the API is open: the **local single-user mode**,
+Without `server.api_token` the API is open: the **local single-user mode**,
 allowed only when the server listens on loopback (`127.0.0.1`, `::1`, `localhost`).
 
 Browsers cannot send headers on `EventSource`, and no credential is ever accepted in a URL: the
@@ -478,43 +476,6 @@ dashboard first asks `POST /api/v1/events/tickets`, which sets a single-use tick
 request sends. Behind a reverse proxy, forward the `Host` header, serve HTTPS, and list the public
 name in `server.allowed_hosts`; do not add HTTP basic auth in front (it uses the same
 `Authorization` header).
-
-#### Tutela authentication
-
-Tutela (identity and permissions) issues the API's bearer tokens; symphony checks them offline
-with `tutela-sdk` (Tutela `docs/INTEGRATION.md` §2): the signature against the issuer's cached
-JWKS, exactly one audience `symphony`, the time rules, and the `(issuer, tenant)` pair against
-the trust list below. Callers are services with a Tutela service-account key or a
-`client_credentials` token for `aud=symphony`. Delegated agent tokens (`typ: agent+jwt`) are
-refused until Tutela Phase B.
-
-```yaml
-server:
-  host: 0.0.0.0
-  port: 4000
-  legacy_api_token: false        # once every caller has a Tutela token
-  tutela:
-    issuers:
-      - iss: https://keycloak.example.com/realms/acme      # exact `iss`
-        jwks_uri: https://keycloak.example.com/realms/acme/protocol/openid-connect/certs
-        tenants: [ten_0193a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b] # the tenants it may speak for
-        algs: [RS256]                                      # default: ES256, RS256, EdDSA
-        external: true                                     # Keycloak, not a Tutela issuer
-```
-
-| Key | Default | Notes |
-|---|---|---|
-| `server.tutela.issuers[].iss` | required | The exact `iss` claim, an `https://` URL. |
-| `server.tutela.issuers[].jwks_uri` | required | `https://`; fetched through `tutela-safenet` (public addresses only, no redirects) and cached. |
-| `server.tutela.issuers[].tenants` | required | Tenant ids (`ten_...`) the issuer may speak for. An external issuer names exactly one: its tokens carry no `tid`. |
-| `server.tutela.issuers[].algs` | `[ES256, RS256, EdDSA]` | The signature algorithms it may use. |
-| `server.tutela.issuers[].external` | `false` | `true` for an issuer outside Tutela (Keycloak in Phases A and B): plain OIDC access tokens. |
-| `server.tutela.issuers[].allow_typ_jwt` | the value of `external` | Accept `typ: JWT` as well as `at+jwt`. |
-
-The old credential goes through a window: in this release `server.api_token` keeps working next
-to Tutela tokens (`server.legacy_api_token: true`, with a deprecation warning); in the next
-release `legacy_api_token` defaults to `false`; the release after removes it. Old tokens cannot
-be turned into Tutela keys: give each caller a Tutela key, then turn the flag off.
 
 ### `budget`
 

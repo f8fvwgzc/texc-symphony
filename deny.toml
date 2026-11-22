@@ -11,7 +11,12 @@ yanked = "deny"
 unsound = "all"
 # An unmaintained crate fails only as a direct dependency; deeper ones are reported by `cargo audit`.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # chrono (timestamps across every crate) was marked unmaintained on 2026-11-22. No security
+    # defect; there is no drop-in replacement yet (jiff is the candidate), so accept it and
+    # re-review by 2026-05-01. Tracked for a migration off chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no drop-in replacement, revisit by 2026-05-01" },
+]
 
 [licenses]
 # Permissive licences only. Add one here only after reading it.
@@ -46,5 +51,4 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Tutela (identity and permissions), pinned to a release tag; private, fetched over SSH.
-allow-git = ["ssh://git@github.com/f8fvwgzc/tutela.git"]
+allow-git = []

@@ -8,11 +8,9 @@ it as JSON at `GET /api/openapi.json`. This page is the human guide.
   set. `0` binds an ephemeral port; the binary prints the real URL on stdout
   (`Symphony listening on http://127.0.0.1:<port>/`).
 - **Auth:** every `/api/*` call except `GET /api/v1/health` and `GET /api/openapi.json` needs
-  `Authorization: Bearer <token>` (else `401 unauthorized`): a Tutela access token for exactly
-  `aud=symphony` from an issuer of `server.tutela` ([configuration](../configuration.md#tutela-authentication)),
-  or during the transition the deprecated legacy token (`server.api_token` / `SYMPHONY_API_TOKEN`,
-  while `server.legacy_api_token` is on). With neither configured the API is open (the local
-  single-user mode) and the server only binds loopback. No credential is accepted in a URL. Requests for another `Host` (DNS rebinding)
+  `Authorization: Bearer <token>` (else `401 unauthorized`): the token in `server.api_token` /
+  `SYMPHONY_API_TOKEN` ([configuration](../configuration.md#server)). Without one the API is open
+  (the local single-user mode) and the server only binds loopback. No credential is accepted in a URL. Requests for another `Host` (DNS rebinding)
   answer `403 host_not_allowed`; cross-origin browser writes answer `403 origin_not_allowed`.
   The bundled dashboard asks for the token and keeps it in `sessionStorage` (or `localStorage`
   when "Remember on this device" is ticked); "Forget token" in the header clears it.
@@ -158,8 +156,8 @@ data: {"at":"2026-02-24T20:15:45Z","generation":42}
 **curl** (`-N` disables buffering):
 
 ```sh
-# Off the local single-user mode, add -H "Authorization: Bearer $TOKEN" to every call (a Tutela
-# access token for aud=symphony, or during the transition the legacy SYMPHONY_API_TOKEN).
+# Off the local single-user mode, add -H "Authorization: Bearer $TOKEN" to every call (the value
+# of SYMPHONY_API_TOKEN).
 curl -N -H 'Accept: text/event-stream' $SYMPHONY/api/v1/events
 # Only the counts, one line per snapshot:
 curl -sN $SYMPHONY/api/v1/events | sed -n 's/^data: //p' | jq -c '.counts? // empty'

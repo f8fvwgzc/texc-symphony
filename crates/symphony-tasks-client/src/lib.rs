@@ -6,7 +6,7 @@
 //! # async fn demo() -> Result<(), symphony_tasks_client::ClientError> {
 //! use symphony_tasks_client::{NewTask, TasksClient};
 //!
-//! // A Tutela access token for aud=symphony (a service-account key or client_credentials token).
+//! // The server's `server.api_token` (SYMPHONY_API_TOKEN).
 //! let client = TasksClient::new("https://symphony.example.com")?.with_token("<access token>");
 //! let task = client
 //!     .create(&NewTask {
@@ -28,13 +28,12 @@
 //! Install it as a git dependency pinned to a release tag:
 //!
 //! ```toml
-//! symphony-tasks-client = { git = "https://github.com/f8fvwgzc/texc-symphony", tag = "v0.2.0" }
+//! symphony-tasks-client = { git = "https://github.com/f8fvwgzc/texc-symphony", tag = "v0.0.1" }
 //! ```
 //!
 //! The wire contract is `docs/api/openapi.yaml` (`/api/openapi.json` on a running server).
 //!
-//! Every request carries `Authorization: Bearer <token>`: a Tutela access token issued for
-//! `aud=symphony` (during the transition, a server may still accept its legacy API token). Only
+//! Every request carries `Authorization: Bearer <token>`: the server's `server.api_token`. Only
 //! a server in local single-user mode, on loopback, needs none. The event stream is a plain
 //! authenticated `GET`: the token is never put in a URL.
 
@@ -198,7 +197,8 @@ pub struct Task {
     /// Failed attempts counted against `retry.max_attempts` (since creation or the last unblock).
     #[serde(default)]
     pub failed_attempts: u32,
-    /// When a retried task may run again (`None`: as soon as a slot is free).
+    /// When a retried task, or one waiting out a provider limit, may run again (`None`: as soon
+    /// as a slot is free).
     #[serde(default)]
     pub next_attempt_at: Option<DateTime<Utc>>,
     /// Creation time.
@@ -394,8 +394,7 @@ impl TasksClient {
         })
     }
 
-    /// Sends `Authorization: Bearer <token>` with every request: a Tutela access token for
-    /// `aud=symphony` (or, while the server still accepts it, its legacy API token).
+    /// Sends `Authorization: Bearer <token>` with every request: the server's `server.api_token`.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self

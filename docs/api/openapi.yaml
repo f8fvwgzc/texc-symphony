@@ -34,13 +34,9 @@ info:
 
     * **Authentication.** Every `/api/*` request except `GET /api/v1/health` and
       `GET /api/openapi.json` needs `Authorization: Bearer <token>`, or answers `401`
-      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. The token is a Tutela
-      access token issued for exactly one audience, `symphony`, by an issuer of `server.tutela`
-      for a tenant it may speak for (a service-account key or `client_credentials` token).
-      Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B. During the
-      transition the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) is accepted too
-      while `server.legacy_api_token` is on (deprecated; off by default from the next release).
-      Without either the API is open, the local single-user mode, and Symphony refuses to bind
+      `unauthorized` with `WWW-Authenticate: Bearer realm="symphony"`. The token is the configured
+      `server.api_token` (`SYMPHONY_API_TOKEN`). Without one the API is open, the local
+      single-user mode, and Symphony refuses to bind
       anything but a loopback address (`auth_required` at startup). The dashboard shell and its
       assets are public; the dashboard asks for a token.
     * **Stream tickets.** A browser `EventSource` cannot send headers, and no credential is ever
@@ -783,8 +779,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: JWT
-      description: A Tutela access token for exactly `aud=symphony` from an issuer and tenant of `server.tutela`; during the transition also the legacy API token (`server.api_token` / `SYMPHONY_API_TOKEN`) while `server.legacy_api_token` is on. Not required in the local single-user mode (no credentials configured, loopback only).
+      description: The configured `server.api_token` (`SYMPHONY_API_TOKEN`). Not required in the local single-user mode (no token configured, loopback only).
 
   parameters:
     TaskId:
@@ -1244,7 +1239,9 @@ components:
         A failed run of a kind in `on` runs again while fewer than `max_attempts` attempts have
         failed, after `backoff_ms * 2^(failed_attempts - 1)` (at most `max_backoff_ms`; at once
         after an interruption). Runs handed off on purpose (kill switch, daily budget, shutdown)
-        do not count. Unblocking resets the count.
+        do not count, nor does a run that a provider's usage or rate limit refused before it
+        processed any tokens: that task is queued again after `agent.max_retry_backoff_ms` (at
+        most 10 s · 2^10; `next_attempt_at`), whatever `on` says. Unblocking resets the count.
       required: [max_attempts, backoff_ms, max_backoff_ms, on]
       additionalProperties: false
       properties:
@@ -1285,7 +1282,7 @@ components:
         attempts: { type: integer, minimum: 0, description: 'Runs started so far.' }
         retry: { $ref: '#/components/schemas/TaskRetry' }
         failed_attempts: { type: integer, minimum: 0, description: 'Failed attempts counted against `retry.max_attempts` since creation or the last unblock.' }
-        next_attempt_at: { type: [string, 'null'], format: date-time, description: 'When a retried task may run again; `null`: as soon as a slot is free.' }
+        next_attempt_at: { type: [string, 'null'], format: date-time, description: 'When a retried task, or one waiting out a provider limit, may run again; `null`: as soon as a slot is free.' }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
         started_at: { type: [string, 'null'], format: date-time }

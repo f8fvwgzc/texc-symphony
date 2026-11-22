@@ -1,17 +1,12 @@
-//! Request security: authentication (Tutela tokens, and the legacy API token during its
-//! window), the `Host` allow-list (DNS rebinding), the `Origin` check for writes (CSRF), and
-//! single-use stream tickets for `EventSource` streams.
+//! Request security: authentication (a bearer token), the `Host` allow-list (DNS rebinding), the
+//! `Origin` check for writes (CSRF), and single-use stream tickets for `EventSource` streams.
 //!
 //! * **Authentication** applies to `/api/*` except `GET /api/v1/health` and
-//!   `GET /api/openapi.json`. Clients send `Authorization: Bearer <token>`:
-//!   - a Tutela access token for `aud=symphony` ([`Auth::tutela`]), checked by `tutela-sdk`'s
-//!     axum layer ([`tutela_sdk::http::AuthLayer`], which also puts the caller's
-//!     [`tutela_sdk::Identity`] in the request extensions);
-//!   - during the transition, the legacy `server.api_token` ([`StaticToken`], SHA-256 digests
-//!     compared in constant time) while `server.legacy_api_token` is on; each process logs one
-//!     deprecation warning when it is first used.
+//!   `GET /api/openapi.json`. Clients send `Authorization: Bearer <token>`: the configured
+//!   `server.api_token` ([`StaticToken`], SHA-256 digests compared in constant time), or any
+//!   other credential an [`Authenticator`] verifies ([`Auth::custom`]).
 //!
-//!   Without either the API is open: the local single-user mode, which [`crate::serve`] only
+//!   Without a token the API is open: the local single-user mode, which [`crate::serve`] only
 //!   allows on a loopback address.
 //! * **Stream tickets**: a browser `EventSource` cannot send headers, and no credential may sit
 //!   in a URL. An authenticated client asks `POST /api/v1/events/tickets`, which sets a
@@ -29,17 +24,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Request, State};
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, WWW_AUTHENTICATE};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
-use tower::{Layer, ServiceExt};
-use tutela_sdk::Verifier;
-use tutela_sdk::http::{AuthLayer, Protocol};
 
 use crate::app::{AppState, is_stream_path};
 use crate::error::ApiError;
@@ -51,8 +41,8 @@ pub const MAX_TICKETS: usize = 1024;
 
 /// Verifies the bearer credential of an API request.
 ///
-/// [`StaticToken`] is the built-in implementation; an OIDC/JWT verifier can implement this trait
-/// and be passed as [`Auth::custom`].
+/// [`StaticToken`] is the built-in implementation; another scheme (an OIDC/JWT verifier, say) can
+/// implement this trait and be passed as [`Auth::custom`].
 #[async_trait]
 pub trait Authenticator: Send + Sync + 'static {
     /// `true` when `bearer` (the value after `Authorization: Bearer `) is valid.
@@ -100,12 +90,10 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// How a server authenticates API requests: Tutela tokens, a legacy credential, both, or
-/// neither (open API).
+/// How a server authenticates API requests: with one [`Authenticator`], or not at all (open API).
 #[derive(Clone, Default)]
 pub struct Auth {
-    tutela: Option<Arc<Verifier>>,
-    legacy: Option<Arc<dyn Authenticator>>,
+    authenticator: Option<Arc<dyn Authenticator>>,
 }
 
 impl Auth {
@@ -114,76 +102,39 @@ impl Auth {
         Self::default()
     }
 
-    /// Tutela access tokens for `aud=symphony`, checked by `verifier`
-    /// ([`crate::tutela::verifier`]).
-    pub fn tutela(verifier: Arc<Verifier>) -> Self {
-        Self {
-            tutela: Some(verifier),
-            legacy: None,
-        }
-    }
-
-    /// The legacy fixed bearer token only.
+    /// One fixed bearer token (`server.api_token`).
     pub fn token(token: &str) -> Self {
-        Self::disabled().with_legacy_token(token)
-    }
-
-    /// Also accepts the legacy fixed bearer token (`server.api_token` while
-    /// `server.legacy_api_token` is on).
-    pub fn with_legacy_token(self, token: &str) -> Self {
-        self.with_legacy(Arc::new(StaticToken::new(token)))
-    }
-
-    /// Also accepts credentials `authenticator` verifies (a legacy scheme).
-    pub fn with_legacy(mut self, authenticator: Arc<dyn Authenticator>) -> Self {
-        self.legacy = Some(authenticator);
-        self
+        Self::custom(Arc::new(StaticToken::new(token)))
     }
 
     /// Any [`Authenticator`] alone.
     pub fn custom(authenticator: Arc<dyn Authenticator>) -> Self {
-        Self::disabled().with_legacy(authenticator)
+        Self {
+            authenticator: Some(authenticator),
+        }
     }
 
     /// `true` when requests must authenticate.
     pub fn is_enabled(&self) -> bool {
-        self.tutela.is_some() || self.legacy.is_some()
-    }
-
-    /// `true` when Tutela tokens are accepted.
-    pub fn accepts_tutela(&self) -> bool {
-        self.tutela.is_some()
-    }
-
-    /// `true` when a legacy credential is accepted.
-    pub fn accepts_legacy(&self) -> bool {
-        self.legacy.is_some()
+        self.authenticator.is_some()
     }
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Auth")
-            .field("tutela", &self.tutela.is_some())
-            .field("legacy", &self.legacy.is_some())
+            .field("enabled", &self.authenticator.is_some())
             .finish()
     }
 }
 
 impl PartialEq for Auth {
     fn eq(&self, other: &Self) -> bool {
-        let same =
-            |a: Option<&Arc<dyn Authenticator>>, b: Option<&Arc<dyn Authenticator>>| match (a, b) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            };
-        let same_tutela = match (&self.tutela, &other.tutela) {
+        match (&self.authenticator, &other.authenticator) {
             (None, None) => true,
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
-        };
-        same_tutela && same(self.legacy.as_ref(), other.legacy.as_ref())
+        }
     }
 }
 
@@ -358,31 +309,6 @@ pub(crate) fn authority_of(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Logs, once per process, that the legacy API token was used.
-fn warn_legacy_use() {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            "A request authenticated with the legacy API token (server.api_token). It is \
-             deprecated: move callers to Tutela tokens for aud=symphony (server.tutela); \
-             server.legacy_api_token defaults to false in the next release"
-        );
-    }
-}
-
-/// Runs `tutela-sdk`'s axum layer around the rest of the stack: a refusal is symphony's 401.
-async fn tutela_layer(verifier: &Arc<Verifier>, request: Request, next: Next) -> Response {
-    let service = AuthLayer::new(Arc::clone(verifier), Protocol::Http).layer(next);
-    let response = match service.oneshot(request).await {
-        Ok(response) => response,
-        Err(never) => match never {},
-    };
-    if response.status() == StatusCode::UNAUTHORIZED {
-        return unauthorized();
-    }
-    response
-}
-
 fn unauthorized() -> Response {
     let mut response = ApiError::Unauthorized.into_response();
     response.headers_mut().insert(
@@ -427,17 +353,12 @@ pub(crate) async fn guard(State(app): State<AppState>, request: Request, next: N
     {
         return next.run(request).await;
     }
-    if let (Some(legacy), Some(token)) = (&auth.legacy, bearer(request.headers()))
-        && legacy.verify(token).await
+    if let (Some(authenticator), Some(token)) = (&auth.authenticator, bearer(request.headers()))
+        && authenticator.verify(token).await
     {
-        warn_legacy_use();
         return next.run(request).await;
     }
-    if let Some(verifier) = &auth.tutela {
-        tutela_layer(verifier, request, next).await
-    } else {
-        unauthorized()
-    }
+    unauthorized()
 }
 
 /// Outstanding SSE tickets (single use, [`TICKET_TTL`]).
@@ -566,8 +487,6 @@ mod tests {
         assert!(!token.verify("").await);
         assert!(!format!("{token:?}").contains("horse"));
         assert!(Auth::token("x").is_enabled());
-        assert!(Auth::token("x").accepts_legacy());
-        assert!(!Auth::token("x").accepts_tutela());
         assert!(!Auth::disabled().is_enabled());
     }
 

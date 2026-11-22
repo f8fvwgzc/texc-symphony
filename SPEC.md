@@ -1603,18 +1603,11 @@ Enablement (extension):
 
 Authentication (Symphony):
 
-- API callers are Tutela-verified (Tutela `docs/INTEGRATION.md` §2): a bearer access token for
-  exactly one audience, `symphony`, from a configured issuer (Keycloak in Tutela's Phases A and
-  B), for a tenant that issuer may speak for, checked offline by `tutela-sdk`'s axum layer. A
-  refused token is `401` and says nothing about why.
-- Delegated agent tokens (`agent+jwt`) are refused until Tutela Phase B turns on delegation;
-  Symphony must then never forward such a token, and obtains a new token per downstream
-  audience.
+- API callers present a bearer token (`Authorization: Bearer <token>`): the configured
+  `server.api_token`, compared in constant time. A refused token is `401` and says nothing about
+  why. An implementation MAY support other credential schemes behind the same header.
 - With no credentials configured the API is open, the local single-user mode, allowed only on a
-  loopback address; any other listen address requires tokens.
-- The legacy static API token stays accepted next to Tutela tokens for one release window behind
-  a flag (on in the release that adds Tutela, off by default in the next, removed in the one
-  after), with a deprecation warning.
+  loopback address; any other listen address requires a token.
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 
@@ -1788,10 +1781,12 @@ Task API (extension of 13.7):
   running it stopped). A failed attempt of a retried kind with attempts left goes back to the
   queue after its backoff (at once after an interruption); otherwise the task fails. Attempts
   handed off on purpose (kill switch, budget, a graceful shutdown) do not count, and re-queueing
-  a task resets the count. Symphony's default policy is three attempts, retrying interruptions
-  only. A task blocked on operator input or approval stays blocked until a client re-queues it
-  (`unblock`, optionally with a reply appended to its prompt). Clients can cancel and watch
-  (Server-Sent Events) a task.
+  a task resets the count. With the retry limit extension (8.4), neither does an attempt that a
+  provider limit refused before it processed any tokens, whatever the task's policy: the task goes
+  back to the queue and waits the delay a limited issue retry waits. Symphony's default policy is
+  three attempts, retrying interruptions only. A task blocked on operator input or approval stays
+  blocked until a client re-queues it (`unblock`, optionally with a reply appended to its prompt).
+  Clients can cancel and watch (Server-Sent Events) a task.
 - Task repositories MUST be restricted to network transports (no local paths, `file://` or git
   transport helpers), and tasks MUST NOT run the workflow's issue hooks.
 

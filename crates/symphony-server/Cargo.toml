@@ -27,8 +27,6 @@ tokio-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["catch-panic", "compression-br", "compression-gzip", "cors", "normalize-path", "request-id", "set-header", "trace", "util"] }
 tracing = { workspace = true }
-tutela-contracts = { workspace = true }
-tutela-sdk = { workspace = true }
 
 [build-dependencies]
 hex = { workspace = true }
